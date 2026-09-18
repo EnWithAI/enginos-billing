@@ -1,0 +1,198 @@
+// Billing lives in the MASTER database, beside Tenant and OrgLlmGateway.
+//
+// Not in a tenant database: the sync sweeps every tenant each tick, and finding
+// billable accounts by opening N tenant databases would be both slow and racy.
+// Billing is tenant-grain state, so it belongs with tenant-grain state.
+//
+// This schema is additive. It declares no model for `tenants` or
+// `org_llm_gateways` — those are owned by enginos-platform and must not be
+// managed from here. `tenant_id` and `routing_slug` are carried as plain
+// columns with no Prisma relation, so `prisma migrate` can never propose a
+// change to a table this service does not own.
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../node_modules/.prisma/billing"
+  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_DIRECT_URL")
+}
+
+/// One row per tenant. The Chargebee customer id is the external identity key;
+/// `tenant_id` remains the local primary key, unchanged from the platform's model.
+model BillingAccount {
+  /// FK to master `tenants.tenant_id` — declared as a plain column, not a
+  /// Prisma relation, because this service does not own that table.
+  tenantId String @id @map("tenant_id") @db.Uuid
+
+  /// Denormalised from `org_llm_gateways.routing_slug`. Carried here rather
+  /// than joined because the gateway row is created fail-open and may be
+  /// absent entirely, and because this is the key the ClickHouse query needs.
+  routingSlug String @unique @map("routing_slug") @db.VarChar(100)
+
+  /// We supply the Chargebee customer id ourselves (the tenant UUID) rather
+  /// than letting Chargebee generate one. That makes customer creation
+  /// idempotent: a retry collides on Chargebee's side instead of creating a
+  /// second customer for the same tenant.
+  chargebeeCustomerId String? @unique @map("chargebee_customer_id") @db.VarChar(100)
+
+  /// Null until the tenant subscribes. Unique: one active subscription per
+  /// tenant in v1 — splitting one span stream across two subscriptions needs
+  /// an allocation rule that is a pricing decision, not a technical one.
+  chargebeeSubscriptionId String? @unique @map("chargebee_subscription_id") @db.VarChar(100)
+
+  chargebeeItemPriceId String? @map("chargebee_item_price_id") @db.VarChar(100)
+
+  /// The credit unit from `ledger_account_balances.unit_id`, e.g. "token".
+  ledgerUnitId String? @map("ledger_unit_id") @db.VarChar(50)
+
+  /// Current grant, mirrored from Chargebee `grant_blocks`. Recomputed whole
+  /// on renewal rather than incremented, so a correction in Chargebee converges.
+  grantedCredits Decimal @default(0) @map("granted_credits") @db.Decimal(20, 10)
+
+  /// grantedCredits x USD_PER_CREDIT — what we pushed to LiteLLM as max_budget.
+  /// Stored so a drift check can compare intent against the gateway's actual state.
+  budgetUsd Decimal @default(0) @map("budget_usd") @db.Decimal(20, 10)
+
+  /// Display cache only. The authoritative balance is SUM(delta) over the
+  /// ledger; this exists so a page render does not need an aggregate.
+  cachedBalanceCredits Decimal?  @map("cached_balance_credits") @db.Decimal(20, 10)
+  cachedBalanceAt      DateTime? @map("cached_balance_at") @db.Timestamptz()
+
+  /// Billing contact on the Chargebee customer. Captured at provisioning from
+  /// the admin email, because no User row exists yet at that point.
+  billingEmail String? @map("billing_email") @db.VarChar(320)
+
+  currentTermStart DateTime? @map("current_term_start") @db.Timestamptz()
+  currentTermEnd   DateTime? @map("current_term_end") @db.Timestamptz()
+
+  /// unlinked | active | cancelled | exhausted
+  status String @default("unlinked") @db.VarChar(20)
+
+  /// Never bill usage before this instant. Set when the subscription starts,
+  /// and set to now() when backfilling an existing tenant — the ClickHouse
+  /// tenant tables hold 90 days of spans, and billing them all on day one
+  /// would be a catastrophe.
+  syncFrom DateTime @map("sync_from") @db.Timestamptz()
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  ledgerEntries CreditLedgerEntry[]
+  batches       UsageSyncBatch[]
+
+  @@index([status])
+  @@map("billing_account")
+}
+
+/// Append-only. Balance is SUM(delta_credits) — there is no mutable counter
+/// anywhere in this design, which is what makes the audit trail trustworthy
+/// and a replay safe.
+model CreditLedgerEntry {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId String         @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
+
+  /// grant | consume | adjustment | expiry
+  entryType String @map("entry_type") @db.VarChar(16)
+
+  /// Signed. Positive grants, negative consumption. Ten decimal places is
+  /// exactly Chargebee's ledger precision, so a value that survives this
+  /// column survives the wire without further rounding.
+  deltaCredits Decimal @map("delta_credits") @db.Decimal(20, 10)
+
+  /// THE anti-double-charge. Unique with tenant_id: the batch UUID for a
+  /// consume, the Chargebee event id for a grant. A replayed webhook or a
+  /// replayed batch collides here rather than writing a second entry.
+  sourceRef String @map("source_ref") @db.VarChar(100)
+
+  /// The dollar figure this entry came from. Null for a grant or an expiry.
+  billedUsd Decimal? @map("billed_usd") @db.Decimal(20, 10)
+
+  chargebeeOperationId String? @map("chargebee_operation_id") @db.VarChar(50)
+
+  /// Business time, not write time.
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz()
+
+  @@unique([tenantId, sourceRef], map: "credit_ledger_tenant_source_uq")
+  @@index([tenantId, occurredAt(sort: Desc)], map: "credit_ledger_tenant_occurred_idx")
+  @@map("credit_ledger_entry")
+}
+
+/// One row per usage window. The id is ALSO the Chargebee ledger operation id —
+/// one value in two systems is what makes a replay settle instead of re-charge.
+model UsageSyncBatch {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId String         @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
+
+  /// Pinned when the window opens, so a mid-term subscription change still
+  /// settles against the subscription that incurred the usage.
+  chargebeeSubscriptionId String? @map("chargebee_subscription_id") @db.VarChar(100)
+  ledgerUnitId            String? @map("ledger_unit_id") @db.VarChar(50)
+
+  /// window | adjustment
+  kind String @default("window") @db.VarChar(12)
+
+  /// Half-open [start, end). Adjacent windows share a boundary instant, and
+  /// >= with < puts it in exactly one of them.
+  windowStart DateTime @map("window_start") @db.Timestamptz()
+  windowEnd   DateTime @map("window_end") @db.Timestamptz()
+
+  /// For the late-arrival diff. Spans are immutable once written, so any
+  /// change to a closed window is purely additive.
+  spanCount BigInt @default(0) @map("span_count")
+
+  billedUsd   Decimal @default(0) @map("billed_usd") @db.Decimal(20, 10)
+  providerUsd Decimal @default(0) @map("provider_usd") @db.Decimal(20, 10)
+  marginUsd   Decimal @default(0) @map("margin_usd") @db.Decimal(20, 10)
+
+  /// billedUsd / USD_PER_CREDIT at the rate in force when the window opened.
+  consumeCredits Decimal @default(0) @map("consume_credits") @db.Decimal(20, 10)
+
+  /// pending | captured | failed | skipped
+  status String @default("pending") @db.VarChar(20)
+
+  attempts  Int     @default(0)
+  lastError String? @map("last_error")
+
+  chargebeeOperationId String?  @map("chargebee_operation_id") @db.VarChar(50)
+  balanceAfter         Decimal? @map("balance_after") @db.Decimal(20, 10)
+
+  /// Correlates a batch back to the workflow run that created it.
+  hatchetRunId String? @map("hatchet_run_id") @db.VarChar(100)
+
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  capturedAt DateTime? @map("captured_at") @db.Timestamptz()
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  @@index([tenantId, windowEnd(sort: Desc)], map: "usage_sync_batch_cursor_idx")
+  @@index([status], map: "usage_sync_batch_status_idx")
+  @@map("usage_sync_batch")
+}
+
+/// Webhook idempotency. Claimed BEFORE any effect, so a Chargebee retry never
+/// reaches a handler. Chargebee does not sign webhooks, so this table is also
+/// the only thing standing between a replayed request and a second credit grant.
+model ProcessedBillingEvent {
+  eventId   String @id @map("event_id") @db.VarChar(100)
+  eventType String @map("event_type") @db.VarChar(64)
+
+  /// Null when the event cannot be mapped to a tenant — kept anyway, because
+  /// an unmappable event is itself a signal worth alerting on.
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz()
+  /// Null means claimed but not finished — a crash mid-handler is visible here.
+  processedAt DateTime? @map("processed_at") @db.Timestamptz()
+  error       String?
+
+  @@index([receivedAt(sort: Desc)], map: "processed_billing_event_received_idx")
+  @@map("processed_billing_event")
+}
