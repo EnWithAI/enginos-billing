@@ -10,7 +10,7 @@
  * Two directions, used at opposite ends of the system:
  *
  *   grant → budget    creditsToUsd()    once per grant, pushed to LiteLLM
- *   spend → capture   usdToCredits()    once per window, drawn from the ledger
+ *   spend → capture   usdToCredits()    once per capture, drawn from the ledger
  */
 
 import { compare, divide, isPositive, multiply, subtract, decimal, type DecimalLike } from "./decimal";
@@ -34,7 +34,7 @@ export function creditsToUsd(credits: DecimalLike, usdPerCredit: DecimalLike): s
   return multiply(credits, usdPerCredit);
 }
 
-/** Dollars → credits. Turns a window's spend into a capture amount. */
+/** Dollars → credits. Turns a capture's spend into its amount. */
 export function usdToCredits(usd: DecimalLike, usdPerCredit: DecimalLike): string {
   assertRate(usdPerCredit);
   return divide(usd, usdPerCredit);
@@ -44,8 +44,8 @@ export function usdToCredits(usd: DecimalLike, usdPerCredit: DecimalLike): strin
  * Split a fractional amount into what can be captured now and what carries forward.
  *
  * Only needed when the Chargebee ledger unit is configured as whole credits.
- * Truncating each window independently would be a silent discount: a tenant
- * making many small windows would round to zero every time and ride free.
+ * Truncating each capture independently would be a silent discount: a tenant
+ * making many small captures would round to zero every time and ride free.
  */
 export function splitWholeCredits(credits: DecimalLike): { capture: string; residual: string } {
   const whole = truncateToWhole(credits);
@@ -61,9 +61,9 @@ function truncateToWhole(credits: DecimalLike): string {
 /**
  * Is this capture worth sending?
  *
- * Chargebee rejects a zero-amount ledger operation, so a window with no traffic
- * is marked skipped and the cursor advances — a quiet tenant must not wedge the
- * pipeline behind an un-billable window.
+ * Chargebee rejects a zero-amount ledger operation, so zero-cost usage is
+ * recorded as skipped and the cursor advances — it must not wedge the pipeline
+ * behind an un-billable capture.
  */
 export function isBillable(credits: DecimalLike): boolean {
   return compare(credits, "0") > 0;

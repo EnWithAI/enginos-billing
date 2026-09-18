@@ -120,14 +120,14 @@ describe("account lifecycle", () => {
 
   it("pushes the budget to the gateway, and survives that push failing", async () => {
     const prisma = makeFakePrisma();
-    const pushed: Array<[string, string]> = [];
+    const pushed: string[] = [];
 
     const accounts = createAccounts({
       prisma: prisma as never,
       chargebee: fakeChargebee() as never,
       usdPerCredit: RATE,
-      pushBudget: async (slug, usd) => {
-        pushed.push([slug, usd]);
+      pushBudget: async (tenantId) => {
+        pushed.push(tenantId);
         throw new Error("gateway unreachable");
       },
       logger: quietLogger,
@@ -141,7 +141,9 @@ describe("account lifecycle", () => {
       sourceRef: "evt_1",
     });
 
-    expect(pushed).toEqual([[SLUG, "1"]]);
+    // Pushed AFTER the grant entry is written: the cap is read from the ledger.
+    expect(pushed).toEqual([TENANT]);
+    expect(account.budgetUsd).toBe("1");
     expect(account.grantedCredits).toBe("1000");
     expect(prisma._entries).toHaveLength(1);
   });

@@ -52,7 +52,7 @@ export interface CaptureResult {
  * Codes meaning "this subscription has no prepaid ledger".
  *
  * Distinct from a hard failure: nothing was charged and nothing will be, so the
- * caller may safely skip the window rather than wedging behind it.
+ * caller may safely move past the capture rather than wedging behind it.
  */
 const NO_LEDGER_CODES = new Set(["resource_not_found", "invalid_request"]);
 
@@ -62,8 +62,9 @@ const NO_LEDGER_CODES = new Set(["resource_not_found", "invalid_request"]);
  * NOTE: Chargebee's documentation does not enumerate the code returned when a
  * client-supplied ledger operation id is reused, nor the one for an exhausted
  * balance. These are the plausible candidates; the real values must be captured
- * against the test site and pinned here. Until then `findOperation()` is the
- * safety net — see `captureIdempotent()`.
+ * against the test site and pinned here. `captureIdempotent()` retrieves our id
+ * before every capture, so these only matter if a capture lands between that
+ * lookup and the send.
  */
 const DUPLICATE_CODES = new Set(["duplicate_entry", "resource_already_exists", "idempotency_replayed"]);
 
@@ -213,14 +214,17 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   }
 
   /** Retry only what a retry could fix, with a bounded backoff. */
-  async function withRetry<T>(run: () => Promise<T>): Promise<T> {
+  async function withRetry<T>(
+    run: () => Promise<T>,
+    shouldRetry: (err: ChargebeeError) => boolean = (err) => err.retryable === true,
+  ): Promise<T> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         return await run();
       } catch (err) {
         lastError = err;
-        if (!(err as ChargebeeError).retryable || attempt === maxAttempts) throw err;
+        if (!shouldRetry(err as ChargebeeError) || attempt === maxAttempts) throw err;
         await sleep(2 ** (attempt - 1) * 500);
       }
     }
@@ -260,25 +264,31 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   /**
    * Consume credits against a subscription's grant.
    *
-   * `ledger_operation_timestamp` is always now, never the window's end: the API
-   * rejects anything older than ten minutes, and a capture is a balance drawdown
-   * rather than a dated invoice line. The window it covers travels in metadata
-   * so the operation stays auditable.
+   * `ledger_operation_timestamp` is always now, never the usage's own time: the
+   * API rejects anything older than ten minutes, and a capture is a balance
+   * drawdown rather than a dated invoice line. The range it covers travels in
+   * metadata so the operation stays auditable.
    */
   async function capture(args: CaptureArgs): Promise<CaptureResult> {
     const amount = decimal(args.amount);
     const now = args.now ?? Date.now();
 
     try {
-      const payload = await withRetry(() =>
-        request("POST", "/ledger_operations/capture", {
-          id: args.id,
-          subscription_id: args.subscriptionId,
-          unit_id: args.unitId,
-          amount,
-          ledger_operation_timestamp: Math.floor(now / 1000),
-          ...(args.metadata ? { "metadata[json]": JSON.stringify(args.metadata) } : {}),
-        }),
+      // Re-sent in place only on a 429, which Chargebee refuses before applying.
+      // A timeout, dropped connection or 5xx may have landed, so it returns
+      // retryable instead: the batch stays pending and the next tick retrieves
+      // the id before sending anything again.
+      const payload = await withRetry(
+        () =>
+          request("POST", "/ledger_operations/capture", {
+            id: args.id,
+            subscription_id: args.subscriptionId,
+            unit_id: args.unitId,
+            amount,
+            ledger_operation_timestamp: Math.floor(now / 1000),
+            ...(args.metadata ? { "metadata[json]": JSON.stringify(args.metadata) } : {}),
+          }),
+        (err) => err.status === 429,
       );
 
       return {
@@ -292,12 +302,15 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   }
 
   /**
-   * Capture, with a pre-flight existence check as the safety net.
+   * Capture, but only once Chargebee has said our id does not exist yet.
    *
-   * Chargebee's own replay behaviour for a reused ledger operation id is implied
-   * by the docs but not stated. Until it is confirmed against the test site,
-   * check first: if an operation with our id already exists, the money has
-   * already moved and we must not send it again.
+   * After a timeout the capture's outcome is unknown, and asking is the only
+   * way to learn it: if an operation with our id exists, the money has already
+   * moved and we must not send it again.
+   *
+   * A lookup that itself fails is ALSO an unknown, so it returns retryable
+   * rather than capturing blind. That cannot wedge the pipeline: the batch stays
+   * pending and the next tick asks again.
    *
    * Check-then-act would race on its own. It does not race here because the
    * caller holds a one-pending-batch-per-tenant unique index and the workflow
@@ -310,48 +323,47 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
         return { kind: CAPTURE_REPLAYED, operationId: existing.id, balanceAfter: null };
       }
     } catch (err) {
-      // A failed pre-check must not block the capture — the unique indexes are
-      // still holding, and refusing to bill on a transient read error would
-      // wedge the pipeline. Fall through and let capture() classify.
-      if (!(err as ChargebeeError).retryable) throw err;
+      if ((err as ChargebeeError).retryable) return { kind: CAPTURE_RETRYABLE, error: err as ChargebeeError };
+      throw err;
     }
 
     return capture(args);
   }
 
   /**
-   * Find a capture we previously recorded under `id`.
+   * Find the capture we sent under `id`, by retrieving it directly.
    *
-   * MEASURED, NOT ASSUMED: Chargebee's /ledger_operations list endpoint IGNORES
-   * the `id[is]` filter. A query for a made-up id returns whatever operations
-   * the subscription has — typically the `allocation` from the credit grant.
+   * MEASURED against the test site: `GET /ledger_operations/{id}` returns the
+   * operation under the id we supplied on capture (our batch UUID), and an
+   * unknown id is a 404 with `api_error_code: resource_not_found`. That 404 is
+   * the only answer that means "never captured".
    *
-   * Trusting that response made `captureIdempotent` believe every first capture
-   * had already happened, so it skipped the charge while the window was marked
-   * billed. Silent revenue loss, and the "safety net" was the cause.
+   * This replaced a scan of `GET /ledger_operations?limit=100`, which ignores
+   * `id[is]` and so had to be filtered client-side — and once a subscription had
+   * more than 100 operations (under two hours at one capture a minute), a
+   * capture that had landed could fall off the page and be sent again.
    *
-   * So the filtering is done here, client-side, on two axes:
-   *   - the id must actually match ours
-   *   - the type must be a capture, never an `allocation` (a grant is not a
-   *     charge, and matching one would suppress a real capture forever)
+   * The type must still be a capture: a grant is not a charge, and matching one
+   * would suppress a real capture forever.
    */
   async function findOperation(id: string, subscriptionId: string) {
-    const payload = await withRetry(() =>
-      request("GET", "/ledger_operations", {
-        "subscription_id[is]": subscriptionId,
-        limit: 100,
-      }),
-    );
+    let payload: Record<string, any>;
+    try {
+      payload = await withRetry(() => request("GET", `/ledger_operations/${encodeURIComponent(id)}`));
+    } catch (err) {
+      const { status, apiErrorCode } = err as ChargebeeError;
+      if (status === 404 && apiErrorCode === "resource_not_found") return null;
+      throw err;
+    }
 
-    const operations: Array<Record<string, any>> = (payload.list ?? [])
-      .map((entry: Record<string, any>) => entry.ledger_operation)
-      .filter(Boolean);
+    const op = payload.ledger_operation as Record<string, any> | undefined;
+    const matches =
+      op != null &&
+      String(op.id) === String(id) &&
+      String(op.type ?? "").includes("capture") &&
+      (op.subscription_id == null || String(op.subscription_id) === String(subscriptionId));
 
-    const match = operations.find(
-      (op) => String(op.id) === String(id) && String(op.type ?? "").includes("capture"),
-    );
-
-    return match ? { id: String(match.id) } : null;
+    return matches ? { id: String(op.id) } : null;
   }
 
   async function balance(subscriptionId: string): Promise<LedgerBalance | null> {

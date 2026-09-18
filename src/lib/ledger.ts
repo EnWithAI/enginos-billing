@@ -17,6 +17,8 @@ import { ENTRY, isUniqueViolation, prisma } from "./db";
 export interface LedgerBalanceView {
   allocated: string;
   consumed: string;
+  /** Credits lost at term renewals, reported positive. */
+  expired: string;
   current: string;
 }
 
@@ -88,19 +90,22 @@ export async function balanceOf(
 
   let allocated = 0;
   let consumed = 0;
+  let expired = 0;
   let current = 0;
 
   for (const row of grouped) {
     const sum = Number(row._sum.deltaCredits ?? 0);
     current += sum;
     if (row.entryType === ENTRY.GRANT) allocated += sum;
-    // Consumption and expiry are both negative; report consumption as positive.
+    // Consumption and expiry are both negative; report them as positive.
     if (row.entryType === ENTRY.CONSUME) consumed -= sum;
+    if (row.entryType === ENTRY.EXPIRY) expired -= sum;
   }
 
   return {
     allocated: String(allocated),
     consumed: String(consumed),
+    expired: String(expired),
     current: String(current),
   };
 }

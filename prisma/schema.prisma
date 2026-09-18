@@ -70,7 +70,7 @@ model BillingAccount {
   currentTermStart DateTime? @map("current_term_start") @db.Timestamptz()
   currentTermEnd   DateTime? @map("current_term_end") @db.Timestamptz()
 
-  /// unlinked | active | cancelled | exhausted
+  /// unlinked | activating | active | cancelled | exhausted
   status String @default("unlinked") @db.VarChar(20)
 
   /// Never bill usage before this instant. Set when the subscription starts,
@@ -84,9 +84,51 @@ model BillingAccount {
 
   ledgerEntries CreditLedgerEntry[]
   batches       UsageSyncBatch[]
+  cursor        BillingCursor?
+  billedEvents  BilledUsageEvent[]
 
   @@index([status])
   @@map("billing_account")
+}
+
+/// Where usage billing has reached for a tenant — the ONE record of progress.
+/// A position in ClickHouse span_nodes order: (ingested_at, TraceId:SpanId).
+/// It moves only after the events before it are captured and in the ledger.
+model BillingCursor {
+  tenantId String         @id @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
+
+  lastProcessedAt DateTime @map("last_processed_at") @db.Timestamptz(3)
+  /// Tie-break for events sharing lastProcessedAt; "" = before any of them.
+  lastEventId     String   @default("") @map("last_event_id") @db.VarChar(200) // COLLATE "C" in SQL: byte order, as ClickHouse
+
+  /// Tenant lease: one worker per tenant at a time (see usage-sync.ts).
+  lockedUntil DateTime? @map("locked_until") @db.Timestamptz(3)
+  lockedBy    String?   @map("locked_by") @db.VarChar(100)
+
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("billing_cursor")
+}
+
+/// One row per usage event assigned to a capture. The key is deterministic
+/// (TraceId:SpanId), so reading a range twice — or a span the collector
+/// re-sent, which lands again with a later ingested_at — cannot charge twice.
+model BilledUsageEvent {
+  tenantId String         @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
+  eventKey String         @map("event_key") @db.VarChar(200)
+
+  /// The capture that charged it; null for events billed before the cursor existed.
+  batchId String?         @map("batch_id") @db.Uuid
+  batch   UsageSyncBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  ingestedAt DateTime @map("ingested_at") @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([tenantId, eventKey])
+  @@index([tenantId, ingestedAt], map: "billed_usage_event_ingested_idx")
+  @@map("billed_usage_event")
 }
 
 /// Append-only. Balance is SUM(delta_credits) — there is no mutable counter
@@ -107,8 +149,10 @@ model CreditLedgerEntry {
   deltaCredits Decimal @map("delta_credits") @db.Decimal(20, 10)
 
   /// THE anti-double-charge. Unique with tenant_id: the batch UUID for a
-  /// consume, the Chargebee event id for a grant. A replayed webhook or a
-  /// replayed batch collides here rather than writing a second entry.
+  /// consume; `sub:<subscription>:<term start>` for a term's grant (the webhook
+  /// and the post-checkout sync share it — see termGrantRef); `invoice:<id>`
+  /// for a top-up. A replayed webhook or batch collides here instead of
+  /// writing a second entry.
   sourceRef String @map("source_ref") @db.VarChar(100)
 
   /// The dollar figure this entry came from. Null for a grant or an expiry.
@@ -124,8 +168,11 @@ model CreditLedgerEntry {
   @@map("credit_ledger_entry")
 }
 
-/// One row per usage window. The id is ALSO the Chargebee ledger operation id —
+/// One row per Chargebee capture — the capture LOG, not a progress record
+/// (billing_cursor is). The id is ALSO the Chargebee ledger operation id —
 /// one value in two systems is what makes a replay settle instead of re-charge.
+/// Rows before the cursor cutover are window-era: windowStart/End were LLM
+/// Timestamp windows; since then they are the ingested_at range captured.
 model UsageSyncBatch {
   id String @id @default(uuid()) @db.Uuid
 
@@ -140,13 +187,14 @@ model UsageSyncBatch {
   /// window | adjustment
   kind String @default("window") @db.VarChar(12)
 
-  /// Half-open [start, end). Adjacent windows share a boundary instant, and
-  /// >= with < puts it in exactly one of them.
+  /// The range captured, for audit: from the cursor before it to the cursor after.
   windowStart DateTime @map("window_start") @db.Timestamptz()
   windowEnd   DateTime @map("window_end") @db.Timestamptz()
 
-  /// For the late-arrival diff. Spans are immutable once written, so any
-  /// change to a closed window is purely additive.
+  /// Where billing_cursor moves when this capture settles. Null on window-era rows.
+  cursorToAt      DateTime? @map("cursor_to_at") @db.Timestamptz(3)
+  cursorToEventId String?   @map("cursor_to_event_id") @db.VarChar(200)
+
   spanCount BigInt @default(0) @map("span_count")
 
   billedUsd   Decimal @default(0) @map("billed_usd") @db.Decimal(20, 10)
@@ -171,6 +219,8 @@ model UsageSyncBatch {
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz()
   capturedAt DateTime? @map("captured_at") @db.Timestamptz()
   updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  events BilledUsageEvent[]
 
   @@index([tenantId, windowEnd(sort: Desc)], map: "usage_sync_batch_cursor_idx")
   @@index([status], map: "usage_sync_batch_status_idx")

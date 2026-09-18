@@ -1,17 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { assertRate, creditsToUsd, isBillable, splitWholeCredits, usdToCredits } from "@/lib/rate";
 import { add } from "@/lib/decimal";
-import {
-  DEFAULT_LAG_MS,
-  findWindowGaps,
-  isFallingBehind,
-  nextWindow,
-  toClickHouseTime,
-} from "@/lib/window";
 
 const RATE = "0.001";
-const MINUTE = 60 * 1000;
-const T0 = Date.UTC(2026, 8, 16, 12, 0, 0);
 
 describe("rate", () => {
   it("converts the design's worked example both ways", () => {
@@ -57,120 +48,62 @@ describe("rate", () => {
   });
 });
 
-describe("window", () => {
-  it("opens no window until the lag buffer has passed", () => {
-    // Steady state on a fast cron. Must be idle, not an error.
-    expect(nextWindow({ syncFrom: T0, now: T0 + 30_000 })).toBeNull();
-    expect(nextWindow({ syncFrom: T0, now: T0 + DEFAULT_LAG_MS })).toBeNull();
-  });
+describe("chargebee findOperation (retrieve by id)", () => {
+  const json = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
-  it("opens a window once traffic has aged past the buffer", () => {
-    expect(nextWindow({ syncFrom: T0, now: T0 + DEFAULT_LAG_MS + 10 * MINUTE })).toEqual({
-      start: T0,
-      end: T0 + 10 * MINUTE,
-    });
-  });
+  // Shapes MEASURED against the test site.
+  const NOT_FOUND = {
+    http_status_code: 404,
+    api_error_code: "resource_not_found",
+    type: "invalid_request",
+    message: "our-batch-uuid not found",
+  };
 
-  it("produces contiguous windows that share no instant", () => {
-    const first = nextWindow({ syncFrom: T0, now: T0 + DEFAULT_LAG_MS + 10 * MINUTE })!;
-    const second = nextWindow({
-      lastWindowEnd: first.end,
-      syncFrom: T0,
-      now: T0 + DEFAULT_LAG_MS + 25 * MINUTE,
-    })!;
-
-    expect(second.start).toBe(first.end); // no gap
-    expect(second.end).toBeGreaterThan(second.start); // half-open
-    expect(findWindowGaps([first, second], T0)).toEqual([]);
-  });
-
-  it("caps a long backlog instead of making one enormous window", () => {
-    const window = nextWindow({ syncFrom: T0, now: T0 + 7 * 24 * 60 * MINUTE })!;
-    expect(window.end - window.start).toBe(60 * MINUTE);
-  });
-
-  it("clamps a cursor behind syncFrom so history cannot be re-billed", () => {
-    const window = nextWindow({
-      lastWindowEnd: T0 - 30 * 24 * 60 * MINUTE,
-      syncFrom: T0,
-      now: T0 + DEFAULT_LAG_MS + 10 * MINUTE,
-    })!;
-    expect(window.start).toBe(T0);
-  });
-
-  it("detects the three ways a window chain can break", () => {
-    expect(
-      findWindowGaps(
-        [
-          { start: T0, end: T0 + MINUTE },
-          { start: T0 + 5 * MINUTE, end: T0 + 6 * MINUTE },
-        ],
-        T0,
-      ),
-    ).toHaveLength(1); // gap
-
-    expect(
-      findWindowGaps(
-        [
-          { start: T0, end: T0 + 5 * MINUTE },
-          { start: T0 + 2 * MINUTE, end: T0 + 6 * MINUTE },
-        ],
-        T0,
-      ),
-    ).toHaveLength(1); // overlap
-
-    expect(findWindowGaps([{ start: T0 + MINUTE, end: T0 + 2 * MINUTE }], T0)).toHaveLength(1);
-  });
-
-  it("flags a cursor a week behind, because ClickHouse drops data at 90 days", () => {
-    expect(isFallingBehind(T0, T0 + 6 * 24 * 60 * MINUTE)).toBe(false);
-    expect(isFallingBehind(T0, T0 + 8 * 24 * 60 * MINUTE)).toBe(true);
-    expect(isFallingBehind(null, T0)).toBe(false);
-  });
-
-  it("renders timestamps in the format ClickHouse parses", () => {
-    expect(toClickHouseTime(T0)).toBe("2026-09-16 12:00:00.000");
-  });
-});
-
-describe("chargebee findOperation hardening (regression)", () => {
-  it("ignores an operation whose id does not match, even though the API returns it", async () => {
-    // MEASURED: Chargebee's /ledger_operations IGNORES `id[is]`. It returns the
-    // subscription's operations regardless, so a query for a batch id that was
-    // never captured comes back holding the grant's `allocation`. Trusting that
-    // made every first capture look already-done — the charge was skipped while
-    // the window was marked billed.
+  it("retrieves the operation by our id rather than scanning a page of the list", async () => {
+    // The list endpoint ignores `id[is]` and returns 100 per page, so a capture
+    // that landed could fall off the page once a subscription had more than
+    // 100 operations — and be sent again.
     const { createChargebee } = await import("@/lib/chargebee");
+    const urls: string[] = [];
+    const fetchImpl = (async (url: URL) => {
+      urls.push(String(url));
+      return json(200, { ledger_operation: { id: "our-batch-uuid", type: "capture", subscription_id: "sub_1" } });
+    }) as unknown as typeof fetch;
 
-    const fetchImpl = (async () =>
-      new Response(
-        JSON.stringify({
-          list: [{ ledger_operation: { id: "some-other-operation", type: "allocation" } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      )) as unknown as typeof fetch;
+    const cb = createChargebee({ site: "test", apiKey: "k", fetchImpl });
+
+    expect(await cb.findOperation("our-batch-uuid", "sub_1")).toEqual({ id: "our-batch-uuid" });
+    expect(urls).toEqual(["https://test.chargebee.com/api/v2/ledger_operations/our-batch-uuid"]);
+  });
+
+  it("reads resource_not_found as a definite 'never captured'", async () => {
+    const { createChargebee } = await import("@/lib/chargebee");
+    const fetchImpl = (async () => json(404, NOT_FOUND)) as unknown as typeof fetch;
 
     const cb = createChargebee({ site: "test", apiKey: "k", fetchImpl });
 
     expect(await cb.findOperation("our-batch-uuid", "sub_1")).toBeNull();
   });
 
-  it("matches only a real capture under our own id", async () => {
+  it("does not count a grant under our id as a charge", async () => {
     const { createChargebee } = await import("@/lib/chargebee");
-
     const fetchImpl = (async () =>
-      new Response(
-        JSON.stringify({
-          list: [
-            { ledger_operation: { id: "our-batch-uuid", type: "allocation" } }, // grant, not a charge
-            { ledger_operation: { id: "our-batch-uuid", type: "capture" } },
-          ],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      )) as unknown as typeof fetch;
+      json(200, { ledger_operation: { id: "our-batch-uuid", type: "allocation", subscription_id: "sub_1" } })) as unknown as typeof fetch;
 
     const cb = createChargebee({ site: "test", apiKey: "k", fetchImpl });
 
-    expect(await cb.findOperation("our-batch-uuid", "sub_1")).toEqual({ id: "our-batch-uuid" });
+    expect(await cb.findOperation("our-batch-uuid", "sub_1")).toBeNull();
+  });
+
+  it("throws on a failed lookup instead of reporting 'not found'", async () => {
+    // A 5xx or timeout says nothing about whether the capture exists. Reading
+    // it as "not found" would re-send a charge that may have landed.
+    const { createChargebee } = await import("@/lib/chargebee");
+    const fetchImpl = (async () => json(503, { message: "unavailable" })) as unknown as typeof fetch;
+
+    const cb = createChargebee({ site: "test", apiKey: "k", fetchImpl, maxAttempts: 1 });
+
+    await expect(cb.findOperation("our-batch-uuid", "sub_1")).rejects.toMatchObject({ retryable: true });
   });
 });

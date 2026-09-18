@@ -1,10 +1,10 @@
 /**
- * In-memory doubles for the sync loop.
+ * In-memory doubles for the usage sync.
  *
- * The fake Prisma enforces the two PARTIAL unique indexes from the migration,
- * because those constraints — not any code path — are what prevent a double
- * charge. A fake that ignored them would let every test pass while production
- * charged twice.
+ * The fake Prisma enforces the constraints that prevent a double charge — one
+ * pending capture per tenant, one key per billed usage event — because those
+ * constraints, not any code path, are what make a replay safe. A fake that
+ * ignored them would let every test pass while production charged twice.
  *
  * The fake Chargebee models the property the whole design rests on: a capture
  * carrying an id that already moved money does not move it again. If that turns
@@ -14,7 +14,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { CAPTURE_OK, CAPTURE_REPLAYED, type CaptureArgs, type CaptureResult } from "@/lib/chargebee";
+import { CAPTURE_OK, CAPTURE_REPLAYED, CAPTURE_RETRYABLE, type CaptureArgs, type CaptureResult } from "@/lib/chargebee";
+import type { ReadEventsArgs, UsageEvent, UsageSource } from "@/lib/usage-events";
 
 export const RATE = "0.001";
 export const MINUTE = 60_000;
@@ -84,6 +85,9 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
   const accounts = new Map<string, AccountRow>();
   const batches = new Map<string, BatchRow>();
   const entries: EntryRow[] = [];
+  const events = new Map<string, Record<string, any>>();
+  const cursors = new Map<string, Record<string, any>>();
+  const billed = new Map<string, Record<string, any>>(); // `${tenantId}|${eventKey}`
 
   accounts.set(TENANT, {
     tenantId: TENANT,
@@ -97,19 +101,17 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
     ...account,
   });
 
-  /** Mirrors `usage_sync_batch_window_uq` and `usage_sync_batch_pending_uq`. */
+  /** Mirrors `usage_sync_batch_pending_uq`: one capture in flight per tenant. */
   function assertBatchIndexes(row: BatchRow, excludeId?: string) {
+    // The table's CHECK constraints. A fake that skipped them let a zero-width
+    // capture (every event in one millisecond) pass here and fail in Postgres.
+    if (!["pending", "captured", "failed", "skipped"].includes(row.status)) throw new Error(`usage_sync_batch_status_check: ${row.status}`);
+    if (!["window", "adjustment"].includes(row.kind)) throw new Error(`usage_sync_batch_kind_check: ${row.kind}`);
+    if (row.windowEnd.getTime() < row.windowStart.getTime()) throw new Error("usage_sync_batch_window_order");
+    if (Number(row.billedUsd) < 0 || Number(row.consumeCredits) < 0 || Number(row.spanCount) < 0) throw new Error("usage_sync_batch_amounts_nonneg");
     for (const existing of batches.values()) {
       if (existing.id === excludeId) continue;
       if (existing.tenantId !== row.tenantId) continue;
-
-      if (
-        row.kind === "window" &&
-        existing.kind === "window" &&
-        existing.windowStart.getTime() === row.windowStart.getTime()
-      ) {
-        throw new UniqueViolation("usage_sync_batch_window_uq");
-      }
       if (row.status === "pending" && existing.status === "pending") {
         throw new UniqueViolation("usage_sync_batch_pending_uq");
       }
@@ -132,6 +134,9 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
     async findMany({ where }: { where: { tenantId: string } }) {
       return entries.filter((e) => e.tenantId === where.tenantId);
     },
+    async findFirst({ where }: { where: Record<string, any> }) {
+      return entries.find((e) => matches(e as Record<string, any>, where)) ?? null;
+    },
     async create({ data }: { data: Omit<EntryRow, "id"> }) {
       // Mirrors `credit_ledger_tenant_source_uq`.
       if (entries.some((e) => e.tenantId === data.tenantId && e.sourceRef === data.sourceRef)) {
@@ -147,15 +152,16 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
   // without a type annotation TypeScript cannot infer a self-referential object.
   const api: any = {
     billingAccount: {
-      async findUnique({ where }: { where: { routingSlug?: string; tenantId?: string } }) {
+      async findUnique({ where }: { where: { routingSlug?: string; tenantId?: string; chargebeeCustomerId?: string } }) {
         for (const row of accounts.values()) {
           if (where.routingSlug && row.routingSlug === where.routingSlug) return { ...row };
           if (where.tenantId && row.tenantId === where.tenantId) return { ...row };
+          if (where.chargebeeCustomerId && (row as any).chargebeeCustomerId === where.chargebeeCustomerId) return { ...row };
         }
         return null;
       },
-      async findMany() {
-        return [...accounts.values()].map((r) => ({ ...r }));
+      async findMany({ where }: { where?: Record<string, any> } = {}) {
+        return [...accounts.values()].filter((row) => matches(row, where ?? {})).map((r) => ({ ...r }));
       },
       async upsert({ where, create, update }: { where: { tenantId: string }; create: Record<string, any>; update: Record<string, any> }) {
         const existing = accounts.get(where.tenantId);
@@ -227,17 +233,89 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
       async findMany({ where }: { where: Record<string, any> }) {
         return [...batches.values()].filter((row) => matches(row, where)).map((r) => ({ ...r }));
       },
-      async aggregate({ where }: { where: Record<string, any> }) {
-        const rows = [...batches.values()].filter((row) => matches(row, where));
-        const max = rows.reduce<Date | null>(
-          (best, row) => (!best || row.windowEnd > best ? row.windowEnd : best),
-          null,
-        );
-        return { _max: { windowEnd: max } };
+      async findUnique({ where }: { where: { id: string } }) {
+        const row = batches.get(where.id);
+        return row ? { ...row } : null;
+      },
+    },
+
+    /** Mirrors `billing_cursor`: tenant_id is the primary key. */
+    billingCursor: {
+      async findMany() {
+        return [...cursors.values()].map((r) => ({ ...r }));
+      },
+      async findUnique({ where }: { where: { tenantId: string } }) {
+        const row = cursors.get(where.tenantId);
+        return row ? { ...row } : null;
+      },
+      async create({ data }: { data: Record<string, any> }) {
+        if (cursors.has(data.tenantId)) throw new UniqueViolation("billing_cursor_pkey");
+        const row = { lastEventId: "", lockedUntil: null, lockedBy: null, updatedAt: new Date(), ...data };
+        cursors.set(data.tenantId, row);
+        return { ...row };
+      },
+      async updateMany({ where, data }: { where: Record<string, any>; data: Record<string, any> }) {
+        let count = 0;
+        for (const row of cursors.values()) {
+          if (matches(row, where)) {
+            Object.assign(row, data);
+            count += 1;
+          }
+        }
+        return { count };
+      },
+    },
+
+    /** Mirrors `billed_usage_event`: (tenant_id, event_key) is the primary key. */
+    billedUsageEvent: {
+      async findMany({ where }: { where: Record<string, any> }) {
+        return [...billed.values()].filter((row) => matches(row, where)).map((r) => ({ ...r }));
+      },
+      async createMany({ data }: { data: Array<Record<string, any>> }) {
+        for (const d of data) {
+          if (billed.has(`${d.tenantId}|${d.eventKey}`)) throw new UniqueViolation("billed_usage_event_pkey");
+        }
+        for (const d of data) billed.set(`${d.tenantId}|${d.eventKey}`, { createdAt: new Date(), batchId: null, ...d });
+        return { count: data.length };
+      },
+      async deleteMany({ where }: { where: Record<string, any> }) {
+        let count = 0;
+        for (const [k, row] of billed) {
+          if (matches(row, where)) {
+            billed.delete(k);
+            count += 1;
+          }
+        }
+        return { count };
       },
     },
 
     creditLedgerEntry,
+
+    /** Mirrors `processed_billing_event`: event_id is the primary key. */
+    processedBillingEvent: {
+      async create({ data }: { data: Record<string, any> }) {
+        if (events.has(data.eventId)) throw new UniqueViolation("processed_billing_event_pkey");
+        const row = { tenantId: null, processedAt: null, error: null, receivedAt: new Date(), ...data };
+        events.set(data.eventId, row);
+        return { ...row };
+      },
+      async update({ where, data }: { where: { eventId: string }; data: Record<string, any> }) {
+        const row = events.get(where.eventId)!;
+        Object.assign(row, data);
+        return { ...row };
+      },
+      async updateMany({ where, data }: { where: Record<string, any>; data: Record<string, any> }) {
+        let count = 0;
+        for (const row of events.values()) {
+          if (matches(row, where)) {
+            Object.assign(row, data);
+            count += 1;
+          }
+        }
+        return { count };
+      },
+    },
 
     /** Runs the callback against the same store — enough to assert atomicity intent. */
     async $transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
@@ -248,6 +326,9 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
     _entries: entries,
     _batches: batches,
     _accounts: accounts,
+    _events: events,
+    _cursors: cursors,
+    _billed: billed,
   };
 
   return api;
@@ -255,12 +336,23 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}) {
 
 function matches(row: Record<string, any>, where: Record<string, any>): boolean {
   return Object.entries(where).every(([key, condition]) => {
+    if (key === "OR") return (condition as Array<Record<string, any>>).some((c) => matches(row, c));
+    if (condition === null) return row[key] == null;
+    if (condition instanceof Date) return row[key] instanceof Date && row[key].getTime() === condition.getTime();
     if (condition && typeof condition === "object" && "in" in condition) {
       return (condition.in as unknown[]).includes(row[key]);
     }
     if (condition && typeof condition === "object" && "not" in condition) {
       return row[key] !== condition.not;
     }
+    if (condition && typeof condition === "object" && "lt" in condition) {
+      return row[key] < condition.lt;
+    }
+    if (condition && typeof condition === "object" && "startsWith" in condition) {
+      return typeof row[key] === "string" && row[key].startsWith(condition.startsWith);
+    }
+    // Decimal columns are held as strings here; Prisma compares them by value.
+    if (typeof condition === "number") return Number(row[key]) === condition;
     return row[key] === condition;
   });
 }
@@ -270,6 +362,10 @@ export class FakeChargebee {
   applied = new Map<string, string>();
   captures: Array<{ id: string; amount: string }> = [];
   failNext: CaptureResult | null = null;
+  /** The charge lands, but the response never arrives (network timeout). */
+  loseResponseNext = false;
+  /** The worker dies mid-call: before the charge, or after it landed. */
+  crashNext: "before" | "after" | null = null;
 
   constructor(balance = 1000) {
     this.balance = balance;
@@ -283,6 +379,10 @@ export class FakeChargebee {
   async captureIdempotent(args: CaptureArgs): Promise<CaptureResult> {
     this.captures.push({ id: args.id, amount: args.amount });
 
+    if (this.crashNext === "before") {
+      this.crashNext = null;
+      throw new Error("worker killed before the capture");
+    }
     if (this.failNext) {
       const result = this.failNext;
       this.failNext = null;
@@ -296,6 +396,15 @@ export class FakeChargebee {
 
     this.applied.set(args.id, args.amount);
     this.balance -= Number(args.amount);
+
+    if (this.crashNext === "after") {
+      this.crashNext = null;
+      throw new Error("worker killed after the capture landed");
+    }
+    if (this.loseResponseNext) {
+      this.loseResponseNext = false;
+      return { kind: CAPTURE_RETRYABLE, error: Object.assign(new Error("Chargebee timeout"), { retryable: true }) };
+    }
     return { kind: CAPTURE_OK, operationId: args.id, balanceAfter: String(this.balance) };
   }
 
@@ -303,37 +412,47 @@ export class FakeChargebee {
   get appliedCount() {
     return this.applied.size;
   }
+
+  /** Total credits actually taken. */
+  get taken() {
+    return [...this.applied.values()].reduce((s, a) => s + Number(a), 0);
+  }
 }
 
-export class FakeUsage {
-  perWindow = new Map<number, { billedUsd: string; spans: number }>();
-  reads: Array<{ slug: string; window: { start: number; end: number } }> = [];
+/**
+ * ClickHouse span_nodes as the usage sync sees it: events in
+ * (ingestedAt, key) order, byte-wise key comparison, Timestamp >= the floor.
+ */
+export class FakeUsageSource implements UsageSource {
+  events: Array<UsageEvent & { timestampMs: number }> = [];
+  nowMs = T0;
+  reads: ReadEventsArgs[] = [];
   throwNext: Error | null = null;
 
-  constructor(public defaultUsd = "0") {}
-
-  set(windowStart: number, billedUsd: string, spans = 1) {
-    this.perWindow.set(windowStart, { billedUsd, spans });
+  /** One costed LLM call. `timestampMs` is the LLM span start, <= ingestion. */
+  add(key: string, ingestedAtMs: number, billedUsd = 0.001, timestampMs = ingestedAtMs) {
+    this.events.push({ key, ingestedAtMs, billedUsd, providerUsd: billedUsd, marginUsd: 0, inputTokens: 1, outputTokens: 1, timestampMs });
     return this;
   }
 
-  async readWindow(slug: string, window: { start: number; end: number }) {
-    this.reads.push({ slug, window });
+  async now() {
+    return this.nowMs;
+  }
+
+  async readEvents(_slug: string, a: ReadEventsArgs): Promise<UsageEvent[]> {
+    this.reads.push(a);
     if (this.throwNext) {
       const err = this.throwNext;
       this.throwNext = null;
       throw err;
     }
-    const hit = this.perWindow.get(window.start);
-    const billedUsd = hit?.billedUsd ?? this.defaultUsd;
-    return {
-      spans: hit?.spans ?? (billedUsd === "0" ? 0 : 1),
-      billedUsd,
-      providerUsd: billedUsd,
-      marginUsd: "0",
-      inputTokens: 0,
-      outputTokens: 0,
-    };
+    const byte = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+    return this.events
+      .filter((e) => e.timestampMs >= a.minTimestampMs && e.ingestedAtMs <= a.untilMs)
+      .filter((e) => e.ingestedAtMs > a.afterMs || (e.ingestedAtMs === a.afterMs && byte(e.key, a.afterKey) > 0))
+      .sort((x, y) => x.ingestedAtMs - y.ingestedAtMs || byte(x.key, y.key))
+      .slice(0, a.limit)
+      .map(({ timestampMs: _t, ...e }) => e);
   }
 }
 

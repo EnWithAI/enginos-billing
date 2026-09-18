@@ -19,6 +19,7 @@ import { createAccounts } from "@/lib/account";
 import { createChargebee } from "@/lib/chargebee";
 import { getConfig } from "@/lib/config";
 import { prisma } from "@/lib/db";
+import { gatewayBudgetHooks } from "@/lib/gateway";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
 
   const config = getConfig();
   const chargebee = createChargebee();
-  const accounts = createAccounts({ chargebee, usdPerCredit: config.usdPerCredit });
+  const accounts = createAccounts({ chargebee, usdPerCredit: config.usdPerCredit, ...gatewayBudgetHooks() });
 
   const account = await prisma.billingAccount.findUnique({ where: { tenantId: body.tenantId } });
 
