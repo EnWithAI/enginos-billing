@@ -19,7 +19,7 @@ import { internalAuthorised } from "@/lib/auth";
 import { createChargebee } from "@/lib/chargebee";
 import { getConfig } from "@/lib/config";
 import { balanceOf, recentEntries } from "@/lib/ledger";
-import { prisma } from "@/lib/db";
+import { ACCOUNT, prisma } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -75,6 +75,23 @@ export async function GET(request: Request, ctx: { params: Promise<{ tenantId: s
       plan: { itemPriceId: config.defaultItemPriceId },
       term: { start: null, end: null },
       credits: { unit: null, granted: "0", allocated: "0", consumed: "0", current: "0" },
+      budgetUsd: "0",
+      lastSync: null,
+      history: [],
+    });
+  }
+
+  // Paid, but the gateway does not hold the budget yet, so the credits cannot
+  // be spent. Showing them would promise service that is blocked; they appear
+  // once the retry lands and the account turns active.
+  if (account.status === ACCOUNT.ACTIVATING) {
+    return NextResponse.json({
+      site: config.chargebee.site,
+      plansOffered: config.itemPriceIds,
+      status: ACCOUNT.ACTIVATING,
+      plan: { itemPriceId: account.chargebeeItemPriceId ?? config.defaultItemPriceId },
+      term: { start: account.currentTermStart, end: account.currentTermEnd },
+      credits: { unit: account.ledgerUnitId, granted: "0", allocated: "0", consumed: "0", current: "0" },
       budgetUsd: "0",
       lastSync: null,
       history: [],

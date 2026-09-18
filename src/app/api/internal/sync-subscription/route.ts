@@ -21,6 +21,7 @@ import { internalAuthorised } from "@/lib/auth";
 import { createAccounts } from "@/lib/account";
 import { createChargebee } from "@/lib/chargebee";
 import { getConfig } from "@/lib/config";
+import { gatewayBudgetHooks } from "@/lib/gateway";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -39,6 +40,7 @@ export async function POST(request: Request) {
   const accounts = createAccounts({
     chargebee: createChargebee(),
     usdPerCredit: config.usdPerCredit,
+    ...gatewayBudgetHooks(),
   });
 
   try {

@@ -24,6 +24,8 @@ export type { PrismaClient };
 /** Account states. `exhausted` is display-only — the gateway is the real gate. */
 export const ACCOUNT = {
   UNLINKED: "unlinked",
+  /** Paid, but the LiteLLM budget is not set yet: no credits shown, team blocked, retried each minute. */
+  ACTIVATING: "activating",
   ACTIVE: "active",
   CANCELLED: "cancelled",
   EXHAUSTED: "exhausted",

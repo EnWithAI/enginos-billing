@@ -97,38 +97,26 @@ describe("reconciliation", () => {
     expect(await reconcileTenant(TENANT, prisma as never)).toEqual([]);
   });
 
-  it("flags a gap between windows, where usage would fall through unbilled", async () => {
+  it("flags a captured batch whose cursor target is ahead of the cursor", async () => {
+    // The capture and the cursor advance commit in one transaction. If they
+    // ever diverged, the next read would charge that usage again.
     const prisma = makeFakePrisma();
     seed(prisma);
-    prisma._batches.set("batch-1", batch() as never);
+    prisma._batches.set("batch-1", batch({ cursorToAt: new Date(T + 5 * MIN), cursorToEventId: "~" }) as never);
     prisma._entries.push(entry() as never);
-    prisma._batches.set(
-      "batch-2",
-      batch({
-        id: "batch-2",
-        status: "skipped",
-        windowStart: new Date(T + 5 * MIN), // gap: previous ended at T + 1min
-        windowEnd: new Date(T + 6 * MIN),
-      }) as never,
-    );
+    prisma._cursors.set(TENANT, { tenantId: TENANT, lastProcessedAt: new Date(T + MIN), lastEventId: "" });
 
     const problems = await reconcileTenant(TENANT, prisma as never);
-    expect(problems.map((p) => p.kind)).toContain("window-gap");
+    expect(problems.map((p) => p.kind)).toContain("cursor-behind-capture");
   });
 
-  it("ignores failed batches when checking contiguity", async () => {
-    // A failed batch deliberately holds the cursor; it is not a gap, and
-    // flagging it would bury the real gaps in noise.
+  it("passes when the cursor has reached every captured batch", async () => {
     const prisma = makeFakePrisma();
     seed(prisma);
-    prisma._batches.set("batch-1", batch() as never);
+    prisma._batches.set("batch-1", batch({ cursorToAt: new Date(T + 5 * MIN), cursorToEventId: "~" }) as never);
     prisma._entries.push(entry() as never);
-    prisma._batches.set(
-      "batch-2",
-      batch({ id: "batch-2", status: "failed", windowStart: new Date(T + MIN), windowEnd: new Date(T + 2 * MIN) }) as never,
-    );
+    prisma._cursors.set(TENANT, { tenantId: TENANT, lastProcessedAt: new Date(T + 5 * MIN), lastEventId: "~" });
 
-    const problems = await reconcileTenant(TENANT, prisma as never);
-    expect(problems.filter((p) => p.kind === "window-gap")).toEqual([]);
+    expect(await reconcileTenant(TENANT, prisma as never)).toEqual([]);
   });
 });

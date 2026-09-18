@@ -11,35 +11,43 @@ import { describe, expect, it } from "vitest";
 import {
   CAPTURE_INSUFFICIENT,
   CAPTURE_NO_LEDGER,
+  CAPTURE_OK,
+  CAPTURE_REPLAYED,
   CAPTURE_RETRYABLE,
   CAPTURE_TERMINAL,
   classify,
   createChargebee,
   type ChargebeeError,
 } from "@/lib/chargebee";
-import { assertSlug, toUsage, usageQuery } from "@/lib/clickhouse";
-import { createSync, OUTCOME } from "@/lib/sync";
-import { DEFAULT_LAG_MS } from "@/lib/window";
-import { FakeChargebee, FakeUsage, MINUTE, RATE, SLUG, T0, TENANT, makeFakePrisma, quietLogger } from "./harness";
+import { assertSlug, eventsQuery } from "@/lib/usage-events";
+import { OUTCOME, createUsageSync } from "@/lib/usage-sync";
+import { FakeChargebee, FakeUsageSource, MINUTE, RATE, SLUG, T0, TENANT, makeFakePrisma, quietLogger } from "./harness";
 
-const LAG = DEFAULT_LAG_MS;
+const LAG = 2 * MINUTE;
 
-function rig(opts: { usd?: string; balance?: number } = {}) {
+/** One tenant, sync_from T0; `usd` is one costed event ingested at T0 + 30s. */
+function rig(opts: { usd?: number; balance?: number } = {}) {
   const prisma = makeFakePrisma();
   const chargebee = new FakeChargebee(opts.balance ?? 1000);
-  const usage = new FakeUsage(opts.usd ?? "0");
+  const usage = new FakeUsageSource();
+  if (opts.usd !== undefined) usage.add("t1:s1", T0 + 30_000, opts.usd);
+  const blocked: Array<{ tenantId: string; reason?: string }> = [];
   let now = T0;
-  const sync = createSync({
+  const sync = createUsageSync({
     prisma: prisma as never,
     usage,
     chargebee,
     usdPerCredit: RATE,
     lagMs: LAG,
-    maxWindowMs: 60 * MINUTE,
     clock: () => now,
     logger: quietLogger,
+    blockBudget: async (tenantId, reason) => void blocked.push({ tenantId, reason }),
   });
-  return { prisma, chargebee, usage, sync, advance: (m: number) => { now = T0 + m * MINUTE + LAG; } };
+  return {
+    prisma, chargebee, usage, sync, blocked,
+    /** Move both clocks so usage ingested before T0 + m minutes has aged past the lag. */
+    advance: (m: number) => { now = T0 + m * MINUTE + LAG; usage.nowMs = now; },
+  };
 }
 
 // ── LLM-side failures ──────────────────────────────────────────────────
@@ -47,14 +55,13 @@ function rig(opts: { usd?: string; balance?: number } = {}) {
 describe("when the LLM call fails", () => {
   it("bills nothing, because a failed call carries no cost attribute", async () => {
     // The ClickHouse query filters on `gen_ai.cost.total_cost != ''`. A provider
-    // error produces a span with no cost, so it never reaches the sum. The
-    // window is real and closes normally — it just has nothing in it.
-    const r = rig({ usd: "0" });
+    // error produces a span with no cost, so it is never an event at all.
+    const r = rig();
     r.advance(1);
 
     const result = await r.sync.runTenant(SLUG);
 
-    expect(result.outcome).toBe(OUTCOME.SKIPPED);
+    expect(result.outcome).toBe(OUTCOME.IDLE);
     expect(r.chargebee.appliedCount).toBe(0);
     expect(r.prisma._entries).toHaveLength(0);
   });
@@ -62,9 +69,9 @@ describe("when the LLM call fails", () => {
   it("still bills a fallback that succeeded after a retry", async () => {
     // LiteLLM runs num_retries: 3. A failed attempt costs nothing, but a
     // fallback that reached a second provider DID cost money and must be
-    // billed — two costed spans in one window sum to one charge.
+    // billed — two costed events sum to one charge.
     const r = rig();
-    r.usage.set(T0, "0.0000254", 2); // two costed spans, one window
+    r.usage.add("t1:s1", T0 + 10_000, 0.0000127).add("t1:s2", T0 + 20_000, 0.0000127);
     r.advance(1);
 
     const result = await r.sync.runTenant(SLUG);
@@ -78,8 +85,7 @@ describe("when the LLM call fails", () => {
     // A runaway or mis-priced model would show up as a huge capture rather than
     // being silently clamped. Clamping would hide the incident; the ledger
     // entry is the alarm.
-    const r = rig({ balance: 1_000_000 });
-    r.usage.set(T0, "500");
+    const r = rig({ usd: 500, balance: 1_000_000 });
     r.advance(1);
 
     const result = await r.sync.runTenant(SLUG);
@@ -91,11 +97,10 @@ describe("when the LLM call fails", () => {
 // ── credit exhaustion ──────────────────────────────────────────────────
 
 describe("when credits run out", () => {
-  it("holds the cursor rather than dropping the usage", async () => {
-    // The v1 plan uses a CAPPED credit unit (token-test: is_unlimited false),
-    // so Chargebee refuses a capture past zero. The usage must not be discarded
-    // — the cursor stays put so it is billed once the balance is topped up.
-    const r = rig({ usd: "0.25" });
+  it("holds billing rather than dropping the usage", async () => {
+    // The usage must not be discarded — its capture stays recorded (failed)
+    // and nothing newer is billed past it until it is resolved.
+    const r = rig({ usd: 0.25 });
     r.advance(1);
     r.chargebee.fail({ kind: CAPTURE_TERMINAL, error: new Error("insufficient balance") });
 
@@ -103,19 +108,17 @@ describe("when credits run out", () => {
 
     expect(result.outcome).toBe(OUTCOME.FAILED);
     expect(r.chargebee.appliedCount).toBe(0);
-
-    // Cursor held: the next sweep retries the SAME window, it does not skip on.
     const batches = [...r.prisma._batches.values()];
     expect(batches).toHaveLength(1);
     expect(batches[0]!.status).toBe("failed");
-    expect(batches[0]!.windowStart).toEqual(new Date(T0));
+    expect(r.prisma._cursors.get(TENANT)!.lastProcessedAt).toEqual(new Date(T0));
   });
 
   it("marks the account exhausted and keeps the usage when Chargebee refuses", async () => {
     // MEASURED code from the live site: HTTP 400, ERROR_INSUFFICIENT_BALANCE,
     // "Not enough balance exists in the account." Only fires on a capped credit
     // unit — one with unlimited overdraft silently accrues debt instead.
-    const r = rig({ usd: "0.25" });
+    const r = rig({ usd: 0.25 });
     r.advance(1);
     r.chargebee.fail({
       kind: CAPTURE_INSUFFICIENT,
@@ -133,10 +136,33 @@ describe("when credits run out", () => {
     // The usage is retained, not dropped — it bills after a top-up.
     expect([...r.prisma._batches.values()][0]!.status).toBe("failed");
     expect(r.prisma._entries).toHaveLength(0);
+    // And nothing more may run: Chargebee is what the customer bought.
+    expect(r.blocked).toEqual([{ tenantId: TENANT, reason: "exhausted" }]);
+  });
+
+  it("blocks the team when a capture leaves the Chargebee balance at zero", async () => {
+    // The LiteLLM cap normally stops spend first, but it only counts what
+    // reaches the team. Chargebee running out is the final word.
+    const r = rig({ usd: 0.25, balance: 250 }); // exactly the event's 250 credits
+    r.advance(1);
+
+    const result = await r.sync.runTenant(SLUG);
+
+    expect(result.outcome).toBe(OUTCOME.CAPTURED);
+    expect(r.prisma._accounts.get(TENANT)!.status).toBe("exhausted");
+    expect(r.blocked).toEqual([{ tenantId: TENANT, reason: "exhausted" }]);
+  });
+
+  it("does not block while credits remain", async () => {
+    const r = rig({ usd: 0.25, balance: 1000 });
+    r.advance(1);
+
+    await r.sync.runTenant(SLUG);
+
+    expect(r.blocked).toEqual([]);
   });
 
   it("classifies the real ERROR_INSUFFICIENT_BALANCE code as insufficient, not generic terminal", async () => {
-    const { classify } = await import("@/lib/chargebee");
     const err = Object.assign(new Error("Not enough balance exists in the account."), {
       apiErrorCode: "ERROR_INSUFFICIENT_BALANCE",
       status: 400,
@@ -146,7 +172,7 @@ describe("when credits run out", () => {
   });
 
   it("never writes a ledger entry for a charge that did not happen", async () => {
-    const r = rig({ usd: "0.25" });
+    const r = rig({ usd: 0.25 });
     r.advance(1);
     r.chargebee.fail({ kind: CAPTURE_TERMINAL, error: new Error("insufficient balance") });
 
@@ -158,8 +184,8 @@ describe("when credits run out", () => {
 // ── cron / worker failures ─────────────────────────────────────────────
 
 describe("when the cron or worker fails", () => {
-  it("a crash before the capture leaves nothing to reconcile", async () => {
-    const r = rig({ usd: "0.25" });
+  it("a crash while reading leaves nothing to reconcile", async () => {
+    const r = rig({ usd: 0.25 });
     r.advance(1);
     r.usage.throwNext = new Error("worker killed mid-read");
 
@@ -169,12 +195,16 @@ describe("when the cron or worker fails", () => {
   });
 
   it("a crash after the capture is recovered on the next tick, charging once", async () => {
-    const r = rig({ usd: "0.25" });
+    const r = rig({ usd: 0.25 });
     r.advance(1);
 
+    // The batch is recorded, the capture lands, then the settle write dies.
     const realTx = r.prisma.$transaction;
-    r.prisma.$transaction = async () => {
-      throw new Error("worker killed mid-write");
+    let calls = 0;
+    r.prisma.$transaction = async (fn: (tx: unknown) => Promise<unknown>) => {
+      calls += 1;
+      if (calls === 2) throw new Error("worker killed mid-write");
+      return realTx(fn as never);
     };
     await expect(r.sync.runTenant(SLUG)).rejects.toThrow();
 
@@ -186,8 +216,8 @@ describe("when the cron or worker fails", () => {
     expect(r.prisma._entries).toHaveLength(1);
   });
 
-  it("one tenant's failure does not abort the sweep for the others", async () => {
-    const r = rig({ usd: "0.25" });
+  it("one tenant's failure does not abort the pass for the others", async () => {
+    const r = rig({ usd: 0.25 });
     r.advance(1);
     r.usage.throwNext = new Error("clickhouse died for this tenant");
 
@@ -198,30 +228,144 @@ describe("when the cron or worker fails", () => {
     expect(summary.tenantsScanned).toBe(1);
   });
 
-  it("gives up after too many unknown outcomes rather than replaying forever", async () => {
+  it("keeps an unknown outcome pending past maxAttempts, escalates, and settles once Chargebee answers", async () => {
+    // Marking it `failed` after N tries used to wedge the tenant: billing held
+    // behind a capture nothing would ever ask Chargebee about again. Only
+    // Chargebee can resolve an unknown, so the batch waits for it — louder.
     const prisma = makeFakePrisma();
     const chargebee = new FakeChargebee(1000);
-    const usage = new FakeUsage("0.25");
-    let now = T0 + MINUTE + LAG;
-    const sync = createSync({
+    const usage = new FakeUsageSource().add("t1:s1", T0 + 30_000, 0.25);
+    usage.nowMs = T0 + MINUTE + LAG;
+    const errors: Array<{ metric?: string }> = [];
+    const sync = createUsageSync({
       prisma: prisma as never,
       usage,
       chargebee,
       usdPerCredit: RATE,
       lagMs: LAG,
       maxAttempts: 3,
-      clock: () => now,
-      logger: quietLogger,
+      clock: () => T0 + MINUTE + LAG,
+      logger: { ...quietLogger, error: (obj: unknown) => errors.push(obj as { metric?: string }) },
     });
 
-    for (let i = 0; i < 3; i += 1) {
-      chargebee.fail({ kind: CAPTURE_RETRYABLE, error: Object.assign(new Error("503"), { retryable: true }) });
-      await sync.runTenant(SLUG);
+    for (let i = 0; i < 4; i += 1) {
+      chargebee.fail({ kind: CAPTURE_RETRYABLE, error: Object.assign(new Error("timeout"), { retryable: true }) });
+      expect((await sync.runTenant(SLUG)).outcome).toBe(OUTCOME.PENDING);
     }
 
-    const batch = [...prisma._batches.values()][0]!;
-    expect(batch.status).toBe("failed");
+    const onlyBatch = () => {
+      const batches = [...prisma._batches.values()];
+      expect(batches).toHaveLength(1);
+      return batches[0]!;
+    };
+    expect(onlyBatch().status).toBe("pending");
+    expect(errors.filter((e) => e.metric === "billing.sync.stuck")).toHaveLength(2); // attempts 3 and 4
     expect(chargebee.appliedCount).toBe(0);
+
+    // Chargebee is back: the same batch settles, exactly once.
+    expect((await sync.runTenant(SLUG)).outcome).toBe(OUTCOME.CAPTURED);
+    expect(onlyBatch().status).toBe("captured");
+    expect(chargebee.appliedCount).toBe(1);
+  });
+});
+
+// ── capture after an unknown outcome ───────────────────────────────────
+
+describe("captureIdempotent against Chargebee", () => {
+  const ARGS = { id: "batch-1", subscriptionId: "sub_1", unitId: "token", amount: "2.5" };
+
+  const NOT_FOUND = () =>
+    new Response(JSON.stringify({ api_error_code: "resource_not_found", message: "batch-1 not found" }), { status: 404 });
+  const CAPTURED = () =>
+    new Response(JSON.stringify({ ledger_operation: { id: ARGS.id, type: "capture" } }), { status: 200 });
+
+  /** Routes the retrieve and the capture separately and records every capture POST. */
+  function chargebeeWith(
+    lookup: () => Response | Promise<Response>,
+    send: (attempt: number) => Response | Promise<Response> = CAPTURED,
+    maxAttempts = 1,
+  ) {
+    const posts: string[] = [];
+    const fetchImpl = (async (url: URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        posts.push(String(url));
+        return send(posts.length);
+      }
+      return lookup();
+    }) as unknown as typeof fetch;
+    const cb = createChargebee({ site: "s", apiKey: "k", fetchImpl, maxAttempts, sleep: async () => {} });
+    return { cb, posts };
+  }
+
+  it("does not re-send a capture in the same tick after its response is lost", async () => {
+    // The POST may have landed. Re-sending it in place — as the generic retry
+    // did — leans on Chargebee's undocumented answer to a reused id. The next
+    // tick retrieves the id first instead.
+    const { cb, posts } = chargebeeWith(
+      NOT_FOUND,
+      () => {
+        throw new Error("The operation was aborted");
+      },
+      3,
+    );
+
+    const result = await cb.captureIdempotent(ARGS);
+
+    expect(result.kind).toBe(CAPTURE_RETRYABLE);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("does not re-send a capture in the same tick after a 5xx", async () => {
+    const { cb, posts } = chargebeeWith(NOT_FOUND, () => new Response("{}", { status: 503 }), 3);
+
+    expect((await cb.captureIdempotent(ARGS)).kind).toBe(CAPTURE_RETRYABLE);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("re-sends a rate-limited capture, which Chargebee refused before applying", async () => {
+    const { cb, posts } = chargebeeWith(
+      NOT_FOUND,
+      (attempt) => (attempt === 1 ? new Response("{}", { status: 429 }) : CAPTURED()),
+      3,
+    );
+
+    expect((await cb.captureIdempotent(ARGS)).kind).toBe(CAPTURE_OK);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("settles a capture that landed before the timeout, without charging again", async () => {
+    const { cb, posts } = chargebeeWith(
+      () => new Response(JSON.stringify({ ledger_operation: { id: ARGS.id, type: "capture", subscription_id: "sub_1" } }), { status: 200 }),
+    );
+
+    const result = await cb.captureIdempotent(ARGS);
+
+    expect(result.kind).toBe(CAPTURE_REPLAYED);
+    expect(posts).toHaveLength(0);
+  });
+
+  it("sends the capture only after Chargebee says the id does not exist", async () => {
+    const { cb, posts } = chargebeeWith(
+      () => new Response(JSON.stringify({ api_error_code: "resource_not_found", message: "batch-1 not found" }), { status: 404 }),
+    );
+
+    const result = await cb.captureIdempotent(ARGS);
+
+    expect(result.kind).toBe(CAPTURE_OK);
+    expect(posts).toEqual(["https://s.chargebee.com/api/v2/ledger_operations/capture"]);
+  });
+
+  it("does not capture blind when the lookup itself times out", async () => {
+    // A failed lookup is another unknown. Capturing anyway would re-send a
+    // charge that may already have landed; staying pending costs one tick.
+    const { cb, posts } = chargebeeWith(() => {
+      throw new Error("The operation was aborted");
+    });
+
+    const result = await cb.captureIdempotent(ARGS);
+
+    expect(result.kind).toBe(CAPTURE_RETRYABLE);
+    expect(posts).toHaveLength(0);
   });
 });
 
@@ -275,40 +419,40 @@ describe("ClickHouse read safety", () => {
     expect(() => assertSlug("org-acme")).toThrow(TypeError);
     expect(() => assertSlug("../etc")).toThrow(TypeError);
     expect(assertSlug("org_acme_com")).toBe("org_acme_com");
+    expect(() => eventsQuery("org-acme")).toThrow(TypeError);
   });
 
   it("reads the deduplicated table, never the raw trace table", () => {
-    const q = usageQuery("org_acme_com");
-    expect(q).toContain("span_nodes FINAL");
+    const q = eventsQuery("org_acme_com");
+    expect(q).toContain("tenant_org_acme_com.span_nodes FINAL");
     expect(q).not.toContain("otel_traces");
     // A union across landing and tenant counts every routed span twice.
     expect(q).not.toContain("merge(");
   });
 
-  it("uses a half-open window so a boundary span bills exactly once", () => {
-    const q = usageQuery("org_acme_com");
-    expect(q).toContain("Timestamp >= {from:DateTime64(3)}");
-    expect(q).toContain("Timestamp <  {to:DateTime64(3)}");
+  it("does not bill responses served from LiteLLM's cache", () => {
+    // MEASURED: a cache hit's span carries the full cost while LiteLLM records
+    // spend 0 for it — billing it charged for provider calls that never
+    // happened and drained Chargebee faster than the LiteLLM cap moved.
+    expect(eventsQuery("org_acme_com")).toContain("JSONExtractString(attrs['hidden_params'], 'cache_key') = ''");
   });
 
-  it("converts float sums to decimal strings immediately", () => {
-    // ClickHouse hands back float64. Pinning it once here stops the binary
-    // representation drifting through the conversion to credits.
-    const u = toUsage({
-      spans: 3,
-      billed_usd: 1e-7,
-      provider_usd: 1e-7,
-      margin_usd: 0,
-      in_tok: 10,
-      out_tok: 5,
-    });
-    expect(u.billedUsd).toBe("0.0000001");
-    expect(typeof u.billedUsd).toBe("string");
+  it("keys each event on its span, so a re-sent copy is the same event", () => {
+    expect(eventsQuery("org_acme_com").replace(/\s+/g, " ")).toContain("concat(TraceId, ':', SpanId) AS event_key");
   });
 
-  it("treats an empty result as a real zero, not as a failure", () => {
-    const u = toUsage({ spans: 0, billed_usd: 0, provider_usd: 0, margin_usd: 0, in_tok: 0, out_tok: 0 });
-    expect(u.spans).toBe(0);
-    expect(u.billedUsd).toBe("0");
+  it("reads strictly after the cursor on (ingested_at, event_key), up to the safe boundary", () => {
+    // Ingestion time, not span time: a span that arrives late still lands after
+    // the cursor. The key breaks ties between events ingested in the same ms.
+    const q = eventsQuery("org_acme_com");
+    expect(q).toContain("ingested_at <= {until:DateTime64(3)}");
+    expect(q).toContain("ingested_at > {after:DateTime64(3)}");
+    expect(q).toContain("(ingested_at = {after:DateTime64(3)} AND concat(TraceId, ':', SpanId) > {afterKey:String})");
+    expect(q).toContain("ORDER BY ingested_at, event_key");
+    expect(q).toContain("LIMIT {limit:UInt32}");
+  });
+
+  it("floors span time — at sync_from, or the key horizon behind the cursor", () => {
+    expect(eventsQuery("org_acme_com")).toContain("Timestamp >= {minTimestamp:DateTime64(3)}");
   });
 });

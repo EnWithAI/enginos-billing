@@ -76,14 +76,17 @@ function buildConfig() {
      */
     wholeCreditsOnly: process.env.WHOLE_CREDITS_ONLY === "true",
 
-    /** How long a window must have been closed before it is billed. */
+    /** Only usage ingested into ClickHouse at least this long ago is read (safe_until = now − lag). */
     lagMs: integer("BILLING_LAG_MS", 2 * 60 * 1000),
 
-    /** Longest interval one window may cover, so a backlog stays auditable. */
-    maxWindowMs: integer("BILLING_MAX_WINDOW_MS", 60 * 60 * 1000),
+    /** Events per Chargebee capture; a larger backlog is paged, one capture per page. */
+    maxEventsPerCapture: integer("BILLING_MAX_EVENTS_PER_CAPTURE", 5000),
 
-    /** Give up on a batch after this many attempts and ask for a human. */
+    /** Unknown capture outcomes past this many attempts log as errors (the batch stays pending). */
     maxAttempts: integer("BILLING_MAX_ATTEMPTS", 10),
+
+    /** Key horizon: spans this far behind the cursor are never read, and their keys are pruned (retention.ts). */
+    eventKeyRetentionMs: integer("BILLING_EVENT_KEY_RETENTION_MS", 7 * 24 * 60 * 60 * 1000),
 
     chargebee: {
       site: required("CHARGEBEE_SITE"),
@@ -99,6 +102,18 @@ function buildConfig() {
       password: required("CLICKHOUSE_PASSWORD"),
       /** Billing reads must never wedge behind a runaway scan. */
       timeoutMs: integer("CLICKHOUSE_TIMEOUT_MS", 20_000),
+    },
+
+    /**
+     * The LiteLLM gateway, for setting each prepaid team's `max_budget`.
+     *
+     * Optional: with no master key the budget is not pushed and a warning says
+     * so, rather than every checkout failing on a missing gateway.
+     */
+    litellm: {
+      baseUrl: optional("LITELLM_BASE_URL", "http://localhost:4000"),
+      masterKey: optional("LITELLM_MASTER_KEY", ""),
+      timeoutMs: integer("LITELLM_TIMEOUT_MS", 10_000),
     },
 
     /**

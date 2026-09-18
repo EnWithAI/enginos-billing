@@ -14,18 +14,39 @@
  * customer owns. They are reconciled, never merged.
  */
 
-import { ACCOUNT, ENTRY, prisma as defaultPrisma } from "./db";
+import { ACCOUNT, BATCH, ENTRY, prisma as defaultPrisma } from "./db";
+import type { BlockReason } from "./gateway";
 import { appendEntry } from "./ledger";
-import { creditsToUsd } from "./rate";
-import { add } from "./decimal";
+import { creditsToUsd, isBillable } from "./rate";
+import { add, decimal } from "./decimal";
 import type { ChargebeeClient } from "./chargebee";
+
+/**
+ * The idempotency key for one term's grant: `sub:<subscription id>:<term start>`.
+ *
+ * Every path that grants a term MUST use this. MEASURED end to end: the webhook
+ * keyed its grant on the Chargebee event id while the post-checkout sync keyed
+ * the same term on this, so the two — which both fire after every checkout —
+ * recorded the grant twice: 4,000 credits and a $4 cap for 2,000 bought.
+ */
+export function termGrantRef(subscriptionId: string, termStartSeconds?: number | null): string {
+  return `sub:${subscriptionId}:${termStartSeconds ?? 0}`;
+}
 
 export interface AccountDeps {
   prisma?: typeof defaultPrisma;
   chargebee: ChargebeeClient;
   usdPerCredit: string;
-  /** Pushes a team budget to LiteLLM. Injected so billing owns no gateway client. */
-  pushBudget?: (routingSlug: string, budgetUsd: string, termEnd: Date | null) => Promise<void>;
+  /**
+   * Sets the tenant's LiteLLM team cap from the ledger (see gateway.ts). When
+   * present, an account is only `active` once this has succeeded. Absent = no
+   * gateway configured: accounts go straight to `active`, unenforced.
+   */
+  pushBudget?: (tenantId: string, opts?: { unblock?: boolean }) => Promise<void>;
+  /** Blocks the tenant's LiteLLM team outright: a failed push, or Chargebee credits used up. */
+  blockBudget?: (tenantId: string, reason?: BlockReason) => Promise<void>;
+  /** Hands the tenant's LiteLLM team back to its plan budget when the subscription ends. */
+  releaseBudget?: (tenantId: string) => Promise<void>;
   clock?: () => number;
   logger?: { log?(o: unknown, m?: string): void; warn?(o: unknown, m?: string): void; error?(o: unknown, m?: string): void };
 }
@@ -227,7 +248,8 @@ export function createAccounts(deps: AccountDeps) {
         budgetUsd,
         currentTermStart: args.termStart ?? undefined,
         currentTermEnd: args.termEnd ?? undefined,
-        status: args.status ?? ACCOUNT.ACTIVE,
+        // Not active until the gateway holds the budget — see activate().
+        status: deps.pushBudget ? ACCOUNT.ACTIVATING : (args.status ?? ACCOUNT.ACTIVE),
         cachedBalanceCredits: balance?.usable ?? undefined,
         cachedBalanceAt: balance ? new Date(clock()) : undefined,
       },
@@ -257,18 +279,130 @@ export function createAccounts(deps: AccountDeps) {
     // never by the ledger balance: the sync lags by a lag buffer plus a cron
     // interval, so a balance-derived budget would let a tenant overspend for
     // that whole window before the gate noticed.
-    if (deps.pushBudget) {
-      try {
-        await deps.pushBudget(account.routingSlug, budgetUsd, args.termEnd ?? null);
-      } catch (err) {
-        log.error?.(
-          { metric: "billing.budget.push_failed", tenantId: args.tenantId, err: (err as Error).message },
-          "Could not push max_budget to the gateway; enforcement may be stale",
-        );
-      }
+    // Always through activate(), with or without a gateway: it also confirms the
+    // Chargebee balance and reopens a capture held for lack of credits, which a
+    // new grant must do either way.
+    return activate(args.tenantId, args.status ?? ACCOUNT.ACTIVE);
+  }
+
+  /**
+   * Make the gateway hold what the ledger says, and only then mark the account
+   * `target` (normally active).
+   *
+   * Fail closed. If the push does not land, the customer has paid but the
+   * gateway enforces a budget nobody computed — possibly the free plan's, higher
+   * than what they bought. So the account is held `activating` (the page shows
+   * no credits) and its LiteLLM team is blocked until a retry lands. The
+   * credits are already in the ledger; nothing is lost, only paused.
+   *
+   * Nor does it open a team whose Chargebee credits are used up: the cap is set
+   * but the team stays blocked and the account `exhausted` until credits arrive.
+   */
+  async function activate(tenantId: string, target: string = ACCOUNT.ACTIVE) {
+    const exhausted = await chargebeeExhausted(tenantId);
+
+    try {
+      // No gateway configured means nothing to hold for: active immediately.
+      if (deps.pushBudget) await deps.pushBudget(tenantId, { unblock: !exhausted });
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.budget.push_failed", tenantId, err: (err as Error).message },
+        "Could not set the LiteLLM budget; account held as activating and its team blocked until a retry lands",
+      );
+      const held = await prisma.billingAccount.update({
+        where: { tenantId },
+        data: { status: ACCOUNT.ACTIVATING },
+      });
+      await block(tenantId, "activating");
+      return held;
     }
 
+    if (exhausted) {
+      await block(tenantId, "exhausted");
+      return prisma.billingAccount.update({ where: { tenantId }, data: { status: ACCOUNT.EXHAUSTED } });
+    }
+
+    const account = await prisma.billingAccount.update({ where: { tenantId }, data: { status: target } });
+    await requeueHeldUsage(tenantId);
     return account;
+  }
+
+  /** Best effort: a failed block is logged, and the next grant or retry tries again. */
+  async function block(tenantId: string, reason: BlockReason) {
+    if (!deps.blockBudget) return;
+    try {
+      await deps.blockBudget(tenantId, reason);
+    } catch (err) {
+      // For `activating` this is usually the same outage that failed the push;
+      // the minute retry tries both again. Until then the team keeps its budget.
+      log.error?.(
+        { metric: "billing.budget.block_failed", tenantId, reason, err: (err as Error).message },
+        "Could not block the LiteLLM team; it keeps its previous budget until a retry lands",
+      );
+    }
+  }
+
+  /**
+   * Is the Chargebee balance used up? A failed read is NOT evidence of that —
+   * blocking a paying customer on a transient Chargebee error would be worse
+   * than the minute until the next capture tells us for certain.
+   */
+  async function chargebeeExhausted(tenantId: string): Promise<boolean> {
+    const account = await prisma.billingAccount.findUnique({ where: { tenantId } });
+    if (!account?.chargebeeSubscriptionId) return false;
+    try {
+      const balance = await deps.chargebee.balance(account.chargebeeSubscriptionId);
+      return balance != null && !isBillable(balance.usable);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Put back the capture Chargebee refused for lack of credits.
+   *
+   * That batch was marked failed, which holds the tenant's billing cursor
+   * behind it: nothing newer is read until it settles. With credits back it is
+   * reopened as pending, so the next tick captures it — under the same id,
+   * looked up first, so it can never be charged twice — and the cursor moves.
+   */
+  async function requeueHeldUsage(tenantId: string) {
+    const held = await prisma.usageSyncBatch.findFirst({
+      where: { tenantId, status: BATCH.FAILED, lastError: { startsWith: "insufficient credits" } },
+      orderBy: { windowStart: "asc" },
+    });
+    if (!held) return;
+    if (await prisma.usageSyncBatch.findFirst({ where: { tenantId, status: BATCH.PENDING } })) return;
+
+    await prisma.usageSyncBatch.update({
+      where: { id: held.id },
+      data: { status: BATCH.PENDING, attempts: 0, lastError: null },
+    });
+    log.log?.({ metric: "billing.sync.requeued", tenantId, batchId: held.id }, "Held usage capture reopened");
+  }
+
+  /**
+   * Retry every account held in `activating`. The worker runs this each minute;
+   * with nothing held it is one indexed query and no gateway call.
+   */
+  async function activatePending() {
+    if (!deps.pushBudget) return { pending: 0, activated: 0 };
+
+    const held = await prisma.billingAccount.findMany({
+      where: { status: ACCOUNT.ACTIVATING },
+      select: { tenantId: true },
+    });
+
+    let activated = 0;
+    for (const { tenantId } of held) {
+      const account = await activate(tenantId);
+      if (account.status === ACCOUNT.ACTIVE) activated += 1;
+    }
+
+    if (activated > 0) {
+      log.log?.({ metric: "billing.budget.activated", activated, pending: held.length }, "Held accounts activated");
+    }
+    return { pending: held.length, activated };
   }
 
   /**
@@ -289,12 +423,19 @@ export function createAccounts(deps: AccountDeps) {
     const { balanceOf } = await import("./ledger");
     const before = await balanceOf(args.tenantId, prisma);
 
-    if (Number(before.current) > 0) {
+    // A repair sync may already have granted the NEW term under the same key.
+    // Those credits are not leftovers, so they must not be expired with them.
+    const newTermGrant = await prisma.creditLedgerEntry.findFirst({
+      where: { tenantId: args.tenantId, sourceRef: args.sourceRef, entryType: ENTRY.GRANT },
+    });
+    const leftover = Number(before.current) - Number(newTermGrant?.deltaCredits ?? 0);
+
+    if (leftover > 0) {
       await appendEntry(
         {
           tenantId: args.tenantId,
           entryType: ENTRY.EXPIRY,
-          deltaCredits: `-${before.current}`,
+          deltaCredits: `-${decimal(leftover)}`,
           sourceRef: `${args.sourceRef}:expiry`,
           occurredAt: args.termStart ?? new Date(clock()),
         },
@@ -306,10 +447,25 @@ export function createAccounts(deps: AccountDeps) {
   }
 
   async function cancel(tenantId: string) {
-    return prisma.billingAccount.update({
+    const account = await prisma.billingAccount.update({
       where: { tenantId },
       data: { status: ACCOUNT.CANCELLED },
     });
+
+    // Without this the team keeps the prepaid cap and the platform keeps its
+    // hands off it — forever, since no further grant will come to move it.
+    if (deps.releaseBudget) {
+      try {
+        await deps.releaseBudget(tenantId);
+      } catch (err) {
+        log.error?.(
+          { metric: "billing.budget.release_failed", tenantId, err: (err as Error).message },
+          "Could not hand the gateway budget back to the plan; the team keeps its prepaid cap",
+        );
+      }
+    }
+
+    return account;
   }
 
   /**
@@ -343,7 +499,7 @@ export function createAccounts(deps: AccountDeps) {
       termEnd: subscription.current_term_end
         ? new Date(subscription.current_term_end * 1000)
         : null,
-      sourceRef: `sub:${subscription.id}:${subscription.current_term_start ?? 0}`,
+      sourceRef: termGrantRef(subscription.id, subscription.current_term_start),
     });
   }
 
@@ -414,7 +570,6 @@ export function createAccounts(deps: AccountDeps) {
     if (applied > 0) {
       // The gateway ceiling has to move too, or the customer has credits they
       // cannot spend.
-      const updated = await prisma.billingAccount.findUnique({ where: { tenantId } });
       const { balanceOf } = await import("./ledger");
       const balance = await balanceOf(tenantId, prisma);
       const budgetUsd = creditsToUsd(balance.allocated, deps.usdPerCredit);
@@ -424,22 +579,17 @@ export function createAccounts(deps: AccountDeps) {
         data: { grantedCredits: balance.allocated, budgetUsd },
       });
 
-      if (deps.pushBudget && updated) {
-        try {
-          await deps.pushBudget(updated.routingSlug, budgetUsd, updated.currentTermEnd);
-        } catch (err) {
-          log.error?.(
-            { metric: "billing.topup.budget_push_failed", tenantId, err: (err as Error).message },
-            "Top-up applied but the gateway ceiling was not raised",
-          );
-        }
-      }
+      // Same rule as a subscription: if the gateway cannot be told, the account
+      // is held and its team blocked until the retry lands. New credits end an
+      // `exhausted` state too — activate() confirms against Chargebee first.
+      await activate(tenantId, account.status === ACCOUNT.CANCELLED ? ACCOUNT.CANCELLED : ACCOUNT.ACTIVE);
     }
 
     return { applied, credits };
   }
 
   return {
+    activatePending,
     ensureCustomer,
     ensureLocalAccount,
     bootstrapFromTenant,
