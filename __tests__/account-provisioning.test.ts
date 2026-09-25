@@ -14,7 +14,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createAccounts } from "@/lib/account";
+import { createAccountService } from "@/services/account.service";
 import { TENANT, SLUG, makeFakePrisma, quietLogger } from "./harness";
 
 const RATE = "0.001";
@@ -47,7 +47,7 @@ describe("ensureLocalAccount", () => {
     platformTenantExists(prisma as never);
 
     const chargebee = forbiddenChargebee();
-    const accounts = createAccounts({
+    const accounts = createAccountService({
       prisma: prisma as never,
       chargebee: chargebee as never,
       usdPerCredit: RATE,
@@ -65,13 +65,13 @@ describe("ensureLocalAccount", () => {
     expect(prisma._accounts.size).toBe(1);
   });
 
-  it("pins sync_from to now, so opening the page never bills 90 days of history", async () => {
+  it("creates no usage cursor, so looking at the page does not start billing", async () => {
     const prisma = makeFakePrisma();
     prisma._accounts.delete(TENANT);
     platformTenantExists(prisma as never);
 
     const NOW = Date.parse("2026-09-17T10:00:00.000Z");
-    const accounts = createAccounts({
+    const accounts = createAccountService({
       prisma: prisma as never,
       chargebee: forbiddenChargebee() as never,
       usdPerCredit: RATE,
@@ -81,9 +81,12 @@ describe("ensureLocalAccount", () => {
 
     const account = await accounts.ensureLocalAccount(TENANT);
 
-    // ClickHouse retains 90 days. Backdating this would invoice a quarter of
-    // usage the instant someone clicked "Billing".
-    expect(new Date(account!.syncFrom).getTime()).toBe(NOW);
+    // `sync_from` used to be pinned here. The billing ORIGIN replaced it and is
+    // laid down at SUBSCRIPTION, not at page load — an org that opens Billing
+    // and walks away is not being polled, and the worker skips it for want of a
+    // subscription rather than for want of an origin.
+    expect(account!.status).toBe("unlinked");
+    expect(prisma._cursor).toBeNull();
   });
 
   it("is idempotent — a refresh or two tabs cost one row, not two", async () => {
@@ -91,7 +94,7 @@ describe("ensureLocalAccount", () => {
     prisma._accounts.delete(TENANT);
     platformTenantExists(prisma as never);
 
-    const accounts = createAccounts({
+    const accounts = createAccountService({
       prisma: prisma as never,
       chargebee: forbiddenChargebee() as never,
       usdPerCredit: RATE,
@@ -109,7 +112,7 @@ describe("ensureLocalAccount", () => {
     const prisma = makeFakePrisma(); // seeded active, with sub_1 linked
     platformTenantExists(prisma as never);
 
-    const accounts = createAccounts({
+    const accounts = createAccountService({
       prisma: prisma as never,
       chargebee: forbiddenChargebee() as never,
       usdPerCredit: RATE,
@@ -128,7 +131,7 @@ describe("ensureLocalAccount", () => {
     prisma._accounts.delete(TENANT);
     (prisma as Record<string, unknown>)["$queryRaw"] = async () => [];
 
-    const accounts = createAccounts({
+    const accounts = createAccountService({
       prisma: prisma as never,
       chargebee: forbiddenChargebee() as never,
       usdPerCredit: RATE,
