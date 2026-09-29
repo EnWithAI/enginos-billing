@@ -629,7 +629,7 @@ describe("C43 webhook out of order", () => {
     expect(r.account().currentTermStart).toEqual(new Date(T0_S * 1000));
     expect(r.account().currentTermEnd).toEqual(new Date((T0_S + 30 * DAY_S) * 1000));
 
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
     await r.accounts.applyPaidTopUps(TENANT, PACK, "1000");
     expect(r.cb.allocations[0]!.expiresAt * 1000).toBeGreaterThan(r.now());
   });
@@ -1124,7 +1124,7 @@ describe("top-up on a cancelled account", () => {
     r.gateway.platformReconcile();
     const writes = r.gateway.updates.length;
 
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 0, credits: "0" });
 
     expect(r.cb.allocations).toHaveLength(0);

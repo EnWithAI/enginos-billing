@@ -281,7 +281,7 @@ describe("an activation in flight never brings a cancelled account back", () => 
   it("P3: a top-up being applied when the cancellation lands allocates nothing and raises the paid invoice", async () => {
     const r = lifecycleRig();
     await r.subscribe("sub_1");
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
 
     cancelDuring(r, "grantBlocks"); // the last read before anything is granted
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 0, credits: "0" });
@@ -295,7 +295,7 @@ describe("an activation in flight never brings a cancelled account back", () => 
   it("P3: a cancellation landing just after the allocation leaves the account cancelled and the team handed back", async () => {
     const r = lifecycleRig();
     await r.subscribe("sub_1");
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
 
     cancelDuring(r, "allocate");
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 1, credits: "1000" });
@@ -465,7 +465,7 @@ describe("a paid pack is granted once, whichever subscription it went to", () =>
   it("a pack granted to the old subscription is not granted again after resubscribing", async () => {
     const r = lifecycleRig();
     await r.subscribe("sub_1");
-    r.cb.paidInvoices.push({ id: "inv_0" });
+    r.cb.payPack("inv_0");
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 1, credits: "1000" });
 
     r.cb.cancel("sub_1");
@@ -477,7 +477,7 @@ describe("a paid pack is granted once, whichever subscription it went to", () =>
     expect(r.cb.allocations).toHaveLength(1);
 
     // A pack paid for now still goes to the new subscription.
-    r.cb.paidInvoices.push({ id: "inv_2" });
+    r.cb.payPack("inv_2");
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 1, credits: "1000" });
     expect(r.cb.allocations[1]).toMatchObject({ subscriptionId: "sub_2", metadata: { invoice_id: "inv_2" } });
   });
