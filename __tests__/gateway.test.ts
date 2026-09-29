@@ -352,9 +352,10 @@ describe("account lifecycle drives the cap", () => {
     expect(status(r)).toBe("active");
     expect(r.gateway.team_).toMatchObject({ maxBudget: 1, budgetDuration: null, blocked: false });
     expect(r.gateway.team_.metadata[BLOCK_REASON]).toBeUndefined();
-    // Blocked on each failed attempt; on success the cap and the unblock land
-    // in ONE update, so the team never opens under a stale budget.
-    expect(r.gateway.calls).toEqual(["block", "block", "cap"]);
+    // Blocked once — the second failed attempt finds it already blocked for
+    // the same reason and writes nothing; on success the cap and the unblock
+    // land in ONE update, so the team never opens under a stale budget.
+    expect(r.gateway.calls).toEqual(["block", "cap"]);
     expect(r.gateway.updates.at(-1)).toMatchObject({ max_budget: 1, budget_duration: null, blocked: false });
   });
 

@@ -97,6 +97,13 @@ model BillingAccount {
   /// the admin email, because no User row exists yet at that point.
   billingEmail String? @map("billing_email") @db.VarChar(320)
 
+  /// Is this org put on the free plan? Null follows FREE_PLAN_DEFAULT. An org
+  /// it is not for is offered the paid plans instead, and cannot check out the
+  /// free one. Set by an operator (POST /api/internal/free-plan) and never by
+  /// the org itself. Deciding who is PUT on the free plan is all it does: an
+  /// org already on it keeps its subscription when this is turned off.
+  freePlan Boolean? @map("free_plan")
+
   /// Mirrored from the subscription for display, and for the expiry date a
   /// top-up allocation requires.
   currentTermStart DateTime? @map("current_term_start") @db.Timestamptz()

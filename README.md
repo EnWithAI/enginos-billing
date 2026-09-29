@@ -1,9 +1,10 @@
 # enginos-billing
 
-Prepaid token billing. A tenant subscribes to one prepaid plan and Chargebee
-grants them credits; every minute a Hatchet cron reads what they actually spent
-from ClickHouse and captures it against those credits in Chargebee, and the
-LiteLLM gateway refuses service once the grant is gone.
+Prepaid credit billing. An org the free plan is for is put on it the moment it
+is created — no checkout, no card — and every other org chooses a paid plan;
+either way Chargebee grants it credits, and customers buy more as top-ups. Every minute a Hatchet cron reads what they actually spent from
+ClickHouse and captures it against those credits in Chargebee, and the LiteLLM
+gateway refuses service once the credits are gone.
 
 Two processes from one image:
 
@@ -12,6 +13,12 @@ npm run dev      # API on :4300  (webhooks + internal reads)
 npm run worker   # Hatchet worker (the cron sweep)
 npm test         # vitest, no external services needed
 ```
+
+Next.js loads `.env` for the API; the worker scripts load it with
+`--env-file-if-exists=.env` (a container that injects its environment has no
+`.env` and is unaffected). A worker started any other way — plain
+`tsx worker/hatchet-worker.ts` — runs with none of its settings: no Chargebee,
+no database, and no Sentry, so it can raise no alerts.
 
 ## The whole flow
 
@@ -54,6 +61,36 @@ Those are two separate questions and they are deliberately two separate columns:
 billing_account.last_processed_ingested_at   WHERE THE WORKER IS
 chargebee_sync.status                        WHAT CHARGEBEE SAID
 ```
+
+## Plans, top-ups and cards
+
+- **The free plan, automatically — for the orgs it is for.** When
+  enginos-platform creates an org it calls `POST /api/internal/provision`, and
+  billing subscribes the org's Chargebee customer to `FREE_PLAN_ITEM_PRICE_ID`
+  — no checkout, no card, and only ever a plan the catalogue prices at zero. It
+  waits for Chargebee's credit ledger (about three seconds) before calling the
+  org set up. The billing page does the same for any org it finds with no
+  subscription.
+- **Who gets it** is per org: `billing_account.free_plan`, or
+  `FREE_PLAN_DEFAULT` (off) when an operator has not set one with
+  `POST /api/internal/free-plan {tenantId, enabled}`. Every other org sees the
+  paid plans (`ITEM_PRICE_IDS`) and subscribes through Chargebee's hosted
+  checkout, which returns it to the billing page.
+- **Top-ups** are charged to the card on file once the customer confirms an
+  amount (₹50, ₹100 or a custom figure): `POST /invoices/create_for_charge_items_and_charges`,
+  the API form of the admin UI's *Add Charge*. The `api_token` charge carries its
+  own Credit Grant, so Chargebee grants the credits and billing records the
+  grant and moves the LiteLLM cap. The `payment_succeeded` webhook does the same
+  for a buyer who closed the tab.
+- **Credits roll over.** Chargebee's grant rollover carries unused credits into
+  the next term, and the LiteLLM cap follows Chargebee's usable balance — with
+  no monthly reset.
+- **The card on file** is changed on Chargebee's Manage Payment Sources page.
+- **Payment history** is paged ten at a time by Chargebee's cursor.
+
+`CREDITS_PER_USD` credits buy $1 of LLM spend. The Chargebee calls behind each
+of these, with real requests and responses, are in
+[docs/CHARGEBEE-API.md](docs/CHARGEBEE-API.md).
 
 ## Why a separate service
 
@@ -98,12 +135,11 @@ code this service used to be.
 onto each span as `gen_ai.cost.total_cost`; this service sums that column. There
 is exactly one pricing system and it is the gateway's.
 
-**It does not create credit grants.** The item price carries a Credit Grant
-configuration and Chargebee issues credits automatically on subscription
-creation. `/ledger_operations/allocate` is called for one thing only — a top-up
-pack, which is an ad-hoc grant Chargebee does not issue by itself. (The pack's
-charge item must therefore carry no Credit Grant of its own; if one does,
-billing records the invoice as granted by Chargebee and allocates nothing.)
+**It does not create credit grants.** Chargebee issues every one: the plan's
+on subscription creation, and the top-up charge's own Credit Grant when a pack
+is paid (`TOPUP_CHARGEBEE_GRANTS=true`) — billing records that grant and
+allocates nothing. `/ledger_operations/allocate` is used only for a top-up
+charge that carries no grant of its own (`TOPUP_CHARGEBEE_GRANTS=false`).
 
 **It does not block LLM requests.** Enforcement is the LiteLLM team's
 `max_budget`, set from Chargebee's live grant blocks at subscription time and
@@ -220,8 +256,9 @@ costs nothing operationally — enforcement is the gateway's real-time budget.
 
 ## Before this bills anyone
 
-1. **Confirm `USD_PER_CREDIT`.** The default makes 1,000 credits worth $1.00. A
-   credit is a *billing* unit with a fixed dollar rate, not an LLM token.
+1. **Confirm `CREDITS_PER_USD`.** How many credits $1 of LLM spend costs; the
+   default is 1,000 (`.env` has 50). A credit is a *billing* unit with a fixed
+   dollar rate, not an LLM token.
 2. **Confirm `gen_ai.cost.total_cost` is inclusive of margin.** If
    `total - original - margin ≈ 0` it is, and billing it alone is correct.
    Adding `margin_total` separately would charge the markup twice.
@@ -238,10 +275,10 @@ costs nothing operationally — enforcement is the gateway's real-time budget.
 5. **Confirm no deployment is unpriced.** `verify-litellm-gateway.ts` in
    enginos-platform already detects this: an unpriced target records spend 0,
    which is both a revenue leak and a hole in the hard block.
-6. **Settle the plan reconciler.** `litellm-plan-reconcile.scheduler.ts` runs
-   every 60 s and adopts LiteLLM team metadata into `OrgLlmGateway.plan`. If
-   Chargebee becomes authoritative, that sweep will revert paid subscriptions
-   unless it is inverted or disabled.
+6. ~~**Settle the plan reconciler.**~~ Settled 2026-09-28: enginos-platform
+   leaves the budget of a `billing_managed` team alone, and gives every other
+   team $0 with no reset — billing is the only source of spend (see
+   docs/BILLING-ARCHITECTURE.md §10 #5).
 
 ## Migrations
 
@@ -277,7 +314,8 @@ src/services/             business logic
   usage-sync.service.ts     cursor, capture, recovery — the one usage path
   gateway-budget.service.ts the LiteLLM team cap, from Chargebee's grant blocks
   billing-overview.service  the billing page's reads, each degrading on its own
-  checkout / portal / invoice / webhook / plan-catalog
+  checkout.service.ts       the free plan (provisionFreePlan) and top-ups
+  payment-method / portal / invoice / webhook / plan-catalog
 src/repositories/         every database query; platform.repository reads the platform's tables
 src/views/                response payloads, in the shapes crewpe-ui reads
 src/models/               pure rules: decimal money, the credit rate, statuses, subscription choice

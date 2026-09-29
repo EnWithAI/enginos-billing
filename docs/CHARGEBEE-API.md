@@ -28,16 +28,49 @@ network failures and timeouts. A 4xx is never retried — it will fail identical
 A network error is marked `retryable` because it says nothing about whether the
 request was *applied*, which is the distinction the whole capture design rests on.
 
-**The idempotency header is deliberately avoided.** `chargebee-idempotency-key` is
-used on exactly one call (`/ledger_operations/allocate`), because its replay window
-is 30 minutes — fine for a top-up retried seconds later, useless for a capture
-stuck behind an hours-long outage. Capture uses a client-supplied `id` instead.
+**One call is never retried at all:** `POST /invoices/create_for_charge_items_and_charges`,
+the top-up charge. It moves money, and a timeout says nothing about whether the
+card was charged — a second send could charge it twice.
+
+**The idempotency header is used sparingly.** `chargebee-idempotency-key` is sent
+on two calls — `/ledger_operations/allocate` and the free-plan subscribe
+(`free-plan:<tenant>`) — because its replay window is 30 minutes: fine for a
+repeat seconds later, useless for a capture stuck behind an hours-long outage.
+Capture uses a client-supplied `id` instead.
 
 ---
+
+# The free plan — no checkout, no card
+
+An org the free plan is for — `billing_account.free_plan`, or
+`FREE_PLAN_DEFAULT` (off) when that is empty — is put on
+`FREE_PLAN_ITEM_PRICE_ID` (`pre-paid-test-v1-INR-Yearly`, ₹0 a year, 1,000
+credits) by `checkout.provisionFreePlan`: enginos-platform calls
+`POST /api/internal/provision` once the org's LiteLLM team exists, and the
+billing page calls it again for such an org with no subscription. It creates
+the customer (§1 below) for **every** org, with the admin's email; for an org
+the free plan is not for it stops there (`not-eligible`). Otherwise it checks
+the plan's `price` is `0` (§2), then:
+
+```http
+POST /api/v2/customers/<tenant uuid>/subscription_for_items
+chargebee-idempotency-key: free-plan:<tenant uuid>
+
+subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Yearly
+&subscription_items[quantity][0]=1
+```
+
+MEASURED 2026-09-28 with a customer that has **no card**: the subscription came
+back `active` and its ₹0 invoice `paid`, and Chargebee granted 1,000 `token-test`.
+The grant block — and the ledger account billing charges usage against — came
+**three seconds after** the subscription, so the link (§5) is repeated once a
+second until `ledger_unit_id` is set. From sign-up to a $20 LiteLLM cap
+(`CREDITS_PER_USD=50`) took about twelve seconds for `org-billtest2-com`.
 
 # Subscription creation, end to end
 
 What happens from "customer clicks Subscribe" to "credits enforced at the gateway".
+The page no longer offers a paid plan; steps 3 and 4 are how one would be bought.
 
 ## 1. `POST /customers` — ensure the customer
 
@@ -343,12 +376,206 @@ retry within the key's window re-sends that exact request (Chargebee answers wit
 the original grant); past it, the subscription's `grant_blocks` are searched for
 the allocation before anything is sent again. See BILLING-ARCHITECTURE.md §10.
 
-A pack whose charge item carries its **own** Credit Grant is granted by Chargebee
-at payment; its grant block's `billing_metadata` names the invoice line
-(`{"line_items":[{"id":"li_…","invoice_number":"85"}],"item_price_id":"…"}`),
-and billing records it and allocates nothing. `checkout_one_time_for_items`
-refuses such a charge outright ("Charges with grants are not supported for
-customer one off charges").
+Allocate is the path for a pack whose charge carries **no** Credit Grant
+(`TOPUP_CHARGEBEE_GRANTS=false`). A pack whose charge carries its **own** grant is
+granted by Chargebee, and billing records that grant and allocates nothing — see
+**Top-up** below.
+
+---
+
+# Top-up — buying more credits
+
+The pack is `api_token-INR`: a charge, `per_unit`, `price: 100` (₹1.00 a unit),
+carrying its **own** Credit Grant of **50 `token-test` per unit** (measured from
+the grant blocks — the grant configuration is not readable over the API, see §2).
+`TOPUP_CHARGEBEE_GRANTS=true` tells billing that Chargebee grants it.
+
+## `POST /invoices/create_for_charge_items_and_charges` — charge the pack
+
+`chargeItem()`, from `checkout.startTopUp`. The API form of the admin UI's
+*Subscription → Billing Actions → Add Charge*: the pack is invoiced onto the
+subscription and collected from the card on file at once. The billing page asks
+the customer to confirm the amount first.
+
+```http
+POST /api/v2/invoices/create_for_charge_items_and_charges
+
+subscription_id=AzZJw4VWERUNT16d5
+&item_prices[item_price_id][0]=api_token-INR
+&item_prices[quantity][0]=1
+&auto_collection=on
+```
+
+**`auto_collection=on` is always sent.** Without it the invoice takes the
+subscription's `auto_collection`, else the customer's. MEASURED 2026-09-28 on a
+probe customer: with the subscription's set `off`, the charge came back
+`payment_due` (invoice 123) and its 50-credit grant was issued anyway. The same
+setup with `auto_collection=on` on the call was paid at once (invoice 124). The
+customer has just confirmed the charge, so the account's setting must not decide
+it. Also measured: adding a card (`POST /payment_sources/create_card`) turned a
+customer's `auto_collection` from `off` to `on` by itself. Every live customer on
+the test site was `on`, with no subscription overriding it.
+
+Trimmed from invoice 96, 2026-09-28:
+
+```json
+{ "invoice": { "id": "96", "status": "paid", "total": 100, "amount_due": 0,
+               "currency_code": "INR", "paid_at": 1790574139,
+               "line_items": [ { "id": "li_16BVWYVWUUbpZG7K", "entity_type": "charge_item_price",
+                                 "entity_id": "api_token-INR", "quantity": 1, "amount": 100 } ] } }
+```
+
+**Never retried** (see Transport). A `payment` error (HTTP 402 — a declined card,
+no card on file) is answered as 409 `topup-payment-failed` with Chargebee's
+reason. An invoice that comes back not `paid` grants nothing on billing's side and
+is returned to the page as it is.
+
+## The grant — issued by Chargebee, recorded by billing
+
+Chargebee issues the pack's grant block itself, **about a second after
+`paid_at`** (invoice 96: `paid_at` 1790574139, block `created_at` 1790574140):
+
+```json
+{ "grant_block": { "id": "B0FQTwVWUUcJx8G", "unit_id": "token-test",
+                   "granted_amount": "50.0000000000", "status": "available",
+                   "grant_source": "top_up", "expires_at": 5680261800,
+                   "billing_metadata": "{\"line_items\":[{\"id\":\"li_16BVWYVWUUbpZG7K\",\"invoice_number\":\"96\",\"quantity\":1}],\"item_price_id\":\"api_token-INR\"}" } }
+```
+
+- `billing_metadata` is a JSON **string**, and names the invoice **line**. That
+  line id is how `catalogueGrantFor()` tells this pack's block from the plan's
+  block on the same invoice.
+- `expires_at` 5680261800 is **2149-12-31**: the pack's grant never expires,
+  unlike the plan's, which ends with the term.
+- billing waits up to five seconds for the block (`startTopUp`), then records
+  it as a `catalogue_grant` row in `topup_grant` and moves the gateway cap. A
+  block still not visible is **never** allocated for instead — that would be a
+  second grant once Chargebee's lands; the next apply, or `payment_succeeded`,
+  looks again.
+
+## What Chargebee refuses for a charge that carries a grant
+
+MEASURED on the test site, 2026-09-28, with `api_token-INR`. A top-up is always
+mid-term, so every route but the invoice charge above is closed to it:
+
+| Call | Result |
+|---|---|
+| `POST /hosted_pages/checkout_one_time_for_items` (`item_prices[…]`, with or without `unit_price`) | 400 `invalid_request` / `operation_not_supported`: *"Charges with grants are not supported for customer one off charges"*. The same call with a grant-free charge (`token-pack-20m-INR`) opens a page. |
+| `POST /hosted_pages/checkout_existing_for_items` (`subscription_items[…]`) | 400 `mid_term_grant_subscription_change_not_allowed`: *"You cannot update a subscription with items having credit unit grants immediately or mid-term. Schedule the update at end of term."* |
+| `POST /subscriptions/{id}/update_for_items` (checked through `POST /estimates/update_subscription_for_items`, which applies nothing) | The same `mid_term_grant_subscription_change_not_allowed`. |
+| `POST /subscriptions/{id}/add_charge` | 400 `configuration_incompatible` / `pc2_to_pc1_error` — a Product Catalog 1.0 endpoint; the site is on 2.0. |
+| `charge_items[…]` on `checkout_one_time_for_items` | **Silently ignored.** The page is created empty — even for an item price that does not exist. |
+
+**Invoice first, pay later does not work with a grant-carrying charge.** The
+same invoice charge with `auto_collection=off` returns an unpaid invoice
+(`payment_due`), and the grant block is issued **at once, `available`** — the
+credits land before any payment. Voiding the invoice (`POST /invoices/{id}/void`)
+leaves the block `available`. So a `hosted_pages/collect_now` flow would hand
+out credits for unpaid invoices. (Test invoice 103 on `5e51a7d0-…`: voided, its
+50 credits still on the subscription.)
+
+**A declined card leaves an unpaid invoice, with the credits granted.**
+MEASURED 2026-09-28 with the test gateway's `4005519200000004`: the card was
+added as `valid`, and the charge (with `auto_collection=on`) answered **HTTP 200**
+with invoice 126 `payment_due`, not a payment error. Its 50-credit block was
+`available` straight away. `grantedCredits()` sums every live block, so the
+gateway cap counted those credits although nothing was paid. **Fixed**: they are
+held back until the invoice is paid (`unpaidTopUpCredits`, below; BILLING-ARCHITECTURE.md
+§10 #7). (`4119862760338320` is refused when the card is
+added: 400 `payment_method_verification_failed`, "(3009) Do not honour".)
+
+**How that invoice gets paid** (MEASURED 2026-09-28, invoice 128):
+
+- The failed attempt is a `failure` transaction, `3001` *Insufficient funds*. The
+  invoice goes into dunning: `dunning_status: in_progress`, `next_retry_at`
+  **24 hours** later, retried on whatever card is primary then.
+- **Adding a new card does not collect it.** With the card replaced
+  (`replace_primary_payment_source=true`), the invoice was still `payment_due`.
+- `POST /invoices/{id}/collect_payment` (admin: the invoice's *Collect Payment*)
+  charged the new card at once: `paid`, `dunning_status: stopped`.
+- Events, in order: `payment_failed` at the decline; then `payment_succeeded`,
+  `invoice_updated` and `dunning_updated` when it was collected.
+- `collect_payment` on a card that declines again: HTTP **400**
+  `payment_processing_failed` / `charge_failed`, *"Payment collection failed.
+  Reason: (3001) Insufficient funds."* (invoice 130), not a 402. Billing treats
+  any `payment_…` code as a declined card.
+
+## Unpaid top-ups
+
+| Client call | Chargebee | Used by |
+|---|---|---|
+| `unpaidInvoicesFor()` | `GET /invoices?customer_id[is]=…&status[in]=["payment_due","not_paid"]&sort_by[asc]=date` | The one-owed-at-a-time guard, the page's banner, Pay now |
+| `unpaidTopUpCredits()` | The same list with `voided` and `pending` added, then `GET /grant_blocks` only if one is a top-up | Holding a declined top-up's credits back from the cap, the page and the exhaustion check |
+| `collectInvoice()` | `POST /invoices/{id}/collect_payment` — **never retried** | Pay now |
+
+The charge response carries `dunning_status` and `next_retry_at`, which the page
+shows as the date Chargebee tries the card again.
+
+## `GET /invoices` — proof of payment
+
+`paidInvoicesFor()`, read by every apply:
+
+```http
+GET /api/v2/invoices?customer_id[is]=…&status[is]=paid&sort_by[desc]=date&limit=20
+```
+
+Newest first, so an invoice paid a moment ago is on the one page read — a
+customer with 20 renewals behind it would otherwise push it off. Filtered
+client-side to invoices with a line for the top-up item price.
+
+---
+
+# The billing page's reads
+
+## `GET /transactions` — the payment history, a page at a time
+
+`transactionsPage()`. The overview reads page one; `GET /api/internal/billing/:tenantId/payments?offset=`
+serves the rest.
+
+```http
+GET /api/v2/transactions?customer_id[is]=…&sort_by[desc]=date&limit=10
+GET /api/v2/transactions?customer_id[is]=…&sort_by[desc]=date&limit=10&offset=["1790574889000","345"]
+```
+
+```json
+{ "list": [ …9 newer…,
+            { "transaction": { "id": "txn_AzytDSVWUXl9II4b", "type": "payment", "status": "success",
+                               "amount": 100, "currency_code": "INR", "date": 1790574889,
+                               "payment_method": "card", "masked_card_number": "************1111",
+                               "linked_invoices": [ { "invoice_id": "98" } ] } } ],
+  "next_offset": "[\"1790574889000\",\"345\"]" }
+```
+
+Chargebee pages by an **opaque cursor**, not by number: `next_offset` is sent back
+as `offset` for the next page and is **absent on the last** (test site: 10, then 7,
+then none). The cursor only says where to continue — `customer_id[is]` is sent
+again with every page, from the tenant's own account, so a cursor from the
+browser cannot reach another customer's list.
+
+## `POST /hosted_pages/manage_payment_sources` — change the card
+
+`managePaymentSourcesPage()`, behind the page's *Update card* button. The customer
+adds, replaces or removes cards — and nothing else; unlike the portal it offers no
+cancellation, so it is shown while the portal stays shut.
+
+```http
+POST /api/v2/hosted_pages/manage_payment_sources
+
+customer[id]=5d3fa58c-86c5-4141-a0d3-94d385af953f
+&redirect_url=https://dev.127.0.0.1.nip.io/organization/billing
+```
+
+```json
+{ "hosted_page": { "id": "IjLMDgAbfoSQm1m9AfxTeI8h500Pbmi7", "type": "manage_payment_sources",
+                   "url": "https://enwithai-test.chargebee.com/pages/v3/…/", "state": "created",
+                   "created_at": 1790580433, "expires_at": 1791012433 } }
+```
+
+**`redirect_url` must be on port 80, 443, 8080 or 8443.** `http://localhost:4200`
+is refused: 400 `UNSUPPORTED_PORT`, *"Only [443, 80, 8443, 8080] ports are
+allowed"*. It is `APP_URL` + `/organization/billing`, so `APP_URL` is the HTTPS dev
+origin locally and the real domain elsewhere. The page lives five days
+(`expires_at − created_at` = 432000 s).
 
 ---
 
@@ -361,7 +588,7 @@ in this precedence:
 |---|---|---|
 | `replayed` | **`ERROR_DUPLICATE_OPERATION_ID`** (measured), plus the unmeasured `duplicate_entry`, `resource_already_exists`, `idempotency_replayed` — in `api_error_code` or `error_code` | Our id was already used — the money moved. Confirmed by `GET /ledger_operations/{id}`, then settled; not found → `retryable`. |
 | `retryable` | 5xx, 429, network error, timeout | **Unknown.** The id stays pending, cursor frozen, resolved by lookup next tick. |
-| `insufficient` | `ERROR_INSUFFICIENT_BALANCE` | Out of credits. Pending cleared, **cursor held**, team blocked; the same usage is offered again every tick and clears itself on a top-up. |
+| `insufficient` | `ERROR_INSUFFICIENT_BALANCE` | Out of credits. Pending cleared, **cursor held**, team blocked. While the account is `exhausted` Chargebee is not asked again (5 min doubling to 1 hour); a top-up or renewal takes it out of `exhausted`, and the same usage is offered again on the next tick. |
 | `no_ledger` | `resource_not_found`, `invalid_request` | No prepaid ledger. Nothing charged and nothing will be until it is configured; `INVALID`, **cursor held**, billed once fixed. |
 | `terminal` | anything else | Stop and ask a human. |
 
@@ -389,8 +616,13 @@ every tenant at once and a person fixes it.
 | `portalSession()` | `POST /portal_sessions` | Self-serve portal. **Built but never rendered in the UI, and refused (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`** — customers must not be able to cancel, and the portal offers cancellation unless it is switched off in the site's Self-Serve Portal settings. |
 | `customer()` | `GET /customers/{id}` | Tells a deleted subscription (customer still there) from a wrong site or key (nothing there) before a missing subscription cancels an account. |
 | `subscriptionIdsOf()` | `GET /subscriptions?customer_id[is]=…` | Every subscription the customer has had, so the top-up guard sees a pack Chargebee granted to an earlier one. |
-| `checkoutOneTime()` | `POST /hosted_pages/checkout_one_time_for_items` | Top-up pack — a one-time charge, not a second subscription. |
-| `paidInvoicesFor()` | `GET /invoices?customer_id[is]=…&status[is]=paid` | Proof of payment for a top-up. |
+| `chargeItem()` | `POST /invoices/create_for_charge_items_and_charges` | Top-up pack, charged to the card on file; **never retried**. See **Top-up**. |
+| `collectInvoice()` | `POST /invoices/{id}/collect_payment` | Pay now, for a top-up whose card declined; **never retried**. See **Unpaid top-ups**. |
+| `unpaidInvoicesFor()` | `GET /invoices` (`payment_due`, `not_paid`) | Top-ups still owed. |
+| `unpaidTopUpCredits()` | `GET /invoices`, then `GET /grant_blocks` | A declined top-up's credits, held back. |
+| `paidInvoicesFor()` | `GET /invoices?customer_id[is]=…&status[is]=paid&sort_by[desc]=date` | Proof of payment for a top-up. See **Top-up**. |
+| `transactionsPage()` | `GET /transactions?customer_id[is]=…&offset=…` | The payment history, by cursor. See **The billing page's reads**. |
+| `managePaymentSourcesPage()` | `POST /hosted_pages/manage_payment_sources` | The *Update card* page. See **The billing page's reads**. |
 | `ledgerOperations()` | `GET /ledger_operations?subscription_id[is]=…` | One page of history. **Not** a top-up guard: operation metadata is never returned. |
 | `grantBlocks()` | `GET /grant_blocks?subscription_id[is]=…` (paginated) | Every grant block with the invoice line that issued it — how the top-up guard recognises a pack Chargebee granted itself, and finds a lost allocation past the key's window. |
 | `subscription()` | `GET /subscriptions/{id}` | One subscription by id. Null only on a 404 `resource_not_found`; anything unclear throws. |
@@ -414,10 +646,58 @@ grants credits.
                "customer": { "id": "…" } } }
 ```
 
-Handled: `subscription_created`, `_activated`, `_changed`, `_renewed`, `_cancelled`,
-`_deleted`, `payment_failed`, `alert_status_changed`. Any other event type is
-acknowledged with **200** and ignored — nothing is logged or stored for it. The
-platform has authenticated the delivery before billing sees it.
+Handled:
+
+| Event | Effect |
+|---|---|
+| `subscription_created`, `_activated`, `_changed`, `_renewed`, `_reactivated`, `_resumed`, `_cancelled`, `_deleted` | A trigger only: the customer's subscriptions are re-read from Chargebee and applied (`syncFromChargebee`). |
+| `payment_succeeded` | For an invoice with a line for the top-up item price only: applies paid packs, exactly as the page's own apply does — what grants a pack whose buyer closed the tab. While a grant-carrying pack's block is not visible yet it answers **500 on purpose**, so Chargebee redelivers once the block is there. Any other payment is ignored. |
+| `payment_failed`, `alert_status_changed` | Logged only. |
+
+Any other event type is acknowledged with **200** and ignored — nothing is logged
+or stored for it. The platform has authenticated the delivery before billing sees
+it.
+
+**Delivery, measured end to end (2026-09-28).** Endpoint `whv2_169rpvVWV3RVFFh0`
+("test"): all events, API version v2, Basic auth, pointed at a `cloudflared` quick
+tunnel to the platform on `:4100`. A ₹1 pack charged straight in Chargebee —
+invoice 109, no billing page involved, so only the webhook could record it —
+produced five events, every one delivered `succeeded`:
+
+| Event | Billing |
+|---|---|
+| `payment_succeeded` | Recorded invoice 109's grant (`catalogue_grant`, 50) in `topup_grant`, 3 s after payment |
+| `invoice_generated` | Acknowledged, ignored |
+| `grant_blocks_created` | Acknowledged, ignored |
+| `ledger_updated` | Acknowledged, ignored |
+| `ledger_account_balance_updated` | Acknowledged, ignored |
+
+**Read delivery per endpoint, not per event.** `GET /events` returns a top-level
+`webhook_status` that stays `not_configured` even when the event was delivered to
+an endpoint added under Webhooks; the delivery is in `webhooks[]`:
+
+```json
+{ "event": { "event_type": "payment_succeeded", "api_version": "v2",
+             "webhook_status": "not_configured",
+             "webhooks": [ { "id": "whv2_169rpvVWV3RVFFh0", "webhook_status": "succeeded",
+                             "object": "webhook" } ] } }
+```
+
+Before any endpoint existed (up to 2026-09-28 08:00), `webhooks` was empty on every
+event. `GET /webhook_endpoints` lists the endpoints themselves.
+
+**Subscribe to what is handled.** Four of the five events a top-up produces are
+acknowledged and ignored, so an endpoint taking ALL events carries mostly noise.
+Selecting only the events in the table above loses nothing.
+
+**Setting it up.** *Settings → Configure Chargebee → API Keys and Webhooks →
+Webhooks → Add webhook*: the platform's public URL + `/api/v1/webhooks/chargebee`,
+*Protect webhook URL with basic authentication* ticked with the platform's
+`CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD`, API version V2. Wrong or
+missing credentials answer 401 `webhook-unauthorized`, and Chargebee retries. A
+developer machine needs a tunnel — `cloudflared tunnel --url http://localhost:4100`
+— whose URL changes on every restart, so the endpoint's URL has to be updated in
+Chargebee each time.
 
 A body with no `id` or `event_type` gets **400**. A failed handler returns **500**,
 not 200, and enginos-platform hands that status to Chargebee unchanged. Billing

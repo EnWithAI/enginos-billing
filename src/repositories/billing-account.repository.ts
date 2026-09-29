@@ -112,6 +112,11 @@ export function createBillingAccountRepository(prisma: PrismaClient = defaultPri
       return { changed: count === 1, account };
     },
 
+    /** Turn the free plan on or off for one org. Its subscription is not touched. */
+    setFreePlan(tenantId: string, freePlan: boolean) {
+      return prisma.billingAccount.update({ where: { tenantId }, data: { freePlan } });
+    },
+
     /** Out of credits — but a cancelled account stays cancelled. False when it was cancelled. */
     async markExhaustedUnlessCancelled(tenantId: string): Promise<boolean> {
       const { count } = await prisma.billingAccount.updateMany({

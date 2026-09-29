@@ -22,10 +22,12 @@ import { createAccountService } from "../services/account.service";
 import { createBillingOverviewService } from "../services/billing-overview.service";
 import { createCheckoutService } from "../services/checkout.service";
 import { createInvoiceService } from "../services/invoice.service";
-import { describePlans } from "../services/plan-catalog.service";
+import { describePlans, describeTopUp } from "../services/plan-catalog.service";
 import { createPortalService } from "../services/portal.service";
+import { createPaymentMethodService } from "../services/payment-method.service";
 import { createUsageSyncService } from "../services/usage-sync.service";
 import { createWebhookService } from "../services/webhook.service";
+import type { Logger } from "../shared/logger";
 import { gatewayBudgetHooks } from "./budget-hooks";
 
 export function createServices() {
@@ -42,7 +44,27 @@ export function createServices() {
     platform,
     usdPerCredit: config.usdPerCredit,
     billingItemPriceIds: config.itemPriceIds,
+    topUpItemPriceId: config.topUpItemPriceId,
     ...budget,
+  });
+
+  const billingPage = `${config.appUrl.replace(/\/+$/, "")}/organization/billing`;
+
+  const checkout = createCheckoutService({
+    chargebee,
+    accountService,
+    accounts,
+    itemPriceIds: config.itemPriceIds,
+    defaultItemPriceId: config.defaultItemPriceId,
+    freeItemPriceId: config.freeItemPriceId,
+    freePlanDefault: config.freePlanDefault,
+    // The page reads `from=checkout` (Chargebee appends `id` and `state`) and
+    // pulls the new subscription at once, rather than waiting on the webhook.
+    checkoutRedirectUrl: `${billingPage}?from=checkout`,
+    topUpItemPriceId: config.topUpItemPriceId,
+    topUpCredits: config.topUpCredits,
+    topUpMaxQuantity: config.topUpMaxQuantity,
+    topUpChargebeeGrants: config.topUpChargebeeGrants,
   });
 
   return {
@@ -56,26 +78,49 @@ export function createServices() {
       accounts,
       syncs,
       plansOffered: () => describePlans(config.itemPriceIds, chargebee, { ttlMs: config.planCacheTtlMs }),
+      topUpOffer: () =>
+        describeTopUp(
+          {
+            itemPriceId: config.topUpItemPriceId,
+            creditsPerUnit: config.topUpCredits,
+            maxQuantity: config.topUpMaxQuantity,
+          },
+          chargebee,
+          { ttlMs: config.planCacheTtlMs },
+        ),
+      autoSubscribe: config.freeItemPriceId ? (tenantId) => checkout.provisionFreePlan(tenantId) : undefined,
+      freeItemPriceId: config.freeItemPriceId,
+      freePlanDefault: config.freePlanDefault,
+      topUpItemPriceId: config.topUpItemPriceId,
     }),
 
-    checkout: createCheckoutService({
-      chargebee,
-      accountService,
-      accounts,
-      itemPriceIds: config.itemPriceIds,
-      defaultItemPriceId: config.defaultItemPriceId,
-      topUpItemPriceId: config.topUpItemPriceId,
-      topUpCredits: config.topUpCredits,
-    }),
+    checkout,
 
     portal: createPortalService({ chargebee, accounts, redirectUrl: config.appUrl, enabled: config.portalEnabled }),
 
+    paymentMethod: createPaymentMethodService({
+      chargebee,
+      accounts,
+      redirectUrl: billingPage,
+    }),
+
     invoices: createInvoiceService({ chargebee, accounts }),
 
-    webhooks: createWebhookService({ accountService, accounts }),
+    webhooks: createWebhookService({
+      accountService,
+      accounts,
+      topUp: {
+        itemPriceId: config.topUpItemPriceId,
+        creditsPerUnit: config.topUpCredits,
+        chargebeeGrants: config.topUpChargebeeGrants,
+      },
+    }),
 
-    /** Built on demand: it opens a ClickHouse client, which only the sync needs. */
-    usageSync(hatchetRunId?: string) {
+    /**
+     * Built on demand: it opens a ClickHouse client, which only the sync needs.
+     * The worker passes a logger that also raises its alerts (worker/alerts.ts).
+     */
+    usageSync(hatchetRunId?: string, logger?: Logger) {
       return createUsageSyncService({
         usage: createUsageSource(),
         chargebee,
@@ -87,6 +132,7 @@ export function createServices() {
         maxWindowsPerTick: config.maxWindowsPerTick,
         maxAttempts: config.maxAttempts,
         hatchetRunId,
+        logger,
         blockBudget: budget.blockBudget,
         releaseBudget: budget.releaseBudget,
       });

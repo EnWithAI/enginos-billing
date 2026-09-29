@@ -28,6 +28,12 @@ export interface ItemPrice {
   /** `period` × `periodUnit` — 1 × "month". */
   period: number | null;
   periodUnit: string | null;
+  /**
+   * `per_unit`, `flat_fee`, `tiered`, `volume` or `stairstep`. Only `per_unit`
+   * makes `priceMinor` the price of ONE unit, which is what a top-up quantity
+   * multiplies. Optional so fakes that predate it still type-check.
+   */
+  pricingModel?: string | null;
 }
 
 export interface LedgerBalance {
@@ -144,6 +150,32 @@ export interface PaymentSource {
   expiryYear: number | null;
 }
 
+/** The invoice a charge created. `status` is Chargebee's: `paid` once collected. */
+export interface ChargedInvoice {
+  id: string;
+  status: string;
+  /** MINOR units of the currency. */
+  totalMinor: number | null;
+  amountDueMinor: number | null;
+  currencyCode: string | null;
+  /**
+   * When Chargebee next retries the card, for an invoice it could not collect
+   * (dunning). Null once paid, or when no retry is scheduled.
+   */
+  nextRetryAt: Date | null;
+}
+
+/** A top-up invoice Chargebee has not collected: `payment_due` while it retries, `not_paid` once it gave up. */
+export interface UnpaidInvoice {
+  id: string;
+  status: string;
+  /** MINOR units of the currency. */
+  amountDueMinor: number;
+  currencyCode: string | null;
+  nextRetryAt: Date | null;
+  date: Date | null;
+}
+
 export interface CaptureArgs {
   id: string;
   subscriptionId: string;
@@ -166,8 +198,12 @@ export interface ChargebeeClient {
     customerId: string;
     itemPriceId: string;
     quantity?: number;
+    /** Where Chargebee sends the browser once the checkout is done. Omit it when Chargebee.js opens the page. */
+    redirectUrl?: string;
   }): Promise<Record<string, unknown>>;
   portalSession(args: { customerId: string; redirectUrl: string }): Promise<Record<string, unknown>>;
+  /** A hosted page where the customer manages their cards — no cancellation, unlike the portal. */
+  managePaymentSourcesPage(args: { customerId: string; redirectUrl: string }): Promise<Record<string, unknown>>;
   grantedCredits(subscriptionId: string, unitId?: string, now?: number): Promise<{ credits: string; blocks: number }>;
   /** Every grant block on the subscription, oldest first, with the invoice that issued each. */
   grantBlocks(subscriptionId: string): Promise<{ blocks: GrantBlock[]; complete: boolean }>;
@@ -184,6 +220,12 @@ export interface ChargebeeClient {
   /** One plan's details. Null when the id is not in the catalogue. */
   itemPrice(id: string): Promise<ItemPrice | null>;
   activeSubscriptions(customerId: string): Promise<Array<Record<string, any>>>;
+  /** Subscribe a customer with no checkout — the free plan only. Idempotent per key. */
+  subscribeCustomer(args: {
+    customerId: string;
+    itemPriceId: string;
+    idempotencyKey: string;
+  }): Promise<Record<string, unknown>>;
   allocate(args: {
     subscriptionId: string;
     unitId: string;
@@ -192,10 +234,36 @@ export interface ChargebeeClient {
     idempotencyKey: string;
     metadata?: Record<string, unknown>;
   }): Promise<{ operationId: string; balanceAfter: string | null; createdAtMs: number | null }>;
-  checkoutOneTime(args: { customerId: string; itemPriceId: string; currencyCode?: string }): Promise<Record<string, unknown>>;
+  /** Invoice units of a charge item onto a subscription and collect it now. Never retried. */
+  chargeItem(args: {
+    subscriptionId: string;
+    itemPriceId: string;
+    /** Units of the charge to sell. Defaults to 1. */
+    quantity?: number;
+  }): Promise<ChargedInvoice>;
+  /** Charge the card on file for an invoice Chargebee has not collected. Never retried. */
+  collectInvoice(invoiceId: string): Promise<ChargedInvoice>;
   paidInvoicesFor(customerId: string, itemPriceId: string): Promise<Array<Record<string, any>>>;
+  /** The customer's uncollected invoices with a line for this item price, oldest first. */
+  unpaidInvoicesFor(customerId: string, itemPriceId: string): Promise<UnpaidInvoice[]>;
+  /**
+   * Credits Chargebee granted for top-ups whose invoice is NOT paid — for the
+   * caller to hold back from the balance and the gateway cap. Plain decimal.
+   */
+  unpaidTopUpCredits(args: {
+    customerId: string;
+    subscriptionId: string;
+    unitId?: string;
+    itemPriceId: string;
+    now?: number;
+  }): Promise<string>;
   /** Payments and refunds for a customer, newest first. */
   transactionsFor(customerId: string, limit?: number): Promise<Transaction[]>;
+  /** One page of payments, newest first, and the opaque cursor for the next (null at the end). */
+  transactionsPage(
+    customerId: string,
+    page?: { limit?: number; offset?: string },
+  ): Promise<{ transactions: Transaction[]; nextOffset: string | null }>;
   /** The card on file, or null when the customer has none. */
   paymentSource(customerId: string): Promise<PaymentSource | null>;
   /** One invoice, narrowed to its ownership. Null when Chargebee does not have it. */

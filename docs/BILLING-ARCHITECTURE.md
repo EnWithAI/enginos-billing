@@ -269,8 +269,14 @@ Load-bearing details:
 `models/rate.ts` is the only place dollars and credits convert.
 
 ```
-usdToCredits(usd)  =  usd / USD_PER_CREDIT      default 0.001
+usdPerCredit       =  1 / CREDITS_PER_USD       default 1,000 credits per $1
+usdToCredits(usd)  =  usd / usdPerCredit        spend → capture
+creditsToUsd(c)    =  c   × usdPerCredit        grant → LiteLLM cap
 ```
+
+`CREDITS_PER_USD` is read in `config/config.ts` and turned into the per-credit
+rate at the ledger's ten places. `USD_PER_CREDIT`, the same rate stated per
+credit, is still read when it is unset.
 
 A credit is a **billing unit with a fixed dollar rate**, not an LLM token — that
 is what makes a single rate possible at all. This service performs **no pricing
@@ -325,7 +331,7 @@ Each answers "what did Chargebee say" — never "where is the worker".
 | `SUCCESS` | **yes** | Taken, already taken, or nothing chargeable | — cursor moves |
 | `UNKNOWN` | no | Timeout, 5xx, bad credential, disabled site | every tick, lookup first |
 | `RATE_LIMITING` | no | HTTP 429 — refused *before* being applied | 1 min doubling to 15 |
-| `OUT_OF_CREDITS` | no | `ERROR_INSUFFICIENT_BALANCE` | **every tick** — a top-up must clear it at once |
+| `OUT_OF_CREDITS` | no | `ERROR_INSUFFICIENT_BALANCE` | **never while the account is `exhausted`** — the tenant is held whole, nothing sent or read; at once when a top-up, renewal or the daily resync takes it out of `exhausted` |
 | `INVALID` | no | Bad data/config, incl. no prepaid ledger | 5 min doubling to 1 hour |
 | `WRITTEN_OFF` | **yes** | `OUT_OF_CREDITS` or `INVALID` on a subscription that has **ended** (account cancelled, or moved to another subscription). Nothing was charged and nothing can be | never — logged once as `billing.sync.written_off`; cursor moves |
 
@@ -453,9 +459,11 @@ is hand-rolled.
 
 | Verb | Endpoint | Notes |
 |---|---|---|
-| GET | `/item_prices/{id}` | Plan details, and the checkout currency |
-| POST | `/hosted_pages/checkout_new_for_items` | Subscribe |
-| POST | `/hosted_pages/checkout_one_time_for_items` | Top-up. **Requires `currency_code`** |
+| GET | `/item_prices/{id}` | Plan details. The free plan's price is checked to be **zero** before every subscribe |
+| POST | `/customers/{id}/subscription_for_items` | **The free plan**, no checkout and no card — for an org it is for, at sign-up and as the billing page's fallback. `chargebee-idempotency-key: free-plan:<tenant>` |
+| POST | `/invoices/create_for_charge_items_and_charges` | **Top-up**, charged onto the subscription and collected from the card on file. **Never retried** |
+| POST | `/hosted_pages/manage_payment_sources` | *Update card*. `redirect_url` on port 80, 443, 8080 or 8443 only |
+| POST | `/hosted_pages/checkout_new_for_items` | Paid-plan checkout, from the page's **Choose a plan** for an org with no plan. `redirect_url` = `APP_URL/organization/billing?from=checkout`; the page then syncs the new subscription at once |
 | POST | `/portal_sessions` | Built, never rendered, and disabled on the test site. Refused by billing (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`: customers must not be able to cancel |
 
 ### Units trap
@@ -542,9 +550,11 @@ maxBudget = baseline + creditsToUsd(grantedCredits)
   `budget_reset_at` — a prepaid cap must not roll over monthly.
 
 Three metadata keys mark a team as ours: `billing_managed`,
-`billing_spend_baseline`, and `billing_block_reason` when blocked. The platform's
-own plan reconciler treats a cap without `billing_managed` as drift and restores
-the plan budget, which is how release works — see below.
+`billing_spend_baseline`, and `billing_block_reason` when blocked.
+enginos-platform leaves the budget of a `billing_managed` team alone: its
+provisioning never writes it, and its plan reconciler does not count it as drift
+(§10 #5). A team without the flag gets the platform's own budget — **$0, with no
+reset** — so billing is the only thing that ever lets a team spend.
 
 `push()` is idempotent: it recomputes the cap and writes only when it differs
 (`capHeld`) or when it needs to unblock. `/team/update` **replaces metadata
@@ -593,20 +603,29 @@ treated as authoritative, not just the refusal.
 `WHERE status <> 'cancelled'` keeps a cancelled account from being flipped back
 to `exhausted` — cancellation is terminal and outranks it.
 
-**Blocking is best-effort and not retried on its own.** If LiteLLM is
-unreachable, the Postgres status still changes and the failure logs as
-`billing.budget.block_failed`. The next tick's capture reaches `markExhausted`
-again and retries there — so a LiteLLM outage at that exact moment leaves a
-window where the account reads `exhausted` while the team is still spending.
+**While `exhausted`, the tenant is held whole.** Every tick `holdExhausted()`
+re-asserts the block and does nothing else: no Chargebee call, no ClickHouse
+read. The usage waits in front of the cursor. Only `activate()` — a top-up, a
+renewal, a subscription webhook, the daily resync — moves the account out of
+`exhausted`; the next tick then resolves the held window first and bills on.
+Credits granted by hand in Chargebee, which nothing tells billing about, are
+found by the daily resync.
+
+**Blocking is best-effort, retried each tick.** If LiteLLM is unreachable, the
+Postgres status still changes and the failure logs as
+`billing.budget.block_failed`; the next tick's `holdExhausted()` blocks again.
+A block already in place for the same reason is not re-written — re-asserting
+it costs one `/team/info` read. A LiteLLM outage at that exact moment still
+leaves a window where the account reads `exhausted` while the team is spending.
 
 ### Release on cancellation
 
 `release()` strips `billing_managed`, `billing_spend_baseline`,
 `billing_baseline_term` and `billing_block_reason` from the team metadata and
 leaves the cap alone. The platform's reconciler then sees an unmanaged team
-whose budget does not match its plan, and restores the plan budget. Without
-this the team would keep the prepaid cap forever, since no further grant would
-ever come to move it.
+and sets the platform's budget, **$0**: a cancelled org can spend nothing until
+it is subscribed again. Without this the team would keep the prepaid cap
+forever, since no further grant would ever come to move it.
 
 It also lifts **billing's own block** (`blocked: false`, sent whenever
 `billing_block_reason` is on the team): the platform's reconciler never sends
@@ -653,6 +672,33 @@ stop everyone else's billing (`billing.sync.tenant_error`).
 | `billing.sync.out_of_credits` | Customer needs to top up |
 | `billing.sync.cursor_repaired` | Cursor had fallen behind a settled window |
 | `billing.invoice.ownership_denied` | A tenant asked for someone else's invoice — not a typo |
+| `billing.free_plan.page_fallback_failed` / `.no_ledger_yet` | A new org is not on its free plan, or is on it with no credit unit yet — its usage is not billed until a sync finds the unit |
+
+### Sentry alerts (the worker)
+
+`worker/alerts.ts` raises four alerts, each ONE Sentry issue however many tenants
+and ticks raise it:
+
+| Alert | Raised when |
+|---|---|
+| `postgres-down` | the database cannot be reached, on any call |
+| `postgres-write-failed` | the database is up and refused a write |
+| `chargebee-down` | Chargebee does not answer (5xx, timeout, network), refuses the key, or a sync is stuck |
+| `chargebee-update-failed` | Chargebee refused a usage window (400, 404) |
+
+Out of credits, rate limiting and every other error send nothing.
+`npx tsx scripts/sentry-alerts-check.ts` fires every case against the Sentry
+project in `.env` (tagged `environment=manual-check`) and passes only when
+Sentry accepted the right alert: all fourteen passed on 2026-09-28.
+
+What it does not cover:
+
+- **The worker must have its settings.** Without `SENTRY_DSN` in its
+  environment Sentry is off; the worker scripts load `.env` for that reason.
+- **A Chargebee outage is seen only when the worker calls Chargebee**, which it
+  does when there is usage to capture. A quiet minute raises nothing.
+- **The API sends nothing to Sentry.** A Chargebee failure on the billing page
+  or a top-up is logged, not alerted.
 
 ---
 
@@ -707,52 +753,89 @@ which applies what Chargebee says now. A late or replayed body can no longer
 re-activate a cancelled account or rewind its term, and a cancellation cancels
 the account only when the subscription it is linked to has ended (C43, C53).
 
-### 4. The top-up pack must NOT carry its own Credit Grant — owner action in Chargebee
+### 4. ~~The top-up pack must NOT carry its own Credit Grant~~ — superseded 2026-09-28: it keeps its grant
 
-**MEASURED on the test site (2026-09-24):** both pack item prices,
-`test-top-up-INR` and `token-pack-5m-INR`, carry a **Credit Grant of their own**
-on their charge item, into unit **`token`**, while the plan
-(`pre-paid-test-v1-INR-*`) grants into **`token-test`**. Two things follow:
+The owner chose to keep Chargebee's Credit Grant on the top-up charge
+(`api_token`, 50 `token-test` per ₹1 unit) rather than have billing allocate.
+MEASURED on the test site, a charge with a grant is refused on every hosted or
+subscription-update route mid-term — `checkout_one_time_for_items` ("Charges
+with grants are not supported for customer one off charges"),
+`checkout_existing_for_items` and `update_for_items`
+(`mid_term_grant_subscription_change_not_allowed`) — and accepted only when
+invoiced onto the subscription. So a top-up is now charged to the card on file
+after the customer confirms the amount
+(`POST /invoices/create_for_charge_items_and_charges`), Chargebee issues the grant
+about a second after `paid_at`, and billing records it as a `catalogue_grant`
+and moves the cap (`TOPUP_CHARGEBEE_GRANTS=true`). Billing never allocates for
+such a pack, not even while the grant block is still on its way: that would be a
+second grant once Chargebee's lands.
 
-- **No customer can buy a pack.** `checkout_one_time_for_items` refuses it:
-  *"Charges with grants are not supported for customer one off charges"*.
-  Billing now answers that as **409 `topup-misconfigured`**
-  (`billing.topup.pack_carries_grant`) instead of a generic 502.
-- **A pack paid another way is granted twice over, in the wrong unit.** Invoice
-  85 was paid through a subscription-level charge: Chargebee granted 1000 into
-  `token` (block `B0FYuUVW8TAKdE2`), and billing — before this fix — allocated
-  1000 more into `token-test`. The `token` credits are never drawn by the usage
-  sync and never counted in the LiteLLM cap; `token` also appeared as a second
-  ledger account on the subscription, listed **first**, which is what broke
-  `balance()` (fixed: it now reads the account's own unit — C57b).
+Two measured consequences shape the flow:
 
-**What the owner must change in the Chargebee catalogue** (Product Catalog →
-Items → Charges):
+- **No hosted checkout for a top-up.** The page asks the customer to confirm the
+  charge to their saved card instead.
+- **Invoice first, pay later does not work.** Invoiced with
+  `auto_collection=off`, the grant was issued at once for the UNPAID invoice,
+  and voiding the invoice did not take it back.
 
-1. Open the charge item **`test-top-up`** (item price `test-top-up-INR`) and
-   **remove its Credit Grant** (the entitlement/credit-grant configuration on the
-   charge that grants units of `token`). Do the same for **`token-pack-5m`**
-   (`token-pack-5m-INR`) if it stays in the catalogue. The pack must be a plain
-   one-off charge; billing grants its credits itself with
-   `/ledger_operations/allocate`, into the account's `ledger_unit_id`
-   (`token-test`), for `TOPUP_CREDITS` credits.
-2. Keep **one-time checkout** enabled (Settings → Configure Chargebee → Checkout
-   & Self-Serve Portal) — it is what `startTopUp` opens.
-3. Decide what to do with the **1000 `token` credits already on
-   `16A6ReVW76FGuAc8`** (org_aws_com, block `B0FYuUVW8TAKdE2`): billing will never
-   use them. Void them, or leave them; nothing reads that unit. Invoice 85 is
-   recorded as applied, so its pack is not granted a third time.
-4. Set `TOPUP_ITEM_PRICE_ID` to the **item price** id — `test-top-up-INR`, not
-   the item id `test-top-up`, which answered *"No currency for item price
-   test-top-up"* (C57c).
+Still true from before: the **1000 `token` credits on `16A6ReVW76FGuAc8`**
+(org_aws_com, block `B0FYuUVW8TAKdE2`) are in a unit billing never reads.
 
-**The code is safe with either setup.** If a pack DOES carry its own grant and
-is paid anyway, its grant block names the invoice's pack line
-(`billing_metadata.line_items[].id`): billing records the invoice as a
-`catalogue_grant` and **allocates nothing**. Into the account's unit it counts
-as applied and the gateway cap moves; into another unit it raises
-`billing.topup.catalogue_grant_wrong_unit` for the owner, once, and still
-allocates nothing — a second grant for one payment is never the remedy.
+### 5. ~~The platform re-applied its plan budget over billing's cap~~ — fixed 2026-09-28
+
+enginos-platform's plan reconciler (`litellm-plan-reconcile.scheduler.ts`, every
+minute) compared each team's `max_budget` with its own per-plan cap ($5 / 30d
+free, $1000 / 30d paid) and "corrected" the difference — so a minute after
+billing set a credit-based cap, every billed team was back to $5 with a monthly
+reset (measured: `org_aa_com` set at 08:09:01, reverted at 08:10:02). The
+platform never read `billing_managed`. Now its provisioning never writes a
+`billing_managed` team's budget, its drift check ignores the budget of such a
+team, and the platform's own budget for any other team is $0 with no reset.
+
+### 6. ~~A new org was linked before its credit ledger existed~~ — fixed 2026-09-28
+
+The free-plan subscribe linked the subscription within a second, and Chargebee
+created the plan's grant block — and with it the ledger account — three seconds
+later. The account came out `active` with no `ledger_unit_id`, and the usage
+sync skips such an account, so the org's usage went unbilled until some later
+sync filled the unit in. `provisionFreePlan` now re-syncs once a second, up to
+ten times, until the unit is there.
+
+### 7. ~~An unpaid top-up still raised the cap~~ — fixed 2026-09-28
+
+Chargebee issues a top-up's grant block with the invoice, not with the payment.
+Two ways to get an unpaid invoice were measured (CHARGEBEE-API.md):
+
+- **Autopay off.** With the subscription's `auto_collection` off, the charge
+  came back `payment_due` with its credits granted. `chargeItem()` now always
+  sends `auto_collection=on`, which was measured to collect at once.
+- **A declined card.** The charge answers HTTP 200 with a `payment_due`
+  invoice, not a payment error, and the block is `available` at once. Voiding
+  the invoice does not take the block back.
+
+**Decision: a failed payment adds no credits.** `unpaidTopUpCredits()` sums the
+live blocks of every top-up invoice that is `payment_due`, `not_paid`, `voided`
+or `pending`. They are subtracted from:
+
+- the gateway cap (`paidGrantedCredits`, container/budget-hooks.ts);
+- the page's granted and remaining figures (billing-overview.service.ts);
+- the exhaustion check (`usableCredits`, account.service.ts).
+
+The invoice is kept, so the money can still be collected:
+
+- **Chargebee's retry**, 24 hours after the failure, on whatever card is then on
+  file. Changing the card does not collect it.
+- **Pay now** (`POST /api/internal/topup/pay-unpaid`, `payUnpaidTopUps`):
+  `collect_payment` on each owed invoice, at once.
+
+Either way `payment_succeeded` (or Pay now itself) records the pack, and the cap
+moves to include it. **One top-up may be owed at a time**: another is refused
+with 409 `topup-unpaid`, because Chargebee would charge each one when it
+retries.
+
+Not handled: when Chargebee's retries run out, the invoice becomes `not_paid`
+and stays owed. What the site does then (leave it, or cancel the subscription)
+is Chargebee's dunning setting, not billing's.
 
 ### Also worth knowing
 
@@ -760,12 +843,14 @@ allocates nothing — a second grant for one payment is never the remedy.
   The cancelled period — free-plan usage — is never billed to the new
   subscription (the cursor restarts, forward only). The ~2–3 minutes of usage
   between the cursor and the cancellation itself (the lag) is not billed either.
-- **At a renewal, the last lag + window of the old term is paid from the new
-  term's grant.** The capture API has no effective time and the old block has
-  already expired. The LiteLLM baseline moves to the team's spend at the term
-  change, so that sliver is not counted against the new headroom; if the
-  customer spends the whole new grant, Chargebee refuses the overflow
-  (`OUT_OF_CREDITS`) and the team is blocked.
+- **Credits roll over at a renewal.** The plan's Credit Grant is set to
+  unlimited rollover in the catalogue: Chargebee moves an old block's unused
+  balance into a new rollover block (`is_rollover: true`) instead of expiring
+  it (`expired_amount` stays 0). The LiteLLM baseline moves at the term change
+  so the headroom equals Chargebee's usable balance — rolled-over credits
+  included. Not yet seen live; the first test-site renewal is `org_aa_com` on
+  2026-10-25. The last lag + window of the old term is paid from the new term's
+  balance, since the capture API has no effective time.
 - **A crash mid-capture costs up to 5 minutes** (the `PROCESSING` lease) before
   that tenant's billing resumes. Nothing is lost — the usage waits in front of
   the cursor.
@@ -784,7 +869,8 @@ allocates nothing — a second grant for one payment is never the remedy.
   it that way. The old `billed_usage_event` table, which remembered billed
   spans, was removed; 030 replaces it without any state here.
 - `TOPUP_CREDITS` is a **single global env var**, so exactly one pack size is
-  supported. A second size requires deriving credits from the item price.
+  supported. With `TOPUP_CHARGEBEE_GRANTS=true` it only sets the figure the page
+  quotes — what is granted is the charge's Credit Grant — so the two must match.
 
 ---
 
@@ -792,14 +878,21 @@ allocates nothing — a second grant for one payment is never the remedy.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `USD_PER_CREDIT` | `0.001` | 1,000 credits = $1.00 of LLM spend |
-| `BILLING_LAG_MS` | `120000` | Only usage ingested this long ago is read |
+| `CREDITS_PER_USD` | `1000` | Credits that buy $1 of LLM spend. `.env`: `50`. `USD_PER_CREDIT` (per credit, default `0.001`) is read only when this is unset |
+| `FREE_PLAN_ITEM_PRICE_ID` | empty | The plan an org it is for is put on at sign-up — no card, so it must cost zero (checked before every subscribe). Empty turns automatic subscription off |
+| `FREE_PLAN_DEFAULT` | `false` | Whether an org with no setting of its own (`billing_account.free_plan` null) gets the free plan. One it is not for is offered the paid plans and cannot check out the free one. Per org: `POST /api/internal/free-plan {tenantId, enabled}` — **operators only**, never forwarded by the platform |
+| `BILLING_LAG_MS` | `10000` | Only usage ingested this long ago is read. 10 s is safe: a span is visible at most 389 ms after its stamp (measured) — [BILLING-WORKER.md](BILLING-WORKER.md) §6 |
 | `BILLING_WINDOW_MS` | `60000` | Window length. **Fixed** — see §3 |
-| `BILLING_MAX_WINDOWS_PER_TICK` | `20` | Catch-up bound |
+| `BILLING_MAX_WINDOWS_PER_TICK` | `20` | Catch-up bound, per pass |
+| `BILLING_SWEEP_INTERVAL_MS` | `60000` | Time between usage-sync passes: one a minute. Under a minute, each cron run makes several passes (none after 45 s) — an option, not used |
 | `BILLING_MAX_ATTEMPTS` | `10` | Escalation threshold; never converts unknown → failure |
 | `BILLING_PLAN_CACHE_TTL_MS` | `600000` | Plan catalogue cache; 0 disables |
-| `TOPUP_ITEM_PRICE_ID` / `TOPUP_CREDITS` | | The one top-up pack and its credits. An **item price** id (`test-top-up-INR`), not the item id; the pack must carry no Credit Grant of its own (§10 #4) |
-| `ITEM_PRICE_IDS` | | **Allowlist**, not a menu — every checkout request is checked against it |
+| `TOPUP_ITEM_PRICE_ID` | `token-pack-5m-INR` | The top-up charge — an **item price** id (`api_token-INR`), not the item id |
+| `TOPUP_CHARGEBEE_GRANTS` | `false` | `true` when the charge carries its own Credit Grant: Chargebee grants, billing only records (§10 #4). `false` with a grant would grant twice |
+| `TOPUP_CREDITS` | `1000` | Credits per unit. With Chargebee granting, only the page's quote — must match the grant |
+| `TOPUP_MAX_QUANTITY` | `100` | Most units one top-up may buy — a typo guard |
+| `ITEM_PRICE_IDS` | empty | Plans besides the free one an org may be on. The free plan is **always** included. An org's current subscription is kept whatever this says |
+| `APP_URL` | `http://localhost:4200` | Where Chargebee sends the browser back to. Chargebee accepts port 80, 443, 8080 or 8443 only, so locally the HTTPS dev origin |
 | `CHARGEBEE_PORTAL_ENABLED` | `false` | The self-serve portal route answers 409 `portal-off` unless this is exactly `true`. Customers must not be able to cancel; set it only after "Allow customers to cancel subscriptions" is off in the site's Self-Serve Portal settings |
 
 > **Deployment note:** `BILLING_LAG_MS` is in **milliseconds**. A value of `120`

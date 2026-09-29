@@ -10,6 +10,7 @@
 import type { Transaction } from "../integrations/chargebee";
 import { ACCOUNT } from "../models/account-status";
 import type { BillingOverview, LastSync, SubscriptionDetails } from "../services/billing-overview.service";
+import type { TopUpOffer } from "../services/plan-catalog.service";
 
 export interface BillingViewConfig {
   /**
@@ -26,6 +27,9 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
   const empty = {
     site: config.site,
     plansOffered: overview.plansOffered,
+    // Whether this org is put on the free plan. With no subscription, false
+    // means the page offers `plansOffered` instead of waiting for one.
+    freePlan: overview.freePlan,
     status: ACCOUNT.UNLINKED as string,
     plan: { itemPriceId: config.defaultItemPriceId },
     term: { start: null as Date | null, end: null as Date | null },
@@ -34,7 +38,11 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
     // An empty list, not null: a tenant with no subscription has genuinely made
     // no payments, which is different from "we could not find out".
     payments: [] as unknown[] | null,
+    paymentsNextOffset: null as string | null,
     subscription: null,
+    // Only a linked subscription can be topped up.
+    topUp: null as TopUpOffer | null,
+    unpaidTopUps: [] as unknown[] | null,
   };
 
   if (overview.kind === "unlinked") return empty;
@@ -58,6 +66,7 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
   return {
     site: config.site,
     plansOffered: overview.plansOffered,
+    freePlan: overview.freePlan,
     status: account.status,
     plan,
     term,
@@ -66,7 +75,19 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
     // NULL (not []) when Chargebee could not be reached, so the page can say
     // "we could not load these" instead of the flatly wrong "no payments yet".
     payments: overview.payments?.map(renderPayment) ?? null,
+    paymentsNextOffset: overview.payments ? overview.paymentsNextOffset : null,
     subscription: renderSubscription(account.chargebeeSubscriptionId, overview.subscription),
+    topUp: overview.topUp,
+    // Null when Chargebee could not be asked — the page must not say "nothing owed".
+    unpaidTopUps:
+      overview.unpaidTopUps?.map((invoice) => ({
+        invoiceId: invoice.id,
+        status: invoice.status,
+        // MINOR units, like payments.
+        amountDueMinor: invoice.amountDueMinor,
+        currencyCode: invoice.currencyCode,
+        nextRetryAt: invoice.nextRetryAt,
+      })) ?? null,
   };
 }
 
@@ -78,6 +99,11 @@ function renderLastSync(sync: LastSync | null) {
     credits: sync.amount.toString(),
     events: sync.eventCount,
   };
+}
+
+/** One later page of the payment history, and the cursor for the page after it. */
+export function renderPaymentsPage(page: { transactions: Transaction[]; nextOffset: string | null }) {
+  return { payments: page.transactions.map(renderPayment), nextOffset: page.nextOffset };
 }
 
 function renderPayment(t: Transaction) {

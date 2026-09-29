@@ -406,7 +406,9 @@ describe("C19 Chargebee timeout", () => {
     expect(r.cb.appliedCount).toBe(1);
   });
 
-  const KINDS: Array<{ label: string; faults: () => Fault[]; applied: boolean; tick1Posts: number; status: string }> = [
+  // `topUp`: the refusal holds the tenant until credits come back, so the retry
+  // needs activate() to take the account out of `exhausted` first.
+  const KINDS: Array<{ label: string; faults: () => Fault[]; applied: boolean; tick1Posts: number; status: string; topUp?: boolean }> = [
     { label: "500 (not applied)", faults: () => [F.s500()], applied: false, tick1Posts: 1, status: SYNC.UNKNOWN },
     { label: "500 after apply", faults: () => [F.s500(true)], applied: true, tick1Posts: 1, status: SYNC.UNKNOWN },
     { label: "502 HTML body", faults: () => [F.s502html()], applied: false, tick1Posts: 1, status: SYNC.UNKNOWN },
@@ -420,12 +422,12 @@ describe("C19 Chargebee timeout", () => {
     { label: "429 x3", faults: () => [F.s429(), F.s429(), F.s429()], applied: false, tick1Posts: 3, status: SYNC.RATE_LIMITING },
     { label: "400 param_wrong_value", faults: () => [F.paramWrongValue()], applied: false, tick1Posts: 1, status: SYNC.INVALID },
     { label: "400 invalid_request", faults: () => [F.invalidRequest()], applied: false, tick1Posts: 1, status: SYNC.INVALID },
-    { label: "400 ERROR_INSUFFICIENT_BALANCE", faults: () => [F.insufficient()], applied: false, tick1Posts: 1, status: SYNC.OUT_OF_CREDITS },
+    { label: "400 ERROR_INSUFFICIENT_BALANCE", faults: () => [F.insufficient()], applied: false, tick1Posts: 1, status: SYNC.OUT_OF_CREDITS, topUp: true },
   ];
 
   it.each(KINDS)(
     "C19 every retry of a maybe-sent id GETs /ledger_operations/{id} before any POST — $label → $status",
-    async ({ faults, applied, tick1Posts, status: expected }) => {
+    async ({ faults, applied, tick1Posts, status: expected, topUp }) => {
       const r = matrixRig({ timeoutMs: 25 });
       r.usage.add("t1:s1", T0 + 30_000, 0.002);
       r.cb.captureFaults.push(...faults());
@@ -437,6 +439,7 @@ describe("C19 Chargebee timeout", () => {
       expect(r.cb.lookupsFor(row.id)).toHaveLength(0);
       expect(r.cb.appliedCount).toBe(applied ? 1 : 0);
 
+      if (topUp) r.prisma._accounts.get(TENANT)!.status = "active";
       const mark = r.cb.requests.length;
       r.at(2 + 61); // past every backoff (RATE_LIMITING 1 min, INVALID 5 min)
       await r.tick();
@@ -893,10 +896,13 @@ describe("C45 credit reaches zero", () => {
     expect(update.body).toMatchObject({ team_id: SLUG, blocked: true, metadata: { [BLOCK_REASON]: "exhausted", [BILLING_MANAGED]: true } });
     expect(litellm.team.blocked).toBe(true);
 
-    // Usage that was in flight before the block. Refused whole; the balance never goes below 0.
+    // Usage that was in flight before the block. Not sent at all while the
+    // account is exhausted; the balance never goes below 0.
     r.usage.add("t2:s1", T0 + MINUTE + 30_000, 0.001);
+    const mark = r.cb.requests.length;
     r.at(3);
-    expect((await r.tick()).outcome).toBe(OUTCOME.OUT_OF_CREDITS);
+    expect((await r.tick()).outcome).toBe(OUTCOME.EXHAUSTED);
+    expect(r.cb.since(mark)).toEqual([]);
     expect(r.cb.balanceStr).toBe("0");
     expect(r.cb.appliedCount).toBe(1);
     expect(r.cursorMin()).toBe(1);
@@ -978,7 +984,7 @@ describe("C45 credit reaches zero", () => {
 // ── C46 ──────────────────────────────────────────────────────────────────────
 
 describe("C46 insufficient credits", () => {
-  it("C46 usage > balance: refused whole (400 ERROR_INSUFFICIENT_BALANCE), OUT_OF_CREDITS, cursor held, balance untouched, exhausted + blockBudget('exhausted'); retried every tick GET-first; a top-up bills it once", async () => {
+  it("C46 usage > balance: refused whole (400 ERROR_INSUFFICIENT_BALANCE), OUT_OF_CREDITS, cursor held, balance untouched, exhausted + blockBudget('exhausted'); Chargebee not asked again while exhausted; a top-up bills it once, GET-first", async () => {
     const r = matrixRig({ balance: "100" });
     r.usage.add("t1:s1", T0 + 30_000, 0.15); // 150 credits > 100
     r.at(2);
@@ -995,22 +1001,33 @@ describe("C46 insufficient credits", () => {
     expect(status(r)).toBe("exhausted");
     expect(r.blocked).toEqual([{ tenantId: TENANT, reason: "exhausted" }]);
     expect(r.metrics(0, "error")).toContain("billing.sync.out_of_credits");
+    // No timer: once credits are back the row is due at once.
     expect(retryDelayMs(SYNC.OUT_OF_CREDITS, 5)).toBe(0);
 
-    // Usage keeps arriving behind it; nothing newer is read while it is held.
+    // Usage keeps arriving behind it. For as long as the account is
+    // exhausted — here, three hours of ticks — nothing newer is read and
+    // Chargebee is not asked: it could only refuse again.
     r.usage.add("t2:s1", T0 + MINUTE + 30_000, 0.001);
     const reads = r.usage.reads.length;
     const mark = r.cb.requests.length;
-    r.at(3);
-    expect((await r.tick()).outcome).toBe(OUTCOME.OUT_OF_CREDITS);
-    expect(r.cb.since(mark).map(tag)).toEqual([`GET /ledger_operations/${held.id} 404`, "POST /ledger_operations/capture 400"]);
+    for (const m of [3, 4, 10, 65, 180]) {
+      r.at(m);
+      expect(await r.tick()).toMatchObject({ outcome: OUTCOME.EXHAUSTED, syncId: held.id });
+    }
+    expect(r.cb.since(mark)).toEqual([]);
     expect(r.usage.reads.length).toBe(reads);
+    expect(r.prisma._stuck).toMatchObject({ id: held.id, status: SYNC.OUT_OF_CREDITS, attemptCount: 1 });
     expect(r.cb.balanceStr).toBe("100");
 
-    // Top-up lands in Chargebee (+1000). No requeue: the next tick bills the held window, then the next.
+    // Top-up lands in Chargebee (+1000), and activate() takes the account out
+    // of `exhausted`. No requeue: the next tick asks about the held window
+    // first, bills it, then the next.
     r.cb.balance += fx("1000");
-    r.at(4);
+    r.prisma._accounts.get(TENANT)!.status = "active";
+    const topUpMark = r.cb.requests.length;
+    r.at(181);
     expect((await r.tick()).outcome).toBe(OUTCOME.SYNCED);
+    expect(r.cb.since(topUpMark).map(tag).slice(0, 2)).toEqual([`GET /ledger_operations/${held.id} 404`, "POST /ledger_operations/capture 200"]);
     expect(r.cb.appliedCount).toBe(2);
     expect(r.cb.taken).toBe("151");
     expect(r.cb.balanceStr).toBe("949");
@@ -1048,7 +1065,7 @@ describe("C46 insufficient credits", () => {
     expect(litellm.team.max_budget).toBe(0.5); // the cap is left in place, the block is on top
   });
 
-  it("C46 LiteLLM unreachable at the moment of refusal: block_failed is logged, the usage stays held, and the next tick's refusal blocks the team", async () => {
+  it("C46 LiteLLM unreachable at the moment of refusal: block_failed is logged, the usage stays held, and the next tick blocks the team without asking Chargebee", async () => {
     const litellm = new LiteLLMHttpFake();
     const budget = gatewayFor(litellm, "100");
     const r = matrixRig({ balance: "100", blockBudget: (t, reason) => budget.block(t, reason) });
@@ -1063,10 +1080,22 @@ describe("C46 insufficient credits", () => {
     expect(litellm.team.blocked).toBe(false); // the gap the architecture doc admits (BILLING-ARCHITECTURE.md:546-550)
 
     litellm.down = false;
+    const mark = r.cb.requests.length;
     r.at(3);
-    expect((await r.tick()).outcome).toBe(OUTCOME.OUT_OF_CREDITS); // retried every tick, no backoff
+    // Held while exhausted, so Chargebee is not asked; the block is re-asserted every tick regardless.
+    expect(await r.tick()).toMatchObject({ outcome: OUTCOME.EXHAUSTED });
+    expect(r.cb.since(mark)).toEqual([]);
     expect(litellm.team).toMatchObject({ blocked: true, metadata: { [BLOCK_REASON]: "exhausted" } });
     expect(r.cb.balanceStr).toBe("100");
     expect(r.prisma._cursor).toBe(T0);
+
+    // Once it is in place, re-asserting it is a read: no more /team/update.
+    const writes = litellm.requests.filter((q) => q.path === "/team/update").length;
+    for (const m of [4, 5, 6]) {
+      r.at(m);
+      expect((await r.tick()).outcome).toBe(OUTCOME.EXHAUSTED);
+    }
+    expect(litellm.requests.filter((q) => q.path === "/team/update")).toHaveLength(writes);
+    expect(litellm.team.blocked).toBe(true);
   });
 });

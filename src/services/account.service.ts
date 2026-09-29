@@ -19,7 +19,7 @@
 import type { PrismaClient } from "../db/prisma";
 import { isDefiniteRefusal, type ChargebeeClient, type ChargebeeError, type GrantBlock } from "../integrations/chargebee";
 import { ACCOUNT, type BlockReason } from "../models/account-status";
-import { add, compare } from "../models/decimal";
+import { add, compare, multiply, subtractFloorZero } from "../models/decimal";
 import { isBillable } from "../models/rate";
 import { realmToRoutingSlug } from "../models/routing-slug";
 import { chooseBillingSubscription, itemPriceIdOf } from "../models/subscription";
@@ -99,6 +99,12 @@ export interface AccountDeps {
   blockBudget?: (tenantId: string, reason?: BlockReason) => Promise<void>;
   /** Hands the tenant's LiteLLM team back to its plan budget when the subscription ends. */
   releaseBudget?: (tenantId: string) => Promise<void>;
+  /**
+   * The top-up charge. Its credits count only once its invoice is paid, so a
+   * declined top-up's — which Chargebee grants with the invoice — are held
+   * back from the usable balance. Absent: nothing is held back.
+   */
+  topUpItemPriceId?: string;
   /** Is the tenant's LiteLLM team blocked BY BILLING right now? Read by the minute's gate check. */
   budgetBlocked?: (tenantId: string) => Promise<boolean>;
   clock?: () => number;
@@ -136,21 +142,21 @@ export function createAccountService(deps: AccountDeps) {
     };
   }
 
-  async function bootstrapFromTenant(tenantId: string) {
+  async function bootstrapFromTenant(tenantId: string, billingEmail?: string) {
     const facts = await tenantFacts(tenantId);
     if (!facts) return null;
-    return ensureCustomer(facts);
+    return ensureCustomer({ ...facts, billingEmail });
   }
 
   /**
    * Create the local row for a tenant that has merely LOOKED at billing, without
    * touching Chargebee.
    *
-   * Deliberately NOT ensureCustomer: creating a Chargebee customer for everyone
-   * who opens a page puts records in a third-party system for orgs that may never
-   * subscribe. The customer is still created lazily at checkout, where it is
-   * actually needed, and `ensureCustomer` upserts the same row so the two paths
-   * converge.
+   * Deliberately NOT ensureCustomer: opening a page is a read, and must not be
+   * what puts a record in a third-party system. The customer is created at
+   * onboarding (checkout.provisionFreePlan, which enginos-platform calls once
+   * per new org) and, for an org that onboarding never reached, at checkout;
+   * `ensureCustomer` upserts the same row so the paths converge.
    *
    * It lays down NO billing origin. Billing starts when the customer
    * subscribes, not when they look at the page — see ensureBillingCursor().
@@ -470,6 +476,7 @@ export function createAccountService(deps: AccountDeps) {
    */
   async function usableCredits(account: {
     tenantId: string;
+    chargebeeCustomerId?: string | null;
     chargebeeSubscriptionId: string | null;
     ledgerUnitId: string | null;
   }): Promise<string | null> {
@@ -481,7 +488,16 @@ export function createAccountService(deps: AccountDeps) {
       // whether this account can pay, and reading "the first balance" opened
       // exhausted accounts on exactly that (C57b).
       const balance = await deps.chargebee.balance(account.chargebeeSubscriptionId, account.ledgerUnitId);
-      return balance?.usable ?? null;
+      if (balance?.usable == null) return null;
+      // A declined top-up's credits are in Chargebee's balance but not paid for.
+      if (!deps.topUpItemPriceId || !account.chargebeeCustomerId) return balance.usable;
+      const unpaid = await deps.chargebee.unpaidTopUpCredits({
+        customerId: account.chargebeeCustomerId,
+        subscriptionId: account.chargebeeSubscriptionId,
+        unitId: account.ledgerUnitId ?? undefined,
+        itemPriceId: deps.topUpItemPriceId,
+      });
+      return subtractFloorZero(balance.usable, unpaid);
     } catch (err) {
       log.warn?.(
         { metric: "billing.balance.unreadable", tenantId, err: errorMessage(err) },
@@ -820,8 +836,20 @@ export function createAccountService(deps: AccountDeps) {
    * have been applied: one bad invoice must not hold up every later one. It
    * stays PENDING and is tried again on every apply, so it completes by itself
    * once the cause is fixed.
+   *
+   * `chargebeeGrants`: the pack's charge carries its own Credit Grant, so
+   * Chargebee grants every paid pack and billing only records it. An invoice
+   * whose grant block is not visible yet is NOT allocated — Chargebee issues
+   * the block about a second after payment, and allocating in that second
+   * would be a second grant. It is left with no row and returned in
+   * `pending`, so the next apply looks again.
    */
-  async function applyPaidTopUps(tenantId: string, itemPriceId: string, creditsPerPack: string) {
+  async function applyPaidTopUps(
+    tenantId: string,
+    itemPriceId: string,
+    creditsPerUnit: string,
+    { chargebeeGrants = false }: { chargebeeGrants?: boolean } = {},
+  ): Promise<{ applied: number; credits: string; pending?: string[] }> {
     const NONE = { applied: 0, credits: "0" };
     const account = await accounts.findByTenantId(tenantId);
     if (!account?.chargebeeCustomerId || !account.chargebeeSubscriptionId || !account.ledgerUnitId) return NONE;
@@ -849,6 +877,7 @@ export function createAccountService(deps: AccountDeps) {
 
     let applied = 0;
     let credits = "0";
+    const pending: string[] = [];
     let refused: unknown = null;
     try {
       for (let i = 0; i < owed.length; i += 1) {
@@ -868,7 +897,7 @@ export function createAccountService(deps: AccountDeps) {
               metric: "billing.topup.refused_cancelled",
               tenantId,
               invoiceIds: owed.slice(i).map((inv) => String(inv.id)),
-              creditsPerPack,
+              creditsPerUnit,
             },
             "Paid top-up not applied: the subscription has ended. Refund these invoices, or allocate them by hand",
           );
@@ -876,11 +905,11 @@ export function createAccountService(deps: AccountDeps) {
         }
 
         const record = records.get(String(invoice.id));
-        let granted: { credits: string } | null;
+        let granted: { credits: string } | null | typeof GRANT_NOT_VISIBLE;
         try {
           granted = record
             ? await resumeTopUp(record, ledger)
-            : await firstTopUp(tenantId, invoice, itemPriceId, creditsPerPack, linked, account.currentTermEnd, ledger);
+            : await firstTopUp(tenantId, invoice, itemPriceId, creditsPerUnit, linked, account.currentTermEnd, ledger, chargebeeGrants);
         } catch (err) {
           // Unknown outcome — a timeout, a 5xx, Chargebee unreachable: stop
           // here, the rest would meet the same. A definite refusal of THIS
@@ -894,7 +923,9 @@ export function createAccountService(deps: AccountDeps) {
           );
           continue;
         }
-        if (granted) {
+        if (granted === GRANT_NOT_VISIBLE) {
+          pending.push(String(invoice.id));
+        } else if (granted) {
           applied += 1;
           credits = add(credits, granted.credits);
         }
@@ -906,7 +937,7 @@ export function createAccountService(deps: AccountDeps) {
       if (applied > 0) await afterTopUp(tenantId, linked.subscriptionId, applied, credits);
     }
 
-    return { applied, credits };
+    return { applied, credits, ...(pending.length > 0 ? { pending } : {}) };
   }
 
   /** An invoice with no row yet: Chargebee's own grant, or claim → allocate → APPLIED. */
@@ -914,15 +945,39 @@ export function createAccountService(deps: AccountDeps) {
     tenantId: string,
     invoice: Record<string, any>,
     itemPriceId: string,
-    creditsPerPack: string,
+    creditsPerUnit: string,
     linked: { subscriptionId: string; unitId: string },
     termEnd: Date | null,
     ledger: Map<string, { blocks: GrantBlock[]; complete: boolean }>,
-  ): Promise<{ credits: string } | null> {
+    chargebeeGrants: boolean,
+  ): Promise<{ credits: string } | null | typeof GRANT_NOT_VISIBLE> {
     const invoiceId = String(invoice.id);
 
     const catalogue = catalogueGrantFor(invoice, itemPriceId, ledger);
     if (catalogue.length > 0) return recordCatalogueGrant(tenantId, invoiceId, linked.unitId, catalogue);
+
+    // Chargebee grants this pack itself. No block naming it yet means not yet,
+    // never "allocate instead": that would be a second grant once Chargebee's
+    // lands. No row is written, so the next apply looks again.
+    if (chargebeeGrants) {
+      log.warn?.(
+        { metric: "billing.topup.grant_not_visible", tenantId, invoiceId, itemPriceId },
+        "Paid top-up has no Chargebee grant block yet; nothing allocated, looked for again on the next apply",
+      );
+      return GRANT_NOT_VISIBLE;
+    }
+
+    // What was PAID FOR, read off the invoice — never the quantity the request
+    // that opened the checkout asked for. Decided once, here, and stored on the
+    // claim below: every retry re-sends the stored amount.
+    const units = topUpUnits(invoice, itemPriceId);
+    if (units === null) {
+      log.error?.(
+        { metric: "billing.topup.quantity_unreadable", tenantId, invoiceId, itemPriceId },
+        "Paid top-up not applied: its invoice line carries no whole-number quantity. Nothing sent; grant it by hand",
+      );
+      return null;
+    }
 
     const expiresAt = await topUpExpiry(tenantId, invoiceId, linked.subscriptionId, termEnd);
     const claimed = await topUps.claim({
@@ -930,7 +985,7 @@ export function createAccountService(deps: AccountDeps) {
       invoiceId,
       chargebeeSubscriptionId: linked.subscriptionId,
       ledgerUnitId: linked.unitId,
-      credits: creditsPerPack,
+      credits: multiply(creditsPerUnit, units),
       // Stored, and re-sent from here on every retry under this key: a replay
       // under the same key must be the same request, and `expires_at` from
       // the clock is not.
@@ -1289,6 +1344,9 @@ export function createAccountService(deps: AccountDeps) {
 
 export type AccountService = ReturnType<typeof createAccountService>;
 
+/** A paid pack whose Chargebee grant block has not appeared yet (applyPaidTopUps `chargebeeGrants`). */
+const GRANT_NOT_VISIBLE = Symbol("grant-not-visible");
+
 /**
  * The grant blocks Chargebee issued for THIS invoice's pack line — the pack's
  * item price carries its own Credit Grant (C57d).
@@ -1328,4 +1386,24 @@ export function catalogueGrantFor(
  */
 function isAllocationBlock(block: GrantBlock): boolean {
   return block.invoices.length === 0 && block.itemPriceId == null && !(block.doneBy ?? "").includes("@");
+}
+
+/**
+ * Units of the top-up charge a paid invoice bought: the sum of its lines for
+ * that item price.
+ *
+ * A line with no `quantity` is one unit — every top-up was, before the
+ * customer could choose. One that carries a quantity that is not a positive
+ * whole number is not guessed at: null, so the invoice is held for a person
+ * rather than granted a made-up amount.
+ */
+export function topUpUnits(invoice: Record<string, any>, itemPriceId: string): number | null {
+  let units = 0;
+  for (const line of (invoice.line_items ?? []) as Array<Record<string, any>>) {
+    if (line?.entity_id !== itemPriceId) continue;
+    const quantity = line.quantity === undefined ? 1 : line.quantity;
+    if (!Number.isInteger(quantity) || quantity <= 0) return null;
+    units += quantity;
+  }
+  return units > 0 ? units : null;
 }

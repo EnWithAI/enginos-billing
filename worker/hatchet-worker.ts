@@ -18,6 +18,10 @@
  *                             The webhook is the push path and it can be lost;
  *                             nothing else repairs a delivery that never landed.
  *
+ * Four failures reach Sentry — Postgres down, a Postgres write refused,
+ * Chargebee down, and usage Chargebee would not take — and nothing else
+ * (alerts.ts).
+ *
  * There is deliberately no late-arrival sweep, no backfill job and no retention
  * job. The cursor is on ClickHouse INGESTION time, so a span that lands late
  * lands in front of the cursor and is read by the next tick like any other; and
@@ -38,7 +42,9 @@ import { ConcurrencyLimitStrategy, HatchetClient } from "@hatchet-dev/typescript
 import { getConfig } from "../src/config/config";
 import { createServices } from "../src/container";
 import { errorMessage } from "../src/shared/errors";
-import { renderSweep } from "../src/views/sweep.view";
+import { mergePasses, renderSweep } from "../src/views/sweep.view";
+import { runPasses } from "./passes";
+import { alertingLogger, initAlerts } from "./alerts";
 
 export const BILLING_SYNC_WORKFLOW = "billing-usage-sync";
 export const BILLING_SUBSCRIPTION_RECONCILE_WORKFLOW = "billing-subscription-reconcile";
@@ -68,7 +74,19 @@ export const BILLING_SUBSCRIPTION_RECONCILE_CRON = "11 2 * * *";
  */
 export const GATE_CHECK_DEADLINE_MS = 4 * 60_000;
 
+/**
+ * With several passes a minute (BILLING_SWEEP_INTERVAL_MS under 60 s), the run
+ * must END before the next minute's tick: the workflow runs one at a time and
+ * cancels the tick that finds one running (CANCEL_NEWEST), which would lose a
+ * whole minute of passes. So no pass starts after 45 s, and the gate check
+ * stops at 55 s — what it does not reach, it reaches next minute.
+ */
+export const LAST_PASS_START_MS = 45_000;
+export const MULTI_PASS_GATE_DEADLINE_MS = 55_000;
+
 async function main() {
+  initAlerts();
+
   // Validate the configuration before registering anything: a bad value should
   // stop the worker at start, not surface as a failed tick a minute later.
   getConfig();
@@ -114,18 +132,32 @@ async function main() {
     fn: async (_input: unknown, ctx: { workflowRunId?: () => string }) => {
       const startedAt = Date.now();
       const services = createServices();
+      const { sweepIntervalMs } = getConfig();
+      const multiPass = sweepIntervalMs < 60_000;
       // Accounts whose LiteLLM budget push failed are held `activating` with
       // their team blocked. Retried first, so one that lands is billed this tick.
       const activation = await services.accounts.activatePending();
-      const summary = await services.usageSync(ctx?.workflowRunId?.()).runOnce();
+
+      // The usage sync, once — or, with an interval under a minute, a pass
+      // every BILLING_SWEEP_INTERVAL_MS until LAST_PASS_START_MS (passes.ts).
+      const sync = services.usageSync(ctx?.workflowRunId?.(), alertingLogger());
+      const passes = await runPasses({
+        runOnce: () => sync.runOnce(),
+        intervalMs: sweepIntervalMs,
+        lastStartMs: LAST_PASS_START_MS,
+        startedAt,
+      });
+
       // Then any account marked active whose team a racing block closed. AFTER
       // the billing, not before it: it is one LiteLLM read per active account,
       // and a hung LiteLLM (10s a call) ahead of the sync would have spent the
       // whole timeout before a single capture was sent. Bounded, too, so it
-      // cannot run the task into its timeout; what it does not reach this
-      // minute it reaches the next.
-      const gates = await services.accounts.reopenBlockedActive({ deadline: startedAt + GATE_CHECK_DEADLINE_MS });
-      return renderSweep(activation, summary, gates);
+      // cannot run the task into its timeout — or, with several passes, into
+      // the next minute's tick; what it does not reach this minute it reaches
+      // the next.
+      const gateDeadline = startedAt + (multiPass ? MULTI_PASS_GATE_DEADLINE_MS : GATE_CHECK_DEADLINE_MS);
+      const gates = await services.accounts.reopenBlockedActive({ deadline: gateDeadline });
+      return renderSweep(activation, mergePasses(passes), gates, passes.length);
     },
   } as never);
   workflows.push(sync);

@@ -440,7 +440,7 @@ describe("recovering an unresolved sync", () => {
     const readsBefore = usage.reads.length;
     const result = await sync.runTenant(SLUG);
 
-    expect(result.outcome).toBe(OUTCOME.OUT_OF_CREDITS);
+    expect(result).toMatchObject({ outcome: OUTCOME.EXHAUSTED, syncId: prisma._stuck!.id });
     expect(usage.reads.length).toBe(readsBefore); // nothing new was even read
     expect(prisma._log).toHaveLength(1);
     expect(prisma._cursor).toBe(T0);
@@ -722,18 +722,26 @@ describe("recovery behaviour by status", () => {
     return { ...rig, sync };
   }
 
-  it("OUT_OF_CREDITS retries every tick, so a top-up clears it with no requeue step", async () => {
-    const { prisma, usage, chargebee, sync } = await stuckAt(CAPTURE_INSUFFICIENT, SYNC.OUT_OF_CREDITS);
+  it("OUT_OF_CREDITS asks Chargebee nothing while the account is exhausted, and a top-up clears it with no requeue step", async () => {
+    const { prisma, usage, chargebee, blocked, sync } = await stuckAt(CAPTURE_INSUFFICIENT, SYNC.OUT_OF_CREDITS);
     expect(prisma._accounts.get(TENANT)!.status).toBe("exhausted");
 
-    // The very next minute, still out of credits: tried again, not backed off.
+    // The very next minute, still out of credits: held, and Chargebee is not
+    // asked — it could only refuse again. The team's block is re-asserted.
     chargebee.insufficient = true;
+    const calls = chargebee.captures.length + chargebee.lookups.length;
+    const blocks = blocked.length;
     usage.nowMs = T0 + 3 * MINUTE;
-    expect((await sync.runTenant(SLUG)).outcome).toBe(OUTCOME.OUT_OF_CREDITS);
+    expect(await sync.runTenant(SLUG)).toMatchObject({ outcome: OUTCOME.EXHAUSTED });
+    expect(chargebee.captures.length + chargebee.lookups.length).toBe(calls);
+    expect(blocked.length).toBe(blocks + 1);
 
-    // The customer tops up. Nothing is requeued, because nothing was dequeued.
+    // The customer tops up, and activate() takes the account out of
+    // `exhausted`. Nothing is requeued, because nothing was dequeued: the row
+    // is due at once.
     chargebee.insufficient = false;
     chargebee.balance = 1000;
+    prisma._accounts.get(TENANT)!.status = "active";
     usage.nowMs = T0 + 4 * MINUTE;
     expect((await sync.runTenant(SLUG)).outcome).toBe(OUTCOME.SYNCED);
     // The held window billed exactly once, and the tick then carried on past
@@ -741,6 +749,26 @@ describe("recovery behaviour by status", () => {
     expect(chargebee.appliedCount).toBe(1);
     expect(prisma._log[0]!.status).toBe(SYNC.SUCCESS);
     expect(prisma._cursor).toBeGreaterThanOrEqual(T0 + MINUTE);
+  });
+
+  it("OUT_OF_CREDITS on an exhausted account is never retried on a timer: a day on, Chargebee has not been asked once", async () => {
+    const { prisma, usage, chargebee, sync } = await stuckAt(CAPTURE_INSUFFICIENT, SYNC.OUT_OF_CREDITS);
+    const calls = chargebee.captures.length + chargebee.lookups.length;
+    const reads = usage.reads.length;
+
+    // Even credits granted by hand in Chargebee do not release it: nothing
+    // told billing, so the account is still `exhausted`. Only activate() —
+    // a top-up, a renewal, the daily resync — takes it out of that.
+    chargebee.balance = 1000;
+    for (let m = 3; m <= 24 * 60; m += 10) {
+      usage.nowMs = T0 + m * MINUTE;
+      expect((await sync.runTenant(SLUG)).outcome).toBe(OUTCOME.EXHAUSTED);
+    }
+    expect(chargebee.captures.length + chargebee.lookups.length).toBe(calls);
+    expect(usage.reads.length).toBe(reads);
+    expect(prisma._stuck).toMatchObject({ status: SYNC.OUT_OF_CREDITS, attemptCount: 1 });
+    expect(prisma._cursor).toBe(T0);
+    expect(prisma._accounts.get(TENANT)!.status).toBe("exhausted");
   });
 
   it("RATE_LIMITING waits out a backoff instead of hammering Chargebee", async () => {

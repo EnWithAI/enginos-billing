@@ -148,18 +148,22 @@ describe("credits run out, usage keeps arriving, then a top-up", () => {
     expect(r.prisma._accounts.get(TENANT)!.status).toBe("exhausted");
     expect(r.blocked).toEqual([{ tenantId: TENANT, reason: "exhausted" }]);
 
-    // Three more ticks, still refused, more usage piling up behind it. Retried
-    // every tick — no backoff — because a top-up must clear it at once.
+    // Three more ticks, still exhausted, more usage piling up behind it. The
+    // tenant is held whole: Chargebee is not asked, since it could only refuse.
+    const sent = r.chargebee.captures.length;
     for (const m of [3, 4, 5]) {
       r.at(m);
-      expect((await r.tick()).outcome).toBe(OUTCOME.OUT_OF_CREDITS);
+      expect(await r.tick()).toMatchObject({ outcome: OUTCOME.EXHAUSTED });
       expect(r.cursorMin()).toBe(0);
     }
-    expect(r.prisma._log).toHaveLength(1); // ONE row, retried — not four
+    expect(r.chargebee.captures.length).toBe(sent);
+    expect(r.prisma._log).toHaveLength(1); // ONE row, held — not four
 
-    // The customer tops up. Nothing is requeued because nothing was dequeued.
+    // The customer tops up, and activate() takes the account out of
+    // `exhausted`. Nothing is requeued because nothing was dequeued.
     r.chargebee.insufficient = false;
     r.chargebee.balance = 1000;
+    r.prisma._accounts.get(TENANT)!.status = "active";
     r.at(6);
     const drained = await r.tick();
 
@@ -314,9 +318,11 @@ describe("a full incident, start to finish", () => {
     // The recovered window moved the cursor; the refused one did not.
     expect(r.cursorMin()).toBe(3);
 
-    // Top-up. The held minute goes through on the next ordinary tick, with no
-    // requeue step, because it was never taken off the queue.
+    // Top-up, and activate() takes the account out of `exhausted`. The held
+    // minute goes through on the next ordinary tick, with no requeue step,
+    // because it was never taken off the queue.
     r.chargebee.balance = 100;
+    r.prisma._accounts.get(TENANT)!.status = "active";
     r.at(7);
     expect((await r.tick()).outcome).toBe(OUTCOME.SYNCED);
     expect(r.cursorMin()).toBe(6);

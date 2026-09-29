@@ -29,9 +29,9 @@
  * The writes that are not merely convergent are guarded where they are:
  *   - the billing cursor is laid create-only, and only moved forward on a
  *     resubscription (account.service.ts), so a replay can never rewind it.
- *   - `applyPaidTopUps` scans the subscription's ledger operations for the
- *     invoice id before allocating, and `allocate` carries a
- *     `chargebee-idempotency-key`, so a paid pack grants once.
+ *   - `applyPaidTopUps` claims a `topup_grant` row per paid pack invoice
+ *     before allocating, so a pack grants once — however many
+ *     `payment_succeeded` deliveries, and page callbacks, ask for it.
  *
  * A FAILED HANDLER THROWS, and the controller answers 500 (see
  * webhook.controller.ts): with no local record of the event, a 200 on failure
@@ -60,12 +60,18 @@ export interface ChargebeeEvent {
       current_term_end?: number;
       subscription_items?: Array<{ item_price_id?: string }>;
     };
+    invoice?: {
+      id?: string;
+      line_items?: Array<{ entity_id?: string }>;
+    };
   };
 }
 
 export function createWebhookService(deps: {
   accountService: AccountService;
   accounts: BillingAccountRepository;
+  /** The top-up charge, the credits one unit of it grants, and who grants them (config.ts). */
+  topUp: { itemPriceId: string; creditsPerUnit: string; chargebeeGrants?: boolean };
   logger?: Logger;
 }) {
   const log = deps.logger ?? console;
@@ -102,6 +108,30 @@ export function createWebhookService(deps: {
       case "subscription_deleted": {
         if (!subscription?.customer_id) return;
         await accounts.syncFromChargebee(mapped());
+        return;
+      }
+
+      // A top-up pack was paid. Only a trigger, like the rest: which invoices
+      // are paid, and what they bought, is re-read from Chargebee, and the
+      // `topup_grant` guard grants each once — so a redelivery, or the page's
+      // own apply landing first, grants nothing twice. This is what grants a
+      // pack whose buyer closed the tab before the checkout's success callback.
+      // Any other payment (the plan, a renewal) is not a top-up: ignored.
+      //
+      // When Chargebee grants the pack itself, its grant block can trail the
+      // payment by a second. Still missing, the delivery is failed on purpose:
+      // Chargebee redelivers it later, by when the block is there to record —
+      // a 200 now would leave the gateway cap unmoved until the next top-up.
+      case "payment_succeeded": {
+        const lines = event.content?.invoice?.line_items ?? [];
+        if (!lines.some((line) => line?.entity_id === deps.topUp.itemPriceId)) return;
+        const result = await accounts.applyPaidTopUps(mapped(), deps.topUp.itemPriceId, deps.topUp.creditsPerUnit, {
+          chargebeeGrants: deps.topUp.chargebeeGrants,
+        });
+        const invoiceId = event.content?.invoice?.id;
+        if (invoiceId && result.pending?.includes(String(invoiceId))) {
+          throw new Error(`grant block for top-up invoice ${invoiceId} not visible yet`);
+        }
         return;
       }
 

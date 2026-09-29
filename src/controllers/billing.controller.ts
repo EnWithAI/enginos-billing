@@ -12,7 +12,8 @@ import { NextResponse } from "next/server";
 
 import { createServices } from "../container";
 import { route } from "../http/route";
-import { renderBillingOverview } from "../views/billing.view";
+import { invalid } from "../shared/errors";
+import { renderBillingOverview, renderPaymentsPage } from "../views/billing.view";
 import { NO_STORE, renderInvoiceDownload } from "../views/responses";
 
 export const getBillingOverview = route<{ tenantId: string }>(
@@ -34,6 +35,31 @@ export const getBillingOverview = route<{ tenantId: string }>(
         defaultItemPriceId: services.config.defaultItemPriceId,
       }),
     );
+  },
+);
+
+/**
+ * GET ?offset=<cursor> — the page of payments after the one that returned the
+ * cursor. The first page comes with the overview; this serves the rest.
+ */
+export const getPayments = route<{ tenantId: string }>(
+  {
+    fallback: {
+      status: 502,
+      body: { error: "Could not load payments", code: "payments-failed" },
+      metric: "billing.payments.failed",
+      message: "Could not read a page of payments from Chargebee",
+    },
+  },
+  async (request, { params, logContext }) => {
+    logContext.tenantId = params.tenantId;
+    const offset = new URL(request.url).searchParams.get("offset") ?? undefined;
+    // Chargebee's cursors are short; anything longer was not one of them.
+    if (offset !== undefined && (offset === "" || offset.length > 512)) {
+      throw invalid("Not a page cursor", "payments-offset-invalid");
+    }
+    const page = await createServices().overview.paymentsPage(params.tenantId, offset);
+    return NextResponse.json(renderPaymentsPage(page), { headers: NO_STORE });
   },
 );
 

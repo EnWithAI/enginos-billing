@@ -18,15 +18,16 @@
  * failed to tell it.
  */
 
-import type { ChargebeeClient, PaymentSource, Transaction } from "../integrations/chargebee";
+import type { ChargebeeClient, PaymentSource, Transaction, UnpaidInvoice } from "../integrations/chargebee";
 import { ACCOUNT } from "../models/account-status";
-import { compare, subtract } from "../models/decimal";
+import { compare, subtract, subtractFloorZero } from "../models/decimal";
+import { freePlanFor } from "../models/free-plan";
 import type { BillingAccount, BillingAccountRepository } from "../repositories/billing-account.repository";
 import type { ChargebeeSyncRepository } from "../repositories/chargebee-sync.repository";
 import { errorMessage } from "../shared/errors";
 import type { Logger } from "../shared/logger";
 import type { AccountService } from "./account.service";
-import type { PlanOffer } from "./plan-catalog.service";
+import type { PlanOffer, TopUpOffer } from "./plan-catalog.service";
 
 export interface Credits {
   granted: string;
@@ -42,21 +43,40 @@ export interface SubscriptionDetails {
 
 export type LastSync = NonNullable<Awaited<ReturnType<ChargebeeSyncRepository["latestSettled"]>>>;
 
+/**
+ * Every shape carries `freePlan`: whether this org is put on the free plan
+ * (models/free-plan.ts). An org with no subscription and no free plan is one
+ * that chooses from `plansOffered`, which then leaves the free plan out.
+ */
 export type BillingOverview =
   /** No billing row at all — every org starts here, and it is a normal state. */
-  | { kind: "unlinked"; plansOffered: PlanOffer[] }
+  | { kind: "unlinked"; plansOffered: PlanOffer[]; freePlan: boolean }
   /** Paid, but the gateway does not hold the budget yet, so no credits are shown. */
-  | { kind: "activating"; plansOffered: PlanOffer[]; account: BillingAccount }
+  | { kind: "activating"; plansOffered: PlanOffer[]; freePlan: boolean; account: BillingAccount }
   | {
       kind: "linked";
       plansOffered: PlanOffer[];
+      freePlan: boolean;
       account: BillingAccount;
       credits: Credits;
-      /** Null when Chargebee could not be reached — distinct from "no payments". */
+      /** The newest page. Null when Chargebee could not be reached — distinct from "no payments". */
       payments: Transaction[] | null;
+      /** Chargebee's cursor for the page after `payments`; null when there is none. */
+      paymentsNextOffset: string | null;
       subscription: SubscriptionDetails | null;
       lastSync: LastSync | null;
+      /** What buying more credits costs. Null when no describer is wired (tests). */
+      topUp: TopUpOffer | null;
+      /**
+       * Top-ups whose card declined and Chargebee has not collected since —
+       * their credits are already in use. Null when Chargebee could not be
+       * asked, which is not "nothing owed".
+       */
+      unpaidTopUps: UnpaidInvoice[] | null;
     };
+
+/** Payments shown per page of the billing page's history. */
+export const PAYMENTS_PAGE_SIZE = 10;
 
 const NO_CREDITS: Credits = { granted: "0", allocated: "0", consumed: "0", current: "0" };
 
@@ -67,25 +87,96 @@ export function createBillingOverviewService(deps: {
   syncs: ChargebeeSyncRepository;
   /** The offered plans, described. Must never throw — see plan-catalog.service.ts. */
   plansOffered: () => Promise<PlanOffer[]>;
+  /** The top-up charge, described. Must never throw — see describeTopUp. */
+  topUpOffer?: () => Promise<TopUpOffer>;
+  /**
+   * Puts an org with no subscription on the free plan (checkout.provisionFreePlan).
+   * The billing page's fallback for the sign-up hook. Absent: none.
+   */
+  autoSubscribe?: (tenantId: string) => Promise<unknown>;
+  /** The free plan's item price, left out of `plansOffered` for an org it is not for. */
+  freeItemPriceId?: string;
+  /** Whether an org with no setting of its own gets the free plan (FREE_PLAN_DEFAULT). */
+  freePlanDefault?: boolean;
+  /** The top-up charge, whose unpaid invoices the page shows. Absent: none are looked for. */
+  topUpItemPriceId?: string;
   logger?: Logger;
 }) {
   const log = deps.logger ?? console;
 
   async function overview(tenantId: string): Promise<BillingOverview> {
-    const plansOffered = await deps.plansOffered();
+    const account = await subscribeIfNeeded(tenantId, await findOrCreateAccount(tenantId));
+    const freePlan = freePlanFor(account, deps.freePlanDefault ?? false);
+    // The free plan is left out for an org it is not for — unless the org is
+    // already on it, because the page names the current plan from this list.
+    const plansOffered = (await deps.plansOffered()).filter(
+      (plan) =>
+        freePlan ||
+        !deps.freeItemPriceId ||
+        plan.itemPriceId !== deps.freeItemPriceId ||
+        plan.itemPriceId === account?.chargebeeItemPriceId,
+    );
 
-    const account = await findOrCreateAccount(tenantId);
-    if (!account) return { kind: "unlinked", plansOffered };
-    if (account.status === ACCOUNT.ACTIVATING) return { kind: "activating", plansOffered, account };
+    if (!account) return { kind: "unlinked", plansOffered, freePlan };
+    if (account.status === ACCOUNT.ACTIVATING) return { kind: "activating", plansOffered, freePlan, account };
 
-    const [credits, payments, subscription, lastSync] = await Promise.all([
-      readCredits(account.chargebeeSubscriptionId, account.ledgerUnitId),
+    const [credits, paymentsPage, subscription, lastSync, topUp, unpaidTopUps] = await Promise.all([
+      readCredits(account.chargebeeSubscriptionId, account.ledgerUnitId, account.chargebeeCustomerId),
       readPayments(account.chargebeeCustomerId),
       readSubscription(account.chargebeeSubscriptionId, account.chargebeeCustomerId),
       deps.syncs.latestSettled(account.tenantId),
+      deps.topUpOffer ? deps.topUpOffer() : Promise.resolve(null),
+      readUnpaidTopUps(account.chargebeeCustomerId),
     ]);
 
-    return { kind: "linked", plansOffered, account, credits, payments, subscription, lastSync };
+    return {
+      kind: "linked",
+      plansOffered,
+      freePlan,
+      account,
+      credits,
+      payments: paymentsPage?.transactions ?? null,
+      paymentsNextOffset: paymentsPage?.nextOffset ?? null,
+      subscription,
+      lastSync,
+      topUp,
+      unpaidTopUps,
+    };
+  }
+
+  async function readUnpaidTopUps(customerId: string | null): Promise<UnpaidInvoice[] | null> {
+    if (!customerId || !deps.topUpItemPriceId) return [];
+    try {
+      return await deps.chargebee.unpaidInvoicesFor(customerId, deps.topUpItemPriceId);
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.page.unpaid_topups_unreadable", customerId, err: errorMessage(err) },
+        "Could not read unpaid top-ups from Chargebee; rendering the page without them",
+      );
+      return null;
+    }
+  }
+
+  /**
+   * An org with no subscription is put on the free plan before the page is
+   * rendered — the fallback for a sign-up hook that failed or never ran (an org
+   * older than it). Fail-open: a failure is logged, the page renders the org
+   * unsubscribed, and the next load tries again. An org the free plan is not
+   * for is left to choose a paid plan.
+   */
+  async function subscribeIfNeeded(tenantId: string, account: BillingAccount | null) {
+    if (!account || account.chargebeeSubscriptionId || !deps.autoSubscribe) return account;
+    if (!freePlanFor(account, deps.freePlanDefault ?? false)) return account;
+    try {
+      await deps.autoSubscribe(tenantId);
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.free_plan.page_fallback_failed", tenantId, err: errorMessage(err) },
+        "Could not put the org on the free plan on page load; rendering it unsubscribed",
+      );
+      return account;
+    }
+    return (await deps.accounts.findByTenantId(tenantId)) ?? account;
   }
 
   /**
@@ -119,21 +210,37 @@ export function createBillingOverviewService(deps: {
    * a page of the last 50 operations is not the whole history, and a partial
    * sum rendered as "spent" would be worse than no number at all.
    */
-  async function readCredits(subscriptionId: string | null, unitId: string | null): Promise<Credits> {
+  async function readCredits(
+    subscriptionId: string | null,
+    unitId: string | null,
+    customerId: string | null,
+  ): Promise<Credits> {
     if (!subscriptionId) return NO_CREDITS;
     try {
-      const [balance, granted] = await Promise.all([
+      const [balance, granted, unpaid] = await Promise.all([
         // The account's own unit, never "the first balance" (C57b).
         deps.chargebee.balance(subscriptionId, unitId),
         deps.chargebee.grantedCredits(subscriptionId, unitId ?? undefined),
+        // Chargebee grants a top-up with its invoice, paid or not. A declined
+        // top-up's credits are not the customer's until it is paid, so they
+        // come off both figures — and stay off `consumed`.
+        customerId && deps.topUpItemPriceId
+          ? deps.chargebee.unpaidTopUpCredits({
+              customerId,
+              subscriptionId,
+              unitId: unitId ?? undefined,
+              itemPriceId: deps.topUpItemPriceId,
+            })
+          : Promise.resolve("0"),
       ]);
-      const current = balance?.usable ?? "0";
+      const grantedPaid = subtractFloorZero(granted.credits, unpaid);
+      const current = subtractFloorZero(balance?.usable ?? "0", unpaid);
       // Exact, and never below zero: a float here printed "1e-7" for a tiny
       // difference and drifted on fractional grants.
-      const spent = subtract(granted.credits, current);
+      const spent = subtract(grantedPaid, current);
       return {
-        granted: granted.credits,
-        allocated: granted.credits,
+        granted: grantedPaid,
+        allocated: grantedPaid,
         consumed: compare(spent, "0") > 0 ? spent : "0",
         current,
       };
@@ -151,10 +258,10 @@ export function createBillingOverviewService(deps: {
    * transaction can say a payment FAILED and why. Keyed on the customer, so a
    * receipt survives its subscription being cancelled and replaced.
    */
-  async function readPayments(customerId: string | null): Promise<Transaction[] | null> {
-    if (!customerId) return [];
+  async function readPayments(customerId: string | null) {
+    if (!customerId) return { transactions: [] as Transaction[], nextOffset: null };
     try {
-      return await deps.chargebee.transactionsFor(customerId, 20);
+      return await deps.chargebee.transactionsPage(customerId, { limit: PAYMENTS_PAGE_SIZE });
     } catch (err) {
       log.error?.(
         { metric: "billing.page.payments_unreadable", customerId, err: errorMessage(err) },
@@ -190,7 +297,18 @@ export function createBillingOverviewService(deps: {
     }
   }
 
-  return { overview };
+  /**
+   * An older page of the tenant's payments, from the cursor the page before it
+   * returned. The customer is the tenant's own, resolved here — the cursor
+   * only says where in that customer's list to continue.
+   */
+  async function paymentsPage(tenantId: string, offset?: string) {
+    const account = await deps.accounts.findByTenantId(tenantId);
+    if (!account?.chargebeeCustomerId) return { transactions: [] as Transaction[], nextOffset: null };
+    return deps.chargebee.transactionsPage(account.chargebeeCustomerId, { limit: PAYMENTS_PAGE_SIZE, offset });
+  }
+
+  return { overview, paymentsPage };
 }
 
 export type BillingOverviewService = ReturnType<typeof createBillingOverviewService>;

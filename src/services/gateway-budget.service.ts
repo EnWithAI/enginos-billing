@@ -205,9 +205,13 @@ export function createGatewayBudget(deps: {
    * Via /team/update, NOT /team/block: MEASURED on 1.98, /team/block writes the
    * DB but leaves the cached team, so a team used in the last minute kept
    * serving after being blocked. /team/update refreshes the cache.
+   *
+   * A team already blocked for this reason is left alone: the usage sync
+   * re-asserts an exhausted team's block every tick, and that costs one read.
    */
   async function block(tenantId: string, reason: BlockReason = "activating"): Promise<void> {
     const { teamId, team } = await teamOf(tenantId);
+    if (team.blocked && team.metadata[BLOCK_REASON] === reason) return;
     await deps.gateway.updateTeam({
       team_id: teamId,
       blocked: true,

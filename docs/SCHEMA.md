@@ -56,7 +56,7 @@ What Postgres answers is therefore narrower and unambiguous:
 
 ### Units
 
-A credit is worth `USD_PER_CREDIT` (default `0.001`), always. Amounts on the wire
+A credit is worth `1 / CREDITS_PER_USD` dollars (default 1,000 credits = $1), always. Amounts on the wire
 to Chargebee carry ten decimal places, which is exactly its ledger precision, so
 nothing rounds in transit. `chargebee_sync.amount` is what was SENT, not a
 balance: no money is stored here.
@@ -136,10 +136,10 @@ Defined in [`src/models/account-status.ts`](../src/models/account-status.ts) as 
 
 | Value | Meaning |
 |---|---|
-| `unlinked` | A billing row exists; no subscription. Created when the tenant is provisioned or first opens the billing page. |
+| `unlinked` | A billing row exists; no subscription. Brief: the free plan is subscribed at sign-up, and again by the billing page for an org still here. |
 | `activating` | Paid, but the LiteLLM budget push has not landed. The team is BLOCKED and the page shows no credits, because showing them would promise service that is refused. Retried every minute. |
 | `active` | Subscribed, and the gateway holds the cap. |
-| `cancelled` | Subscription ended. The team is handed back to its plan budget. |
+| `cancelled` | Subscription ended. The team is handed back to the platform, whose budget for it is $0. |
 | `exhausted` | Chargebee reports no usable balance. The team is blocked; the cursor stops moving until credits return. |
 
 ---
@@ -197,7 +197,7 @@ Defined in [`src/models/sync-status.ts`](../src/models/sync-status.ts) as `SYNC`
 | `SUCCESS` | **yes** | Chargebee took it, confirmed it already had, or there was nothing chargeable. The cursor moves to `to_ingested_at`. |
 | `UNKNOWN` | no | Timeout, 5xx, rejected credential, disabled site. Same treatment as `PROCESSING`: ask, do not guess. Retried every tick. |
 | `RATE_LIMITING` | no | HTTP 429. Refused *before* it was applied, so it needs no lookup — just a backoff: 1 min doubling to 15. |
-| `OUT_OF_CREDITS` | no | `ERROR_INSUFFICIENT_BALANCE`. Retried **every tick**, so a top-up clears it immediately with no requeue step. |
+| `OUT_OF_CREDITS` | no | `ERROR_INSUFFICIENT_BALANCE`. Backs off 5 min doubling to 1 hour **while the account is `exhausted`**; a top-up or renewal takes it out of `exhausted` and the row is retried on the next tick, with no requeue step. |
 | `INVALID` | no | Rejected for bad data or configuration, including a subscription with no prepaid ledger. Backoff 5 min doubling to 1 hour, so a corrected configuration heals itself within the hour without anyone touching the database. |
 | `WRITTEN_OFF` | **yes** | An `OUT_OF_CREDITS` or `INVALID` row whose subscription has **ended** — the account is cancelled, or now bills another subscription. No top-up or renewal can reach it, so it is given up once (`billing.sync.written_off`, an error naming the amount) and the cursor moves past it. Never settled: `settled_at` stays null. Added by `20260924120000_chargebee_sync_written_off`. |
 

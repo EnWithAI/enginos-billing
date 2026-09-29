@@ -25,7 +25,11 @@ export const SYNC = {
   UNKNOWN: "UNKNOWN",
   /** Throttled. Refused before it was applied, so it is simply sent again on a backoff. */
   RATE_LIMITING: "RATE_LIMITING",
-  /** No balance. Retried every tick, because a top-up clears it with no requeue step. */
+  /**
+   * No balance. Not retried at all while the account is `exhausted` — the
+   * usage sync holds the whole tenant — and due at once when credits come
+   * back, so a top-up still clears it with no requeue step.
+   */
   OUT_OF_CREDITS: "OUT_OF_CREDITS",
   /** Bad data or configuration. Retried on a long backoff, but it needs a person. */
   INVALID: "INVALID",
@@ -87,9 +91,14 @@ export const PROCESSING_LEASE_MS = 5 * 60_000;
  * MEANS: `RATE_LIMITING` without a backoff is just a slower way of being rate
  * limited, and `INVALID` without one is the blind retry §7 rules out.
  *
- *   OUT_OF_CREDITS   every tick. A top-up must clear it immediately, and
- *                    Chargebee is not under load from a refusal it answers in
- *                    microseconds.
+ *   OUT_OF_CREDITS   never on a timer. While the account is `exhausted` the
+ *                    usage sync does not reach the row at all (holdExhausted
+ *                    in usage-sync.service.ts): every retry would be refused,
+ *                    and each one cost Chargebee a lookup and a refused
+ *                    capture. Credits coming back is what activate() sees (a
+ *                    top-up, a renewal, a webhook, the daily resync), and it
+ *                    moves the account out of `exhausted`; from then the row
+ *                    is due at once, so a top-up bills it on the next tick.
  *   PENDING          every tick. Nothing has been sent; there is nothing to
  *   UNKNOWN          back off from, and an unknown is resolved by ONE cheap GET
  *                    whose whole purpose is to run soon after the failure. The

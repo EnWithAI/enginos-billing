@@ -135,3 +135,69 @@ export async function describePlans(
   );
 }
 
+/** What the billing API returns about the top-up charge. */
+export interface TopUpOffer {
+  itemPriceId: string;
+  name: string;
+  /**
+   * Price of ONE unit, in minor units. Null unless Chargebee prices the charge
+   * per unit — a flat fee is not a unit price and a tiered one has no single
+   * number — or when it could not be read. The page then shows no total, and
+   * Chargebee's checkout quotes the real one.
+   */
+  unitPriceMinor: number | null;
+  currencyCode: string | null;
+  /** Credits one unit grants (TOPUP_CREDITS). */
+  creditsPerUnit: string;
+  /** Most units one checkout may sell: 1 for a flat-fee charge, which has no quantity. */
+  maxQuantity: number;
+}
+
+const topUpCache = new Map<string, { price: ItemPrice | null; at: number }>();
+
+/**
+ * The top-up charge, described for the page. Same two rules as describePlans:
+ * cached, and never fatal — a Chargebee outage leaves the button working with
+ * no price shown, since the checkout itself still quotes one.
+ */
+export async function describeTopUp(
+  offer: { itemPriceId: string; creditsPerUnit: string; maxQuantity: number },
+  chargebee: ChargebeeClient,
+  {
+    now = () => Date.now(),
+    ttlMs = PLAN_CACHE_TTL_MS,
+    logger = console,
+  }: {
+    now?: () => number;
+    ttlMs?: number;
+    logger?: Logger;
+  } = {},
+): Promise<TopUpOffer> {
+  const at = now();
+  const hit = topUpCache.get(offer.itemPriceId);
+  let price: ItemPrice | null = null;
+  if (hit && at - hit.at < ttlMs) {
+    price = hit.price;
+  } else {
+    try {
+      price = await chargebee.itemPrice(offer.itemPriceId);
+      topUpCache.set(offer.itemPriceId, { price, at });
+    } catch (err) {
+      price = hit?.price ?? null;
+      logger.warn?.(
+        { metric: "billing.topup.lookup_failed", itemPriceId: offer.itemPriceId, err: errorMessage(err) },
+        "Could not read the top-up charge from Chargebee; the page shows no price",
+      );
+    }
+  }
+
+  return {
+    itemPriceId: offer.itemPriceId,
+    name: price?.name ?? offer.itemPriceId,
+    unitPriceMinor: price?.pricingModel === "per_unit" ? price.priceMinor : null,
+    currencyCode: price?.currencyCode ?? null,
+    creditsPerUnit: offer.creditsPerUnit,
+    maxQuantity: price?.pricingModel === "flat_fee" ? 1 : offer.maxQuantity,
+  };
+}
+

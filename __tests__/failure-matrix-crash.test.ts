@@ -771,11 +771,18 @@ describe("C24 — cursor update fails", () => {
 // ── C25 ───────────────────────────────────────────────────────────────────
 
 describe("C25 — cursor advances too early", () => {
-  const failures: Array<[string, (r: Rig) => void]> = [
+  // Optional third element: what clears the failure. Only out of credits
+  // needs one — the tenant is held until a top-up, and activate() taking the
+  // account out of `exhausted` is what a top-up does here.
+  const failures: Array<[string, (r: Rig) => void, ((r: Rig) => void)?]> = [
     ["timeout before landing", (r) => r.chargebee.fail({ kind: CAPTURE_RETRYABLE, error: Object.assign(new Error("timeout"), { retryable: true }) })],
     ["response lost after landing", (r) => void (r.chargebee.loseResponseNext = true)],
     ["429", (r) => void (r.chargebee.rateLimitNext = true)],
-    ["out of credits", (r) => r.chargebee.fail({ kind: CAPTURE_INSUFFICIENT, error: Object.assign(new Error("no balance"), { status: 400 }) })],
+    [
+      "out of credits",
+      (r) => r.chargebee.fail({ kind: CAPTURE_INSUFFICIENT, error: Object.assign(new Error("no balance"), { status: 400 }) }),
+      (r) => void (r.prisma._accounts.get(TENANT)!.status = "active"),
+    ],
     ["terminal 400", (r) => r.chargebee.fail({ kind: CAPTURE_TERMINAL, error: Object.assign(new Error("bad"), { status: 400 }) })],
     ["no prepaid ledger", (r) => r.chargebee.fail({ kind: CAPTURE_NO_LEDGER, error: Object.assign(new Error("none"), { status: 404 }) })],
     ["killed before the request left", (r) => void (r.chargebee.crashNext = "before")],
@@ -784,7 +791,7 @@ describe("C25 — cursor advances too early", () => {
 
   it("C25 checked at EVERY cursor write under eight capture failures: the cursor never passes usage that is not settled", async () => {
     const seen: string[] = [];
-    for (const [label, arm] of failures) {
+    for (const [label, arm, heal] of failures) {
       const r = rig();
       backlog(r, 2);
       r.at(3); // windows (0,1] and (1,2] are due
@@ -799,6 +806,7 @@ describe("C25 — cursor advances too early", () => {
       expect(r.prisma._cursor, label).toBe(T0);
       expect(row0(r).status, label).not.toBe(SYNC.SUCCESS);
 
+      heal?.(r);
       r.at(12); // past every backoff (INVALID's first is 5 min)
       await r.build({ prisma: watch.prisma }).runTenant(SLUG);
 
@@ -839,8 +847,10 @@ describe("C25 — cursor advances too early", () => {
     expect(r.cursorMin()).toBe(1);
     expect(audit(r)).toContain("event t1:s1 @0.5min covered by 0 settled rows");
 
-    // Second line of defence: the unresolved row, not the cursor, is what holds the usage.
-    r.at(3);
+    // Second line of defence: the unresolved row, not the cursor, is what holds
+    // the usage. A top-up takes the account out of `exhausted`, so it is retried.
+    r.prisma._accounts.get(TENANT)!.status = "active";
+    r.at(7);
     await r.build().runTenant(SLUG);
     expect(r.metrics()).toContain("billing.sync.cursor_race");
     expect(r.chargebee.taken).toBe(2);

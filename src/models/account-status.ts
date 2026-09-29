@@ -2,13 +2,17 @@
  * What a billing account is, operationally — and why a LiteLLM team is blocked.
  */
 
-/** Account states. `exhausted` is display-only — the gateway is the real gate. */
+/**
+ * Account states. `exhausted` blocks the LiteLLM team and holds the usage sync
+ * — nothing sent to Chargebee, nothing read — until credits come back.
+ */
 export const ACCOUNT = {
   UNLINKED: "unlinked",
   /** Paid, but the LiteLLM budget is not set yet: no credits shown, team blocked, retried each minute. */
   ACTIVATING: "activating",
   ACTIVE: "active",
   CANCELLED: "cancelled",
+  /** Chargebee says the credits are used up. Only credits coming back (activate()) moves it on. */
   EXHAUSTED: "exhausted",
 } as const;
 

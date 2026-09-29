@@ -42,6 +42,7 @@ import { grantBlockInvoiceRefs, isLiveGrantBlock } from "./ledger";
 import type {
   CaptureArgs,
   ChargebeeClient,
+  ChargedInvoice,
   ChargebeeOptions,
   GrantBlock,
   InvoiceDownload,
@@ -50,6 +51,7 @@ import type {
   LedgerBalance,
   PaymentSource,
   Transaction,
+  UnpaidInvoice,
 } from "./types";
 
 export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient {
@@ -650,18 +652,22 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     customerId,
     itemPriceId,
     quantity = 1,
+    redirectUrl,
   }: {
     customerId: string;
     itemPriceId: string;
     quantity?: number;
+    redirectUrl?: string;
   }) {
     const payload = await withRetry(() =>
       request("POST", "/hosted_pages/checkout_new_for_items", {
         "customer[id]": customerId,
         "subscription_items[item_price_id][0]": itemPriceId,
         "subscription_items[quantity][0]": quantity,
-        // Deliberately NO redirect_url: setting one makes Chargebee navigate
-        // away instead of calling openCheckout's success callback in place.
+        // Only for a page the browser is SENT to. With Chargebee.js's
+        // openCheckout it must be left out: a redirect_url makes Chargebee
+        // navigate away instead of calling the success callback in place.
+        ...(redirectUrl ? { redirect_url: redirectUrl } : {}),
       }),
     );
     return payload.hosted_page as Record<string, unknown>;
@@ -682,6 +688,60 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
       }),
     );
     return payload.portal_session as Record<string, unknown>;
+  }
+
+  /**
+   * Chargebee's Manage Payment Sources page: the customer adds, replaces or
+   * removes a card — and nothing else. Unlike the portal it offers no
+   * cancellation, which is why it can be shown while the portal stays shut.
+   *
+   * MEASURED: `redirect_url` must be on port 80, 443, 8080 or 8443 — Chargebee
+   * refuses `http://localhost:4200` with UNSUPPORTED_PORT.
+   */
+  async function managePaymentSourcesPage({
+    customerId,
+    redirectUrl,
+  }: {
+    customerId: string;
+    redirectUrl: string;
+  }) {
+    const payload = await withRetry(() =>
+      request("POST", "/hosted_pages/manage_payment_sources", {
+        "customer[id]": customerId,
+        redirect_url: redirectUrl,
+      }),
+    );
+    return payload.hosted_page as Record<string, unknown>;
+  }
+
+  /**
+   * Subscribe an existing customer to a plan with no checkout and no card —
+   * only ever the free plan (checkout.provisionFreePlan checks its price is
+   * zero first). Carries `chargebee-idempotency-key`, so the sign-up hook and a
+   * billing page opened in the same moment create ONE subscription: a repeat
+   * of the same request inside the key's window is answered with the first.
+   */
+  async function subscribeCustomer({
+    customerId,
+    itemPriceId,
+    idempotencyKey,
+  }: {
+    customerId: string;
+    itemPriceId: string;
+    idempotencyKey: string;
+  }) {
+    const payload = await withRetry(() =>
+      request(
+        "POST",
+        `/customers/${encodeURIComponent(customerId)}/subscription_for_items`,
+        {
+          "subscription_items[item_price_id][0]": itemPriceId,
+          "subscription_items[quantity][0]": 1,
+        },
+        idempotencyKey,
+      ),
+    );
+    return payload.subscription as Record<string, unknown>;
   }
 
   /**
@@ -770,44 +830,145 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   }
 
   /**
-   * A hosted page for a one-time purchase — the top-up checkout.
+   * Charge `quantity` units of a charge item to a subscription, now, against
+   * the card on file — the top-up. The API form of the admin UI's Subscription
+   * > Billing Actions > Add Charge.
    *
-   * MEASURED: this endpoint requires `currency_code`, and rejects the request
-   * with "currency_code : cannot be blank" without it. That requirement was
-   * invisible for as long as one-time checkout was disabled on the site,
-   * because the disabled-feature error is raised first — so turning the feature
-   * ON is what surfaces this, which is a poor time to discover it.
+   * Not a hosted checkout, because the pack's charge carries its own Credit
+   * Grant, and MEASURED on the test site (2026-09-28) Chargebee refuses a
+   * grant-carrying charge on every hosted or subscription-update route
+   * mid-term: `checkout_one_time_for_items` ("Charges with grants are not
+   * supported for customer one off charges"), `checkout_existing_for_items`
+   * and `update_for_items` (`mid_term_grant_subscription_change_not_allowed`).
+   * Invoicing it onto the subscription is accepted, the invoice is collected at
+   * once, and Chargebee issues the grant block itself about a second after
+   * `paid_at`.
    *
-   * The currency is read from the item price rather than configured, because it
-   * is a property OF the thing being sold: a caller that passed the wrong one
-   * would be quoting a price the catalogue does not have. `currencyCode` can be
-   * supplied to skip the lookup where the caller already knows it.
+   * NEVER retried. The call moves money, and a timeout says nothing about
+   * whether the card was charged — a second send could charge it twice.
    */
-  async function checkoutOneTime({
-    customerId,
+  async function chargeItem({
+    subscriptionId,
     itemPriceId,
-    currencyCode,
+    quantity = 1,
   }: {
-    customerId: string;
+    subscriptionId: string;
     itemPriceId: string;
-    currencyCode?: string;
-  }) {
-    const currency = currencyCode ?? (await itemPrice(itemPriceId))?.currencyCode;
-    if (!currency) {
-      throw Object.assign(new Error(`No currency for item price ${itemPriceId}`), {
-        apiErrorCode: "invalid_request",
-      }) as ChargebeeError;
-    }
+    quantity?: number;
+  }): Promise<ChargedInvoice> {
+    const payload = await request("POST", "/invoices/create_for_charge_items_and_charges", {
+      subscription_id: subscriptionId,
+      "item_prices[item_price_id][0]": itemPriceId,
+      "item_prices[quantity][0]": quantity,
+      // The customer has just confirmed "charge my card now", so collect now
+      // whatever the account says. Without it the invoice takes the
+      // subscription's (else the customer's) auto_collection. MEASURED
+      // 2026-09-28: with that off, the charge came back `payment_due`, with
+      // its Credit Grant already issued — credits for nothing. With `on`, paid.
+      auto_collection: "on",
+    });
+    return toChargedInvoice(payload.invoice);
+  }
 
+  /**
+   * Charge the card on file for an invoice left unpaid — a top-up whose card
+   * declined, now in Chargebee's dunning. Adding a card does not do this by
+   * itself (MEASURED 2026-09-28: the invoice stayed `payment_due` with the new
+   * card on file); Chargebee's own retry would, a day later.
+   *
+   * NEVER retried, like chargeItem: it moves money. MEASURED: a card that
+   * declines again answers HTTP 400 `payment_processing_failed`.
+   */
+  async function collectInvoice(invoiceId: string): Promise<ChargedInvoice> {
+    const payload = await request("POST", `/invoices/${encodeURIComponent(invoiceId)}/collect_payment`, {});
+    return toChargedInvoice(payload.invoice);
+  }
+
+  /**
+   * The customer's top-up invoices Chargebee has not collected, oldest first.
+   * `payment_due` while it retries the card; `not_paid` once its retries ran
+   * out. Either is still owed.
+   */
+  async function unpaidInvoicesFor(customerId: string, itemPriceId: string): Promise<UnpaidInvoice[]> {
     const payload = await withRetry(() =>
-      request("POST", "/hosted_pages/checkout_one_time_for_items", {
-        "customer[id]": customerId,
-        "item_prices[item_price_id][0]": itemPriceId,
-        "item_prices[quantity][0]": 1,
-        currency_code: currency,
+      request("GET", "/invoices", {
+        "customer_id[is]": customerId,
+        "status[in]": '["payment_due","not_paid"]',
+        "sort_by[asc]": "date",
+        limit: 20,
       }),
     );
-    return payload.hosted_page as Record<string, unknown>;
+    return (payload.list ?? [])
+      .map((entry: Record<string, any>) => entry.invoice)
+      .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, itemPriceId))
+      .map((invoice: Record<string, any>) => ({
+        id: String(invoice.id),
+        status: String(invoice.status),
+        amountDueMinor: typeof invoice.amount_due === "number" ? invoice.amount_due : 0,
+        currencyCode: invoice.currency_code == null ? null : String(invoice.currency_code),
+        nextRetryAt: fromUnixSeconds(invoice.next_retry_at),
+        date: fromUnixSeconds(invoice.date),
+      }));
+  }
+
+  /**
+   * Credits Chargebee has granted for top-ups that are NOT paid, on this
+   * subscription's unit — for the caller to hold back from the balance the
+   * page shows and from the gateway cap.
+   *
+   * Chargebee issues a top-up's grant block with the INVOICE, not with the
+   * payment (MEASURED 2026-09-28): a declined card left invoice 126
+   * `payment_due` with its 50 credits already `available`, and voiding an
+   * invoice left its block too. So a top-up's credits count only once its
+   * invoice is paid. The live blocks of every top-up invoice still owed
+   * (`payment_due`), abandoned by dunning (`not_paid`), voided or `pending`
+   * are summed here, over the same page of blocks `grantedCredits` counts.
+   * One call when nothing is unsettled — the usual case.
+   */
+  async function unpaidTopUpCredits({
+    customerId,
+    subscriptionId,
+    unitId,
+    itemPriceId,
+    now = Date.now(),
+  }: {
+    customerId: string;
+    subscriptionId: string;
+    unitId?: string;
+    itemPriceId: string;
+    now?: number;
+  }): Promise<string> {
+    const invoices = await withRetry(() =>
+      request("GET", "/invoices", {
+        "customer_id[is]": customerId,
+        "status[in]": '["payment_due","not_paid","voided","pending"]',
+        limit: 100,
+      }),
+    );
+    const unsettled = new Set<string>(
+      (invoices.list ?? [])
+        .map((entry: Record<string, any>) => entry.invoice)
+        .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, itemPriceId))
+        .map((invoice: Record<string, any>) => String(invoice.id)),
+    );
+    if (unsettled.size === 0) return "0";
+
+    const payload = await withRetry(() =>
+      request("GET", "/grant_blocks", { "subscription_id[is]": subscriptionId, limit: 100 }),
+    );
+    const held: Array<Record<string, any>> = (payload.list ?? [])
+      .map((entry: Record<string, any>) => entry.grant_block)
+      .filter((block: Record<string, any> | undefined) => block != null)
+      .filter((block: Record<string, any>) => !unitId || block.unit_id === unitId)
+      .filter((block: Record<string, any>) => isLiveGrantBlock(block, now))
+      .filter((block: Record<string, any>) => {
+        const refs = grantBlockInvoiceRefs(block);
+        return (
+          refs.itemPriceId === itemPriceId &&
+          refs.invoices.some((ref) => ref.invoiceId != null && unsettled.has(ref.invoiceId))
+        );
+      });
+    return add("0", ...held.map((block) => String(block.granted_amount ?? 0)));
   }
 
   /**
@@ -822,6 +983,9 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
       request("GET", "/invoices", {
         "customer_id[is]": customerId,
         "status[is]": "paid",
+        // Newest first: a pack paid a moment ago must be on this page, and a
+        // customer with 20 renewals behind it would otherwise push it off.
+        "sort_by[desc]": "date",
         limit: 20,
       }),
     );
@@ -850,15 +1014,30 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
    * see it here will conclude the refund never happened.
    */
   async function transactionsFor(customerId: string, limit = 20): Promise<Transaction[]> {
+    return (await transactionsPage(customerId, { limit })).transactions;
+  }
+
+  /**
+   * One page of the customer's payments, newest first, and the cursor for the
+   * next. Chargebee pages a list by an opaque `next_offset`, not by number, so
+   * the page after this one is reached only through it; null once nothing
+   * older is left. The cursor says WHERE in the list, never whose — the
+   * customer filter is sent again with every page.
+   */
+  async function transactionsPage(
+    customerId: string,
+    { limit = 10, offset }: { limit?: number; offset?: string } = {},
+  ): Promise<{ transactions: Transaction[]; nextOffset: string | null }> {
     const payload = await withRetry(() =>
       request("GET", "/transactions", {
         "customer_id[is]": customerId,
         "sort_by[desc]": "date",
         limit,
+        offset,
       }),
     );
 
-    return (payload.list ?? [])
+    const transactions = (payload.list ?? [])
       .map((entry: Record<string, any>) => entry.transaction)
       .filter(Boolean)
       .map((t: Record<string, any>): Transaction => ({
@@ -877,6 +1056,7 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
           .map((l: Record<string, any>) => (l.invoice_id == null ? null : String(l.invoice_id)))
           .filter(Boolean),
       }));
+    return { transactions, nextOffset: payload.next_offset == null ? null : String(payload.next_offset) };
   }
 
   /**
@@ -973,6 +1153,7 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
         currencyCode: entry.currency_code ?? null,
         period: typeof entry.period === "number" ? entry.period : null,
         periodUnit: entry.period_unit ?? null,
+        pricingModel: entry.pricing_model ?? null,
       };
     } catch (err) {
       // An id in the allowlist that Chargebee does not know is a configuration
@@ -1066,16 +1247,42 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     subscriptionIdsOf,
     itemPrice,
     activeSubscriptions,
+    subscribeCustomer,
     allocate,
-    checkoutOneTime,
+    chargeItem,
+    collectInvoice,
     paidInvoicesFor,
+    unpaidInvoicesFor,
+    unpaidTopUpCredits,
     transactionsFor,
+    transactionsPage,
     paymentSource,
     invoice,
     invoicePdfUrl,
     checkoutPage,
     portalSession,
+    managePaymentSourcesPage,
   };
+}
+
+function toChargedInvoice(raw: unknown): ChargedInvoice {
+  const invoice = (raw ?? {}) as Record<string, any>;
+  return {
+    id: String(invoice.id),
+    status: String(invoice.status ?? "unknown"),
+    totalMinor: typeof invoice.total === "number" ? invoice.total : null,
+    amountDueMinor: typeof invoice.amount_due === "number" ? invoice.amount_due : null,
+    currencyCode: invoice.currency_code == null ? null : String(invoice.currency_code),
+    nextRetryAt: fromUnixSeconds(invoice.next_retry_at),
+  };
+}
+
+function hasLineFor(invoice: Record<string, any> | undefined, itemPriceId: string): boolean {
+  return (invoice?.line_items ?? []).some((line: Record<string, any>) => line?.entity_id === itemPriceId);
+}
+
+function fromUnixSeconds(value: unknown): Date | null {
+  return typeof value === "number" && Number.isFinite(value) ? new Date(value * 1000) : null;
 }
 
 function operationIdOf(payload: Record<string, any>): string | null {

@@ -17,7 +17,9 @@ import { createBillingAccountRepository } from "@/repositories/billing-account.r
 import { createAccountService } from "@/services/account.service";
 import { createCheckoutService } from "@/services/checkout.service";
 import { createInvoiceService } from "@/services/invoice.service";
+import { describeTopUp } from "@/services/plan-catalog.service";
 import { createPortalService } from "@/services/portal.service";
+import { createPaymentMethodService } from "@/services/payment-method.service";
 import { AppError, conflict } from "@/shared/errors";
 import type { Logger } from "@/shared/logger";
 import { renderBillingOverview } from "@/views/billing.view";
@@ -57,11 +59,19 @@ describe("route()", () => {
   });
 });
 
+const PAID = { id: "inv_topup", status: "paid", totalMinor: 100, amountDueMinor: 0, currencyCode: "INR", nextRetryAt: null };
+const CARD = { id: "pm_1", type: "card", status: "valid", brand: "visa", last4: "1111", expiryMonth: 12, expiryYear: 2030 };
+
 function chargebeeStub(over: Partial<ChargebeeClient> = {}) {
   return {
     createCustomer: async ({ id }: { id: string }) => ({ id }),
     checkoutPage: async () => ({ id: "hp_1" }),
-    checkoutOneTime: async () => ({ id: "hp_topup" }),
+    chargeItem: async () => PAID,
+    paymentSource: async () => CARD,
+    unpaidInvoicesFor: async () => [],
+    paidInvoicesFor: async () => [],
+    subscriptionIdsOf: async () => [],
+    grantBlocks: async () => ({ blocks: [], complete: true }),
     portalSession: async () => ({ id: "ps_1" }),
     ...over,
   } as unknown as ChargebeeClient;
@@ -119,8 +129,8 @@ describe("checkout", () => {
   it("will not top up a CANCELLED account — it still carries its subscription id — and says why, as a 409", async () => {
     // The credits would reopen a LiteLLM team whose usage the sync no longer
     // bills, because it skips cancelled accounts. Refused before any payment.
-    const checkoutOneTime = vi.fn(async () => ({ id: "hp_topup" }));
-    const rig = checkoutRig({ checkoutOneTime }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "cancelled" });
+    const chargeItem = vi.fn(async () => PAID);
+    const rig = checkoutRig({ chargeItem }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "cancelled" });
 
     const err = await rejection(rig.startTopUp(TENANT));
 
@@ -129,7 +139,7 @@ describe("checkout", () => {
       "subscription-cancelled",
       "Your subscription has ended — subscribe again to add credits",
     ]);
-    expect(checkoutOneTime).not.toHaveBeenCalled();
+    expect(chargeItem).not.toHaveBeenCalled();
 
     const res = await route({ fallback: FALLBACK }, async () => Response.json(await rig.startTopUp(TENANT)))(request());
     expect(res.status).toBe(409);
@@ -182,35 +192,106 @@ describe("checkout", () => {
     ]);
   });
 
-  it("still tops up an active account", async () => {
-    const checkoutOneTime = vi.fn(async () => ({ id: "hp_topup" }));
-    const rig = checkoutRig({ checkoutOneTime }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" });
+  it("still tops up an active account — charged onto its subscription", async () => {
+    const chargeItem = vi.fn(async () => PAID);
+    const rig = checkoutRig({ chargeItem }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" });
 
-    expect(await rig.startTopUp(TENANT)).toEqual({ hostedPage: { id: "hp_topup" }, credits: "1000" });
-    expect(checkoutOneTime).toHaveBeenCalledWith({ customerId: TENANT, itemPriceId: "pack" });
+    expect(await rig.startTopUp(TENANT)).toEqual({ invoice: PAID, quantity: 1, applied: 0, credits: "0" });
+    expect(chargeItem).toHaveBeenCalledWith({ subscriptionId: "sub_1", itemPriceId: "pack", quantity: 1 });
   });
 
-  it("names a site with one-time checkout switched off, instead of failing generically", async () => {
-    const disabled = Object.assign(new Error("One time checkout is not enabled for this site"), {
-      apiErrorCode: "invalid_request",
-    });
-    const err = await rejection(
-      checkoutRig({
-        checkoutOneTime: async () => {
-          throw disabled;
+  it("charges the quantity the customer chose", async () => {
+    const chargeItem = vi.fn(async () => PAID);
+    const rig = checkoutRig({ chargeItem }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" });
+
+    expect(await rig.startTopUp(TENANT, 3)).toMatchObject({ quantity: 3 });
+    expect(chargeItem).toHaveBeenCalledWith({ subscriptionId: "sub_1", itemPriceId: "pack", quantity: 3 });
+  });
+
+  it.each([0, -1, 1.5, 101, Number.NaN, "3" as unknown as number])(
+    "refuses quantity %s before anything reaches Chargebee",
+    async (quantity) => {
+      const chargeItem = vi.fn(async () => PAID);
+      const rig = checkoutRig({ chargeItem }, { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" });
+
+      const err = await rejection(rig.startTopUp(TENANT, quantity));
+      expect([err.kind, err.code]).toEqual(["invalid", "topup-quantity-invalid"]);
+      expect(chargeItem).not.toHaveBeenCalled();
+    },
+  );
+
+  it("names a card Chargebee could not charge, with its reason, as a 409 — not an outage", async () => {
+    const declined = Object.assign(new Error("Your card was declined."), { status: 402, apiErrorCode: "payment" });
+    const rig = checkoutRig(
+      {
+        chargeItem: async () => {
+          throw declined;
         },
-      }).startTopUp(TENANT),
+      },
+      { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" },
     );
-    expect([err.kind, err.code]).toEqual(["conflict", "topup-disabled"]);
+
+    const res = await route({ fallback: FALLBACK }, async () => Response.json(await rig.startTopUp(TENANT)))(request());
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "Payment failed: Your card was declined.", code: "topup-payment-failed" });
+  });
+
+  it.each([
+    ["no card at all", null],
+    ["an expired card", { ...CARD, status: "expired" }],
+    ["a card still being verified", { ...CARD, status: "pending_verification" }],
+  ])("sends a customer with %s to add a card — 409 no-payment-method — and charges nothing", async (_label, card) => {
+    const chargeItem = vi.fn(async () => PAID);
+    const rig = checkoutRig(
+      { chargeItem, paymentSource: async () => card as never },
+      { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" },
+    );
+
+    const res = await route({ fallback: FALLBACK }, async () => Response.json(await rig.startTopUp(TENANT)))(request());
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "Add a card before buying credits", code: "no-payment-method" });
+    expect(chargeItem).not.toHaveBeenCalled();
+  });
+
+  it("an expiring card is still charged", async () => {
+    const chargeItem = vi.fn(async () => PAID);
+    const rig = checkoutRig(
+      { chargeItem, paymentSource: async () => ({ ...CARD, status: "expiring" }) },
+      { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" },
+    );
+
+    await rig.startTopUp(TENANT);
+    expect(chargeItem).toHaveBeenCalledTimes(1);
+  });
+
+  it("names Chargebee's own no-card refusal the same way, for a card removed in between", async () => {
+    const refused = Object.assign(new Error("Charge operation failed as there is no valid card on file"), {
+      status: 400,
+      apiErrorCode: "payment_method_not_present",
+    });
+    const rig = checkoutRig(
+      {
+        chargeItem: async () => {
+          throw refused;
+        },
+      },
+      { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" },
+    );
+
+    const err = await rejection(rig.startTopUp(TENANT));
+    expect([err.kind, err.code]).toEqual(["conflict", "no-payment-method"]);
   });
 
   it("lets any other Chargebee failure through for the route's fallback", async () => {
-    const outage = new Error("Chargebee /hosted_pages unreachable");
-    const rig = checkoutRig({
-      checkoutOneTime: async () => {
-        throw outage;
+    const outage = new Error("Chargebee /invoices/create_for_charge_items_and_charges unreachable");
+    const rig = checkoutRig(
+      {
+        chargeItem: async () => {
+          throw outage;
+        },
       },
-    });
+      { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" },
+    );
     await expect(rig.startTopUp(TENANT)).rejects.toBe(outage);
   });
 });
@@ -255,6 +336,34 @@ describe("portal", () => {
   });
 });
 
+describe("payment method page", () => {
+  const cards = (over: Partial<ChargebeeClient>, account: Record<string, unknown> = {}) => {
+    const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, ...account } as never);
+    return createPaymentMethodService({
+      chargebee: chargebeeStub(over),
+      accounts: createBillingAccountRepository(prisma),
+      redirectUrl: "https://app.test/organization/billing",
+    });
+  };
+
+  it("opens Chargebee's card page for the tenant's OWN customer, returning to the billing page — and is not gated like the portal", async () => {
+    const managePaymentSourcesPage = vi.fn(async () => ({ id: "hp_cards", url: "https://cb.test/pages/v3/x" }));
+
+    expect(await cards({ managePaymentSourcesPage }).manage(TENANT)).toEqual({ id: "hp_cards", url: "https://cb.test/pages/v3/x" });
+    expect(managePaymentSourcesPage).toHaveBeenCalledWith({
+      customerId: TENANT,
+      redirectUrl: "https://app.test/organization/billing",
+    });
+  });
+
+  it("has no cards to manage for a tenant with no customer", async () => {
+    const managePaymentSourcesPage = vi.fn(async () => ({ id: "hp_cards" }));
+    const err = await rejection(cards({ managePaymentSourcesPage }, { chargebeeCustomerId: null }).manage(TENANT));
+    expect([err.kind, err.code]).toEqual(["not_found", "no-customer"]);
+    expect(managePaymentSourcesPage).not.toHaveBeenCalled();
+  });
+});
+
 describe("invoice download", () => {
   const invoices = (over: Partial<ChargebeeClient>) => {
     const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT } as never);
@@ -292,21 +401,71 @@ describe("invoice download", () => {
   });
 });
 
+describe("describeTopUp", () => {
+  // Distinct ids per case: the cache is module-level, keyed by item price.
+  const describe$ = (itemPriceId: string, itemPrice: ChargebeeClient["itemPrice"]) =>
+    describeTopUp({ itemPriceId, creditsPerUnit: "1000", maxQuantity: 100 }, chargebeeStub({ itemPrice }), { logger: quietLogger });
+
+  it("quotes the price of one unit when Chargebee prices the charge per unit", async () => {
+    const offer = await describe$("topup-per-unit", async (id) => ({
+      id,
+      name: "Credit top-up",
+      priceMinor: 49900,
+      currencyCode: "INR",
+      period: null,
+      periodUnit: null,
+      pricingModel: "per_unit",
+    }));
+    expect(offer).toEqual({
+      itemPriceId: "topup-per-unit",
+      name: "Credit top-up",
+      unitPriceMinor: 49900,
+      currencyCode: "INR",
+      creditsPerUnit: "1000",
+      maxQuantity: 100,
+    });
+  });
+
+  it("sells a flat-fee charge one at a time, and quotes no unit price for it", async () => {
+    const offer = await describe$("topup-flat", async (id) => ({
+      id,
+      name: "Pack",
+      priceMinor: 49900,
+      currencyCode: "INR",
+      period: null,
+      periodUnit: null,
+      pricingModel: "flat_fee",
+    }));
+    expect([offer.unitPriceMinor, offer.maxQuantity]).toEqual([null, 1]);
+  });
+
+  it("never fails the page: Chargebee down leaves the id and no price", async () => {
+    const offer = await describe$("topup-down", async () => {
+      throw new Error("timeout");
+    });
+    expect(offer).toMatchObject({ itemPriceId: "topup-down", name: "topup-down", unitPriceMinor: null, maxQuantity: 100 });
+  });
+});
+
 describe("billing page view", () => {
   const config = { site: "test-site", defaultItemPriceId: "plan-monthly" };
   const plansOffered: never[] = [];
 
   it("gives an unlinked tenant every key, with the site set so checkout can load", () => {
-    expect(renderBillingOverview({ kind: "unlinked", plansOffered }, config)).toEqual({
+    expect(renderBillingOverview({ kind: "unlinked", plansOffered, freePlan: false }, config)).toEqual({
       site: "test-site",
       plansOffered,
+      freePlan: false,
       status: "unlinked",
       plan: { itemPriceId: "plan-monthly" },
       term: { start: null, end: null },
       credits: { unit: null, granted: "0", allocated: "0", consumed: "0", current: "0" },
       lastSync: null,
       payments: [],
+      paymentsNextOffset: null,
       subscription: null,
+      topUp: null,
+      unpaidTopUps: [],
     });
   });
 
@@ -318,7 +477,7 @@ describe("billing page view", () => {
       currentTermStart: null,
       currentTermEnd: null,
     } as never;
-    const view = renderBillingOverview({ kind: "activating", plansOffered, account }, config);
+    const view = renderBillingOverview({ kind: "activating", plansOffered, freePlan: true, account }, config);
     expect(view.status).toBe("activating");
     expect(view.plan).toEqual({ itemPriceId: "plan-yearly" });
     expect(view.credits).toEqual({ unit: "token", granted: "0", allocated: "0", consumed: "0", current: "0" });
@@ -329,16 +488,42 @@ describe("billing page view", () => {
     const view = renderBillingOverview(
       {
         kind: "linked",
+        freePlan: true,
         plansOffered,
         account,
         credits: { granted: "1000", allocated: "1000", consumed: "10", current: "990" },
         payments: null,
+        paymentsNextOffset: null,
         subscription: null,
         lastSync: null,
+        topUp: null,
+        unpaidTopUps: [],
       },
       config,
     );
     expect(view.payments).toBeNull();
+    expect(view.paymentsNextOffset).toBeNull();
     expect(view.credits).toEqual({ unit: "token", granted: "1000", allocated: "1000", consumed: "10", current: "990" });
+  });
+
+  it("passes the cursor for the next page of payments through", () => {
+    const account = { status: "active", chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token" } as never;
+    const view = renderBillingOverview(
+      {
+        kind: "linked",
+        freePlan: true,
+        plansOffered,
+        account,
+        credits: { granted: "0", allocated: "0", consumed: "0", current: "0" },
+        payments: [],
+        paymentsNextOffset: '["1790000000000","2"]',
+        subscription: null,
+        lastSync: null,
+        topUp: null,
+        unpaidTopUps: [],
+      },
+      config,
+    );
+    expect(view.paymentsNextOffset).toBe('["1790000000000","2"]');
   });
 });

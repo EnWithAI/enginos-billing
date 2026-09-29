@@ -6,6 +6,7 @@
  * "Invalid api key", which gives no hint that the value was never filled in.
  */
 
+import { divide, isPositive } from "../models/decimal";
 import { assertRate } from "../models/rate";
 
 function required(name: string): string {
@@ -31,6 +32,38 @@ function integer(name: string, fallback: number): number {
     throw new Error(`${name} must be a positive number, got ${raw}`);
   }
   return Math.floor(parsed);
+}
+
+/**
+ * What one credit is worth in USD of LLM spend.
+ *
+ * Set as CREDITS_PER_USD — how many credits $1 buys, the way the business
+ * states it — and turned into the per-credit rate every conversion uses
+ * (models/rate.ts), at the ledger's ten decimal places. USD_PER_CREDIT, the
+ * same thing stated the other way round, is still read when CREDITS_PER_USD is
+ * not set, so an environment that has it keeps working.
+ */
+function readRate(): string {
+  const perUsd = optional("CREDITS_PER_USD", "").trim();
+  if (perUsd === "") return assertRate(optional("USD_PER_CREDIT", DEFAULT_USD_PER_CREDIT));
+  if (!isPositive(perUsd)) {
+    throw new RangeError(`CREDITS_PER_USD must be greater than zero, got ${perUsd}`);
+  }
+  return assertRate(divide("1", perUsd));
+}
+
+/**
+ * The plan allowlist: ITEM_PRICE_IDS, with the free plan always on it. A site
+ * whose only plan is the free one needs no ITEM_PRICE_IDS at all, and one that
+ * lists others cannot leave the free plan off by accident — which would stop
+ * every new org being subscribed.
+ */
+function planAllowlist(listed: string, freePlan: string): string[] {
+  const ids = listed
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return freePlan !== "" && !ids.includes(freePlan) ? [...ids, freePlan] : ids;
 }
 
 /**
@@ -65,14 +98,19 @@ function nonNegativeInteger(name: string, fallback: number): number {
 export const MIN_LAG_MS = 10_000;
 
 /**
- * `BILLING_LAG_MS`, refusing an obviously wrong value.
+ * `BILLING_LAG_MS`, refusing an obviously wrong value. 10 s unless set.
+ *
+ * Why 10 s is enough: ClickHouse stamps `ingested_at` when it writes the span
+ * into the org's span_nodes, and the span is visible once that write commits.
+ * MEASURED 2026-09-29 over 7 days of system.query_views_log: 10,058 writes,
+ * slowest 389 ms, p99 19 ms. The default was two minutes before that was known.
  *
  * `BILLING_ALLOW_SHORT_LAG=true` lifts the floor. It exists for tests that
  * drive the worker against a local ClickHouse on a short clock, and must never
  * be set anywhere real.
  */
 function lagMs(): number {
-  const value = integer("BILLING_LAG_MS", 2 * 60 * 1000);
+  const value = integer("BILLING_LAG_MS", 10 * 1000);
   if (value < MIN_LAG_MS && process.env.BILLING_ALLOW_SHORT_LAG !== "true") {
     throw new Error(
       `BILLING_LAG_MS is ${value} ms — below the ${MIN_LAG_MS} ms floor. It is in MILLISECONDS: ` +
@@ -117,7 +155,7 @@ export function resetConfig(): void {
 function buildConfig() {
   return {
     /** Charged per credit, in USD. */
-    usdPerCredit: assertRate(optional("USD_PER_CREDIT", DEFAULT_USD_PER_CREDIT)),
+    usdPerCredit: readRate(),
 
     /**
      * Only usage ingested into ClickHouse at least this long ago is read
@@ -144,6 +182,15 @@ function buildConfig() {
 
     /** How many windows one tick may process for one tenant, so a backlog cannot run past the task timeout. */
     maxWindowsPerTick: integer("BILLING_MAX_WINDOWS_PER_TICK", 20),
+
+    /**
+     * How often the usage sync passes over every org. Hatchet's cron fires once
+     * a minute at most, so a shorter interval runs several passes inside each
+     * minute's run (worker/hatchet-worker.ts). With BILLING_LAG_MS and
+     * BILLING_WINDOW_MS at 10 s, usage reaches Chargebee 15–30 s after the call.
+     * 60 s or more: one pass per minute.
+     */
+    sweepIntervalMs: integer("BILLING_SWEEP_INTERVAL_MS", 60 * 1000),
 
     /** Unresolved syncs past this many attempts log as errors. The row stays unresolved regardless. */
     maxAttempts: integer("BILLING_MAX_ATTEMPTS", 10),
@@ -181,21 +228,42 @@ function buildConfig() {
     },
 
     /**
-     * The plans checkout is allowed to sell.
+     * The plans an org may be on: the allowlist the linking step picks a usage
+     * subscription from, and checkout sells from. ITEM_PRICE_IDS lists any
+     * besides the free plan, which is always included — so a site that uses
+     * only the free plan sets nothing here. An org's CURRENT subscription is
+     * kept whatever this says (models/subscription.ts).
      *
      * An ALLOWLIST, not a menu. Every request naming an item price is checked
      * against it, so a tampered request cannot start a checkout for some other
-     * plan in the catalogue — precisely the hole Chargebee's attribute drop-in
-     * leaves open, since it puts the item price in markup the browser controls.
+     * plan in the catalogue.
      */
-    itemPriceIds: optional("ITEM_PRICE_IDS", "pre-paid-test-v1-INR-Monthly")
-      .split(",")
-      .map((id) => id.trim())
-      .filter(Boolean),
+    itemPriceIds: planAllowlist(optional("ITEM_PRICE_IDS", ""), optional("FREE_PLAN_ITEM_PRICE_ID", "")),
 
     defaultItemPriceId: optional("DEFAULT_ITEM_PRICE_ID", "pre-paid-test-v1-INR-Monthly"),
 
-    /** Where Chargebee returns the browser after the self-serve portal. */
+    /**
+     * The plan every org is put on automatically — at sign-up, and when its
+     * billing page is opened with no subscription — with no checkout and no
+     * card. Must cost nothing (checked against the catalogue before every
+     * create); always on the plan allowlist. Empty turns automatic
+     * subscription off.
+     */
+    freeItemPriceId: optional("FREE_PLAN_ITEM_PRICE_ID", ""),
+
+    /**
+     * Whether an org with no setting of its own is put on the free plan. Off
+     * by default: an org is offered the paid plans unless an operator turns
+     * the free plan on for it (POST /api/internal/free-plan).
+     */
+    freePlanDefault: optional("FREE_PLAN_DEFAULT", "false") === "true",
+
+    /**
+     * The app's origin, where Chargebee returns the browser after the portal
+     * and the card page (`/organization/billing`). MEASURED: Chargebee accepts
+     * a redirect only on port 80, 443, 8080 or 8443, so the local
+     * `http://localhost:4200` is refused — use the HTTPS dev origin.
+     */
     appUrl: optional("APP_URL", "http://localhost:4200"),
 
     /**
@@ -224,7 +292,21 @@ function buildConfig() {
     // item price. The live .env once held the item id, and every top-up
     // checkout failed with "No currency for item price test-top-up" (C57c).
     topUpItemPriceId: optional("TOPUP_ITEM_PRICE_ID", "token-pack-5m-INR"),
+    /**
+     * Credits ONE UNIT of the top-up charge grants. The customer picks a
+     * quantity; a paid invoice for N units grants N × this. Before quantities
+     * every top-up was one unit, so an existing value keeps meaning what it did.
+     */
     topUpCredits: optional("TOPUP_CREDITS", "1000"),
+    /** The most units one top-up checkout may sell — a typo guard, not a limit on spend. */
+    topUpMaxQuantity: integer("TOPUP_MAX_QUANTITY", 100),
+    /**
+     * The top-up charge carries its own Credit Grant in the Chargebee catalogue,
+     * so Chargebee grants each paid pack and billing only records it — and never
+     * allocates, which would grant twice. TOPUP_CREDITS must then equal what that
+     * grant gives per unit: it is only the figure the page quotes.
+     */
+    topUpChargebeeGrants: optional("TOPUP_CHARGEBEE_GRANTS", "false") === "true",
   } as const;
 }
 

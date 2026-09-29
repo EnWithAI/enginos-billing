@@ -202,7 +202,7 @@ export class ChargebeeWorld {
   grantBlocksIncomplete = false;
   /** Balances of units other than the plan's (a pack granted into the wrong unit). */
   otherUnits = new Map<string, number>();
-  paidInvoices: Array<{ id: string; paid_at?: number; line_items?: Array<{ id: string; entity_id: string }> }> = [];
+  paidInvoices: Array<{ id: string; paid_at?: number; line_items?: Array<{ id: string; entity_id: string; quantity?: unknown }> }> = [];
   /**
    * The service is pointed at a site that is not ours (a wrong CHARGEBEE_SITE
    * or key): it lists no subscriptions and knows no id — 404 for everything.
@@ -276,9 +276,14 @@ export class ChargebeeWorld {
     else this.otherUnits.set(unit, (this.otherUnits.get(unit) ?? 0) + credits);
   }
 
-  /** A pack paid for the ordinary way: an invoice with its pack line, and no grant of its own. */
-  payPack(invoiceId: string) {
-    this.paidInvoices.push({ id: invoiceId, paid_at: Math.floor(this.now() / 1000), line_items: [{ id: `li_${invoiceId}`, entity_id: PACK }] });
+  /**
+   * A pack paid for the ordinary way: an invoice with its pack line, and no
+   * grant of its own. `quantity` omitted leaves the line without one, as the
+   * rig always has; anything else is written onto the line as given.
+   */
+  payPack(invoiceId: string, quantity?: unknown) {
+    const line = { id: `li_${invoiceId}`, entity_id: PACK, ...(quantity === undefined ? {} : { quantity }) };
+    this.paidInvoices.push({ id: invoiceId, paid_at: Math.floor(this.now() / 1000), line_items: [line] });
   }
 
   /** Term rollover: the old plan block expires (its leftover with it), a new one is issued. */
@@ -500,7 +505,12 @@ export function lifecycleRig() {
     logger,
     ...hooks,
   });
-  const webhooks = createWebhookService({ accountService: accounts, accounts: repo, logger });
+  const webhooks = createWebhookService({
+    accountService: accounts,
+    accounts: repo,
+    topUp: { itemPriceId: PACK, creditsPerUnit: "1000" },
+    logger,
+  });
   const usageSync = createUsageSyncService({
     prisma: prisma as never,
     usage,

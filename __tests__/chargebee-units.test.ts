@@ -150,7 +150,12 @@ describe("C57b the account service never lets balance ordering move or open an a
     const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, chargebeeSubscriptionId: SUB, ledgerUnitId: "token", status: "active" } as never);
     const accounts = createBillingAccountRepository(prisma as never);
     const overview = createBillingOverviewService({
-      chargebee: { ...client, transactionsFor: async () => [], subscription: async () => null, paymentSource: async () => null },
+      chargebee: {
+        ...client,
+        transactionsPage: async () => ({ transactions: [], nextOffset: null }),
+        subscription: async () => null,
+        paymentSource: async () => null,
+      },
       accountService: { ensureLocalAccount: (t: string) => accounts.findByTenantId(t) } as never,
       accounts,
       syncs: createChargebeeSyncRepository(prisma as never),

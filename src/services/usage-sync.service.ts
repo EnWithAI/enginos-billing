@@ -103,9 +103,10 @@ export const OUTCOME = {
   REPLAYED: "replayed", // a sync we had lost the answer to had in fact landed
   UNKNOWN: "unknown", // outcome unknown; resolved by lookup next tick
   RATE_LIMITED: "rate_limited", // Chargebee throttled us; backing off
-  OUT_OF_CREDITS: "out_of_credits", // usage kept, cursor held, retried each tick
+  OUT_OF_CREDITS: "out_of_credits", // usage kept, cursor held, retried once credits come back
   INVALID: "invalid", // Chargebee refused the request itself; a human is needed
   HOLDING: "holding", // an unresolved sync exists but is not due for retry yet
+  EXHAUSTED: "exhausted", // credits used up: team blocked, nothing sent or read until credits come back
   LOCKED: "locked", // another worker is on this window
   NOT_BILLABLE: "not_billable", // no subscription, or cancelled
   WRITTEN_OFF: "written_off", // refused, and its subscription has ended: given up, once
@@ -222,6 +223,16 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
       return { tenantSlug, outcome: OUTCOME.NOT_BILLABLE, reason: "no subscription linked" };
     }
 
+    // 0. Out of credits: the whole tenant waits for credits to come back.
+    //
+    //    Chargebee could only refuse again, so nothing is sent — not the held
+    //    window, not a lookup — and nothing new is read. The usage waits in
+    //    ClickHouse in front of a cursor that has not moved. A top-up, a
+    //    renewal or the daily resync is what moves the account out of
+    //    `exhausted` (activate()); the next tick then resolves the held window
+    //    first and bills on from there.
+    if (account.status === ACCOUNT.EXHAUSTED) return holdExhausted(account);
+
     log.log?.({ metric: "billing.sync.started", tenantSlug }, "Billing sync started");
 
     // 1. Resolve whatever is unresolved, BEFORE reading anything new.
@@ -265,6 +276,30 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     }
 
     return processWindows(current, recovered);
+  }
+
+  /**
+   * An exhausted tenant's tick: keep its LiteLLM team blocked, and nothing else.
+   *
+   * The block is re-asserted every tick — one team read while it is in place —
+   * so a block that failed when the credits ran out lands on the next tick
+   * rather than waiting for a top-up. The one row settled here is a refusal on
+   * a subscription the account no longer bills: no top-up can reach it, and
+   * writing it off asks Chargebee nothing.
+   */
+  async function holdExhausted(account: Account): Promise<TenantResult> {
+    const tenantSlug = account.routingSlug;
+    const held = await syncs.oldestUnresolved(account.tenantId);
+    if (held && abandoned(held, account)) return writeOff(held, account);
+
+    await blockExhausted(account.tenantId, tenantSlug);
+    warnIfBehind(account, clock());
+    return {
+      tenantSlug,
+      outcome: OUTCOME.EXHAUSTED,
+      reason: "credits used up; held until a top-up",
+      ...(held ? { syncId: held.id, amount: decimal(held.amount), attempts: held.attemptCount } : {}),
+    };
   }
 
   /**
@@ -596,6 +631,8 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
   async function recover(row: Sync, account: Account): Promise<TenantResult> {
     const tenantSlug = account.routingSlug;
 
+    // An OUT_OF_CREDITS row gets here only once the account has left
+    // `exhausted` (holdExhausted), so it is due at once.
     const waitMs = retryDelayMs(row.status, row.attemptCount);
     const dueAt = row.updatedAt.getTime() + waitMs;
     if (waitMs > 0 && clock() < dueAt) {
@@ -718,7 +755,8 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
       return claimLost(row, tenantSlug, result.kind);
     }
 
-    if (status === SYNC.OUT_OF_CREDITS && pinnedToLinked(row, account)) await markExhausted(row.tenantId, tenantSlug);
+    const exhausted = status === SYNC.OUT_OF_CREDITS && pinnedToLinked(row, account);
+    if (exhausted) await markExhausted(row.tenantId, tenantSlug);
 
     log[status === SYNC.RATE_LIMITING ? "warn" : "error"]?.(
       {
@@ -730,7 +768,8 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
         amount,
         window: `${row.fromIngestedAt.toISOString()} → ${row.toIngestedAt.toISOString()}`,
         subscriptionId: row.chargebeeSubscriptionId,
-        retryInMs: retryDelayMs(status, claim.attemptCount),
+        // Null: an exhausted tenant is not retried on a timer; credits coming back release it.
+        retryInMs: exhausted ? null : retryDelayMs(status, claim.attemptCount),
         err: err?.message,
       },
       REASON[status] ?? "Chargebee did not accept this window; billing holds here",
@@ -828,23 +867,32 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
 
   /**
    * Chargebee says the credits are gone: mark the account and block the
-   * tenant's LiteLLM team so no more usage accrues. Best effort — a failed
-   * block is loud, and the next tick tries again.
+   * tenant's LiteLLM team so no more usage accrues. From the next tick the
+   * tenant is held (holdExhausted) until credits come back.
    */
   async function markExhausted(tenantId: string, tenantSlug: string) {
     // A cancelled account's team has been handed back to its plan: blocking
     // it would take the free plan away too, and nothing would lift it.
     if (!(await accounts.markExhaustedUnlessCancelled(tenantId))) return;
-    if (!deps.blockBudget) return;
+    if (await blockExhausted(tenantId, tenantSlug)) {
+      log.warn?.({ metric: "billing.budget.exhausted_blocked", tenantSlug }, "Credits used up; LiteLLM team blocked until a top-up");
+    }
+  }
+
+  /**
+   * Block the team as `exhausted` via /team/update. Best effort — a failure is
+   * loud, and the next tick tries again (holdExhausted). True when it landed.
+   */
+  async function blockExhausted(tenantId: string, tenantSlug: string): Promise<boolean> {
+    if (!deps.blockBudget) return false;
     try {
       await deps.blockBudget(tenantId, "exhausted");
-      log.warn?.({ metric: "billing.budget.exhausted_blocked", tenantSlug }, "Credits used up; LiteLLM team blocked until a top-up");
     } catch (err) {
       log.error?.(
         { metric: "billing.budget.block_failed", tenantSlug, reason: "exhausted", err: errorMessage(err) },
         "Credits used up but the LiteLLM team could not be blocked",
       );
-      return;
+      return false;
     }
     // A cancellation that landed between the status write and the block has
     // already handed the team back — and this block undid that. cancel()
@@ -860,6 +908,7 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
         );
       }
     }
+    return true;
   }
 
   /**
@@ -901,6 +950,7 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
       outOfCredits: count(OUTCOME.OUT_OF_CREDITS),
       invalid: count(OUTCOME.INVALID),
       holding: count(OUTCOME.HOLDING),
+      exhausted: count(OUTCOME.EXHAUSTED),
       locked: count(OUTCOME.LOCKED),
       writtenOff: count(OUTCOME.WRITTEN_OFF),
       errors,
@@ -921,7 +971,7 @@ const REASON: Record<string, string> = {
     "Sync outcome unknown; the row is resolved by lookup on the next tick, never by re-sending",
   [SYNC.RATE_LIMITING]: "Chargebee is throttling us; the same window is sent again after a backoff",
   [SYNC.OUT_OF_CREDITS]:
-    "Customer is out of credits; the usage is retained and retried until a top-up clears it",
+    "Customer is out of credits; the usage is retained and the tenant held — nothing sent or read — until a top-up or renewal brings credits back",
   [SYNC.INVALID]: "Chargebee refused the request itself; billing holds here until it is fixed",
 };
 

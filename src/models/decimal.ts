@@ -199,3 +199,9 @@ function expandExponent(text: string): string {
   intPart = intPart.replace(/^0+(?=\d)/, "");
   return fracPart ? `${sign}${intPart}.${fracPart}` : `${sign}${intPart}`;
 }
+
+/** `a − b`, never below zero: a figure with credits held back from it. */
+export function subtractFloorZero(a: DecimalLike, b: DecimalLike): string {
+  const difference = subtract(a, b);
+  return compare(difference, "0") > 0 ? difference : "0";
+}

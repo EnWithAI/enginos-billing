@@ -508,10 +508,10 @@ describe("C41 webhook delayed", () => {
 
     r.at(5);
     await r.tick();
-    // The held window now clears against the new grant — once — but nothing on
-    // this path reopens the team: the stale state is "blocked", never "open".
-    expect(r.cb.ledger.appliedCount).toBe(2);
-    expect(r.prisma._stuck).toBeUndefined();
+    // Still exhausted as far as billing knows, so the held window waits on its
+    // backoff and Chargebee is not asked. The stale state is "blocked", never "open".
+    expect(r.cb.ledger.appliedCount).toBe(1);
+    expect(r.prisma._stuck).toMatchObject({ status: "OUT_OF_CREDITS" });
     expect(r.account().status).toBe("exhausted");
     expect(r.gateway.team_.blocked).toBe(true);
 
@@ -520,6 +520,12 @@ describe("C41 webhook delayed", () => {
 
     expect(r.account()).toMatchObject({ status: "active", currentTermStart: new Date((T0_S + 30 * DAY_S) * 1000) });
     expect(r.gateway.team_.blocked).toBe(false);
+
+    // The webhook took the account out of `exhausted`, so the held window is
+    // due at once, inside its backoff, and clears against the new grant — once.
+    r.at(7);
+    await r.tick();
+    expect(r.prisma._stuck).toBeUndefined();
     expect(r.cb.ledger.appliedCount).toBe(2);
     expect(r.cb.ledger.taken).toBe(300);
     expect(r.cb.ledger.balance).toBe(900);
@@ -961,7 +967,7 @@ describe("C52 concurrent LLM requests", () => {
     expect(r.llmCall("after:1", T0 + 5 * MINUTE, 0.01)).toBe(false);
 
     // A top-up settles the overshoot in full; the two sides agree again.
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
     await r.accounts.applyPaidTopUps(TENANT, PACK, "1000");
     r.at(6);
     await r.tick();
@@ -1153,7 +1159,7 @@ describe("C57 top-up after exhaustion", () => {
     expect(r.gateway.team_.blocked).toBe(true);
     expect(r.cb.ledger.balance).toBe(400);
 
-    r.cb.paidInvoices.push({ id: "inv_1" });
+    r.cb.payPack("inv_1");
     expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 1, credits: "1000" });
 
     expect(r.account().status).toBe("active");

@@ -83,7 +83,7 @@ things happened. The states and their responses are now:
 | `PROCESSING` | every tick, lookup first |
 | `UNKNOWN` | every tick, lookup first |
 | `RATE_LIMITING` | 1 min doubling to 15 |
-| `OUT_OF_CREDITS` | every tick, so a top-up clears it at once |
+| `OUT_OF_CREDITS` | 5 min doubling to 1 hour while the account is `exhausted`; at once after a top-up or renewal |
 | `INVALID` | 5 min doubling to 1 hour |
 
 The backoff is derived from `updated_at + f(attempt_count)`; there is no

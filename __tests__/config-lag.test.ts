@@ -48,9 +48,9 @@ describe("C11 BILLING_LAG_MS below the floor is refused at start", () => {
     }
   });
 
-  it("unset, it is two minutes", () => {
+  it("unset, it is ten seconds", () => {
     delete process.env.BILLING_LAG_MS;
-    expect(getConfig().lagMs).toBe(120_000);
+    expect(getConfig().lagMs).toBe(10_000);
   });
 
   it("BILLING_ALLOW_SHORT_LAG=true — tests only — lifts the floor, and only exactly `true` does", () => {
@@ -64,7 +64,7 @@ describe("C11 BILLING_LAG_MS below the floor is refused at start", () => {
 
   it(".env.example documents the unit, the floor and why", () => {
     const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
-    expect(example).toMatch(/^BILLING_LAG_MS=120000$/m);
+    expect(example).toMatch(/^BILLING_LAG_MS=10000$/m);
     expect(example).toMatch(/MILLISECONDS/);
     expect(example).toMatch(/10000 is REFUSED/);
     expect(example).toMatch(/BILLING_ALLOW_SHORT_LAG=true lifts the floor for tests only/);

@@ -31,7 +31,8 @@ subscriptions from Chargebee and applies them through `syncSubscription()`:
 | Path | Trigger | Caller |
 |---|---|---|
 | Push | every `subscription_*` event — the body is only a trigger; nothing in it is written | [`webhooks/chargebee/route.ts`](../src/app/api/webhooks/chargebee/route.ts) |
-| Pull | The UI, from the checkout success callback | [`internal/sync-subscription/route.ts`](../src/app/api/internal/sync-subscription/route.ts) |
+| Provision | enginos-platform once an org is created, and the billing page for an org with no subscription: subscribe the free plan, then pull until Chargebee's credit ledger is there | [`internal/provision/route.ts`](../src/app/api/internal/provision/route.ts) |
+| Pull | on request — an operator, or a caller repairing one tenant | [`internal/sync-subscription/route.ts`](../src/app/api/internal/sync-subscription/route.ts) |
 | Repair | the daily reconcile, for every tenant with a Chargebee customer | [`worker/hatchet-worker.ts`](../worker/hatchet-worker.ts) |
 
 **What it writes**
@@ -114,16 +115,17 @@ webhook with a 500 and is retried by Chargebee's redelivery and by the reconcile
 
 | Symptom | Mechanism to check |
 |---|---|
-| Credits wrong after checkout | Push/pull — check Chargebee's webhook delivery log for the event, and whether the post-checkout pull ran. |
+| New org shows "Setting up your free plan" | Provision — the platform's call failed or has not run; each load of the billing page tries again. Check `billing.free_plan.*` in the logs |
+| Credits missing after a top-up | The top-up's own apply, then `payment_succeeded` — both record Chargebee's grant block; check Chargebee's webhook delivery log (`webhooks[]` on the event) |
 | Credits not decreasing with usage | Poll — is the worker up? Is there an unresolved `chargebee_sync` row, or is the account `exhausted`? Its `status` names which of the eight things happened. |
 | "Last synced" frozen | Poll — the cursor only moves past a resolved window. Check the logs for `billing.sync.out_of_credits`, `billing.sync.rate_limited`, `billing.sync.invalid` or `billing.sync.unknown_outcome`. |
 | Cursor moving but "last synced" old | Normal for a quiet tenant: an empty window advances the cursor and writes no row. The billing page reports both, and only the cursor means billing is healthy. |
 | Stuck "Activating your credits" | Poll — `activatePending()` retries each minute; the push is failing |
 | Cancelled customer still serving | Webhook, then the daily reconcile — both re-read Chargebee and release the budget |
 | Active customer refused by LiteLLM | Poll — `reopenBlockedActive()` re-opens an active account's team each minute when BILLING blocked it (`billing.budget.active_but_blocked`); a team blocked by hand is left alone. It runs after the usage sync, bounded by a deadline (`billing.budget.gate_check_deadline`) |
-| Cancelled customer blocked on the free plan | `release()` lifts billing's own block when it hands the team back; the daily reconcile re-runs it |
+| Cancelled customer refused by LiteLLM | Expected: `release()` hands the team back, and the platform's budget for it is $0 |
 | Refused usage on an ended subscription | Written off once (`billing.sync.written_off`); it no longer holds the tenant |
-| Leftover credits survived a renewal | Chargebee — the old grant block is still live; the cap follows whatever `/grant_blocks` reports |
+| Leftover credits survived a renewal | Expected: the plan's grant rolls over; the cap follows whatever `/grant_blocks` reports |
 
 ---
 
@@ -132,10 +134,12 @@ webhook with a 500 and is retried by Chargebee's redelivery and by the reconcile
 ### A tenant stopped on credits is quieter than it looks
 
 An account Chargebee refuses for want of balance logs
-`billing.sync.out_of_credits` at `error` every tick and stops moving its
-cursor. That is correct and self-healing — the usage stays in ClickHouse in
-front of the cursor and goes through the moment the customer tops up, with no
-requeue step — but it is also indefinite. `billing.sync.behind` fires once the
+`billing.sync.out_of_credits` at `error` once, becomes `exhausted`, and from
+then is held whole: no retry, no Chargebee call, no ClickHouse read, only the
+LiteLLM block re-asserted each tick (the sweep counts it under `exhausted`).
+That is correct and self-healing — the usage stays in ClickHouse in front of
+the cursor and goes through the moment a top-up takes the account out of
+`exhausted`, with no requeue step — but it is also indefinite. `billing.sync.behind` fires once the
 cursor is more than seven days back, which is the real alarm, because tenant
 tables drop spans after 90 days.
 
@@ -178,10 +182,14 @@ or billed twice.
 
 Chargebee cannot reach `localhost`, so on a developer machine:
 
-- **The push path never fires.** No webhook arrives at all — that is expected,
-  not a bug. Nothing local records the absence, since the claim table is gone.
-- **The pull path runs once**, from the checkout success callback. Not on page load,
-  not on refresh, not on a timer.
+- **The push path fires only through a tunnel.** Without one no webhook arrives
+  at all — expected, not a bug. With one (`cloudflared tunnel --url http://localhost:4100`,
+  its URL set on the Chargebee webhook), deliveries work end to end: MEASURED
+  2026-09-28, a top-up's five events all `succeeded`, and `payment_succeeded`
+  recorded the grant three seconds after payment. The quick tunnel's URL changes
+  on every restart.
+- **The provision path runs at sign-up and on page load** for an org with no
+  subscription; the plain pull runs only when asked.
 - **The poll runs normally** — the worker reaches ClickHouse and Chargebee outbound
   without trouble.
 

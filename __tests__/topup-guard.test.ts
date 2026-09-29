@@ -25,11 +25,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ChargebeeClient } from "@/integrations/chargebee";
 import { createBillingAccountRepository } from "@/repositories/billing-account.repository";
-import { createAccountService, TOPUP_CLAIM_LEASE_MS, TOPUP_KEY_REPLAY_MS } from "@/services/account.service";
+import { createAccountService, TOPUP_CLAIM_LEASE_MS, TOPUP_KEY_REPLAY_MS, topUpUnits } from "@/services/account.service";
 import { createCheckoutService } from "@/services/checkout.service";
+import { createWebhookService } from "@/services/webhook.service";
 
 import { lifecycleRig, MINUTE, PACK, PLAN, T0, TENANT, UNIT, type LifecycleRig } from "./failure-matrix-lifecycle-webhooks-litellm.helpers";
-import { makeFakePrisma, quietLogger } from "./harness";
+import { quietLogger } from "./harness";
 
 const apply = (r: LifecycleRig) => r.accounts.applyPaidTopUps(TENANT, PACK, "1000");
 const rows = (r: LifecycleRig) => [...r.prisma._topUps.values()];
@@ -40,6 +41,57 @@ async function subscribed() {
   await r.subscribe("sub_1");
   return r;
 }
+
+describe("a top-up of several units grants what the PAID invoice says", () => {
+  it("grants credits per unit × the invoice line's quantity — once", async () => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1", 3);
+
+    expect(await apply(r)).toEqual({ applied: 1, credits: "3000" });
+    expect(rows(r)).toEqual([expect.objectContaining({ invoiceId: "inv_1", status: "APPLIED" })]);
+    expect(r.cb.liveCredits("sub_1")).toBe(4000); // the plan's 1000 + 3 × 1000
+
+    expect(await apply(r)).toEqual({ applied: 0, credits: "0" });
+    expect(r.cb.allocateCalls).toHaveLength(1);
+  });
+
+  it("each invoice is granted its own quantity", async () => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1", 2);
+    r.cb.payPack("inv_2", 5);
+
+    expect(await apply(r)).toEqual({ applied: 2, credits: "7000" });
+    expect(r.cb.liveCredits("sub_1")).toBe(8000);
+  });
+
+  it.each([1.5, 0, -2, "3", null])("holds an invoice whose quantity is %s — nothing sent, nothing claimed", async (quantity) => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1", quantity);
+
+    expect(await apply(r)).toEqual({ applied: 0, credits: "0" });
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
+  });
+});
+
+describe("topUpUnits", () => {
+  const line = (entity_id: string, quantity?: unknown) => ({ id: `li_${entity_id}`, entity_id, ...(quantity === undefined ? {} : { quantity }) });
+
+  it("sums the quantity of every line for the top-up charge, and ignores other lines", () => {
+    expect(topUpUnits({ line_items: [line(PACK, 2), line(PLAN, 9), line(PACK, 3)] }, PACK)).toBe(5);
+  });
+
+  it("counts a line with no quantity as one unit, as every top-up was before", () => {
+    expect(topUpUnits({ line_items: [line(PACK)] }, PACK)).toBe(1);
+  });
+
+  it("refuses to guess: a quantity that is not a positive whole number, or no line at all, is null", () => {
+    expect(topUpUnits({ line_items: [line(PACK, 2.5)] }, PACK)).toBeNull();
+    expect(topUpUnits({ line_items: [line(PACK, 0)] }, PACK)).toBeNull();
+    expect(topUpUnits({ line_items: [line(PLAN, 1)] }, PACK)).toBeNull();
+    expect(topUpUnits({}, PACK)).toBeNull();
+  });
+});
 
 describe("C57a the local guard: one grant per paid invoice, whatever repeats", () => {
   it("a repeat apply answers {applied: 0} — at once, and long after Chargebee's 30-minute key window — and sends nothing", async () => {
@@ -295,32 +347,161 @@ describe("C57d a pack whose item price carries its OWN Credit Grant", () => {
     expect(await apply(r)).toEqual({ applied: 1, credits: "1000" });
     expect(r.cb.allocations).toHaveLength(1);
   });
+});
 
-  it("checkout for such a pack is refused by Chargebee — answered as a named misconfiguration, not a 502", async () => {
-    const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT } as never);
-    const errors: Array<Record<string, unknown>> = [];
-    const chargebee = {
-      checkoutOneTime: async () => {
-        throw Object.assign(new Error("Charges with grants are not supported for customer one off charges"), {
-          status: 400,
-          apiErrorCode: "invalid_request",
-        });
-      },
-    } as unknown as ChargebeeClient;
-    const accounts = createBillingAccountRepository(prisma);
+/**
+ * TOPUP_CHARGEBEE_GRANTS: the pack is charged onto the subscription
+ * (`create_for_charge_items_and_charges`, the admin UI's Add Charge) and
+ * Chargebee issues its Credit Grant — MEASURED, the grant block's `created_at`
+ * one second after the invoice's `paid_at`.
+ */
+describe("a pack charged to the card on file, Chargebee granting", () => {
+  const paid = (id: string, quantity = 1) => ({ id, status: "paid", totalMinor: 100 * quantity, amountDueMinor: 0, currencyCode: "INR" });
+
+  function charging(r: LifecycleRig, chargeItem: ChargebeeClient["chargeItem"], sleep = vi.fn(async () => {})) {
     const checkout = createCheckoutService({
-      chargebee,
-      accountService: createAccountService({ prisma, chargebee, usdPerCredit: "0.001", logger: quietLogger }),
-      accounts,
+      chargebee: {
+        ...(r.cb.client as unknown as ChargebeeClient),
+        chargeItem,
+        paymentSource: async () => ({ id: "pm_1", type: "card", status: "valid", brand: "visa", last4: "1111", expiryMonth: 12, expiryYear: 2030 }),
+        unpaidInvoicesFor: async () => [],
+      },
+      accountService: r.accounts,
+      accounts: createBillingAccountRepository(r.prisma as never),
       itemPriceIds: [PLAN],
       defaultItemPriceId: PLAN,
       topUpItemPriceId: PACK,
-      topUpCredits: "1000",
-      logger: { ...quietLogger, error: (o: unknown) => void errors.push(o as Record<string, unknown>) },
+      topUpCredits: "50",
+      topUpChargebeeGrants: true,
+      logger: { log() {}, warn: (o: unknown) => void r.warns.push(o as Record<string, unknown>), error: (o: unknown) => void r.errors.push(o as Record<string, unknown>) },
+      sleep,
     });
+    return { checkout, sleep };
+  }
 
-    await expect(checkout.startTopUp(TENANT)).rejects.toMatchObject({ kind: "conflict", code: "topup-misconfigured" });
-    expect(errors).toContainEqual(expect.objectContaining({ metric: "billing.topup.pack_carries_grant", itemPriceId: PACK }));
+  it("waits out the second Chargebee takes to issue the grant block, then records it — never allocates", async () => {
+    const r = await subscribed();
+    let held: GrantBlockOf<LifecycleRig> | null = null;
+    const chargeItem = vi.fn(async ({ quantity = 1 }: { quantity?: number }) => {
+      held = payWithLateGrant(r, "96", 50 * quantity);
+      return paid("96", quantity);
+    });
+    const sleep = vi.fn(async () => {
+      if (held) r.cb.blocks.push(held);
+      held = null;
+    });
+    const { checkout } = charging(r, chargeItem as never, sleep);
+
+    expect(await checkout.startTopUp(TENANT, 2)).toMatchObject({ invoice: { id: "96", status: "paid" }, quantity: 2, applied: 1, credits: "100" });
+    expect(chargeItem).toHaveBeenCalledWith({ subscriptionId: "sub_1", itemPriceId: PACK, quantity: 2 });
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([expect.objectContaining({ invoiceId: "96", source: "catalogue_grant", status: "APPLIED" })]);
+  });
+
+  it("a grant block that never shows is left for the next apply — nothing allocated in the meantime", async () => {
+    const r = await subscribed();
+    let held: GrantBlockOf<LifecycleRig> | null = null;
+    const chargeItem = vi.fn(async () => {
+      held = payWithLateGrant(r, "96", 50);
+      return paid("96");
+    });
+    const { checkout, sleep } = charging(r, chargeItem as never);
+
+    expect(await checkout.startTopUp(TENANT)).toMatchObject({ applied: 0, credits: "0" });
+    expect(sleep).toHaveBeenCalledTimes(4);
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
+    expect(r.warns).toContainEqual(expect.objectContaining({ metric: "billing.topup.grant_not_visible", invoiceId: "96" }));
+
+    r.cb.blocks.push(held!);
+    expect(await checkout.applyTopUps(TENANT)).toEqual({ applied: 1, credits: "50" });
+    expect(r.cb.allocateCalls).toHaveLength(0);
+  });
+
+  // No credits for a failed payment (2026-09-28). MEASURED: a declined card
+  // leaves the invoice `payment_due` with Chargebee's block already issued.
+  it("an invoice Chargebee could not collect grants nothing — its block is not recorded, nothing allocated, no wait", async () => {
+    const r = await subscribed();
+    const chargeItem = vi.fn(async () => {
+      r.cb.payPackWithGrant("97", { unit: UNIT, credits: 50 });
+      r.cb.paidInvoices.pop(); // issued with the invoice, but the invoice is not paid
+      return { id: "97", status: "payment_due", totalMinor: 100, amountDueMinor: 100, currencyCode: "INR", nextRetryAt: null };
+    });
+    const { checkout, sleep } = charging(r, chargeItem as never);
+
+    expect(await checkout.startTopUp(TENANT)).toEqual({
+      invoice: expect.objectContaining({ id: "97", status: "payment_due" }),
+      quantity: 1,
+      applied: 0,
+      credits: "0",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
+    expect(r.warns).toContainEqual(expect.objectContaining({ metric: "billing.topup.unpaid", invoiceId: "97" }));
+  });
+
+  it("payment_succeeded before the grant block exists is failed for redelivery, never allocated — and records it once redelivered", async () => {
+    const r = await subscribed();
+    const held = payWithLateGrant(r, "96", 50);
+    const webhooks = createWebhookService({
+      accountService: r.accounts,
+      accounts: createBillingAccountRepository(r.prisma as never),
+      topUp: { itemPriceId: PACK, creditsPerUnit: "50", chargebeeGrants: true },
+      logger: quietLogger,
+    });
+    const event = {
+      id: "ev_96",
+      event_type: "payment_succeeded",
+      content: { customer: { id: TENANT }, invoice: { id: "96", line_items: [{ entity_id: PACK }] } },
+    };
+
+    await expect(webhooks.handle(event)).rejects.toThrow(/not visible yet/);
+    expect(r.cb.allocateCalls).toHaveLength(0);
+
+    r.cb.blocks.push(held);
+    await webhooks.handle(event);
+    expect(rows(r)).toEqual([expect.objectContaining({ invoiceId: "96", source: "catalogue_grant", status: "APPLIED" })]);
+    expect(r.cb.allocateCalls).toHaveLength(0);
+  });
+});
+
+/** Pays the pack with its grant, but holds the grant block back — Chargebee has not issued it yet. */
+function payWithLateGrant(r: LifecycleRig, invoiceId: string, credits: number) {
+  r.cb.payPackWithGrant(invoiceId, { unit: UNIT, credits });
+  return r.cb.blocks.pop()!;
+}
+
+type GrantBlockOf<R extends LifecycleRig> = R["cb"]["blocks"][number];
+
+describe("payment_succeeded: a pack is granted even when the buyer closed the tab", () => {
+  const paymentSucceeded = (invoiceId: string, itemPriceId: string) => ({
+    id: `ev_${invoiceId}`,
+    event_type: "payment_succeeded",
+    content: { customer: { id: TENANT }, invoice: { id: invoiceId, line_items: [{ entity_id: itemPriceId }] } },
+  });
+
+  it("grants the paid pack — once, however often Chargebee delivers it, and whether or not the page applied it first", async () => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1", 2);
+
+    await r.deliver(paymentSucceeded("inv_1", PACK));
+    expect(rows(r)).toEqual([expect.objectContaining({ invoiceId: "inv_1", status: "APPLIED", credits: "2000" })]);
+    expect(r.cb.liveCredits("sub_1")).toBe(3000);
+
+    await r.deliver(paymentSucceeded("inv_1", PACK));
+    expect(await apply(r)).toEqual({ applied: 0, credits: "0" });
+    expect(r.cb.allocateCalls).toHaveLength(1);
+  });
+
+  it("any other payment — the plan, a renewal — grants nothing", async () => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1");
+
+    await r.deliver(paymentSucceeded("inv_2", PLAN));
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
   });
 });
 
