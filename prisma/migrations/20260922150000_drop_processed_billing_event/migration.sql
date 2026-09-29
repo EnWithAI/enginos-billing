@@ -1,0 +1,33 @@
+-- Webhook replay protection moves to Chargebee.
+--
+-- `processed_billing_event` claimed each event id before any work, which made a
+-- redelivery a no-op and recorded failures for a human to find. It is removed,
+-- and what replaces it is not a table:
+--
+--   * A redelivery of the SAME body rewrites the same values, so it converges.
+--     NOTE, because an earlier draft of this comment claimed more than is true:
+--     the webhook handlers do NOT re-read the subscription from Chargebee. They
+--     write subscription id, item price and term dates straight from the request
+--     body. Only syncFromChargebee (the pull path) re-reads. A replayed OLD body
+--     therefore rewrites the account with that body's values.
+--   * `ensureBillingCursor` is create-only — `WHERE last_processed_ingested_at
+--     IS NULL` — so a replayed activation cannot rewind billing to now() and
+--     skip everything ingested since.
+--   * `applyPaidTopUps` scans the subscription's own ledger operations for the
+--     invoice id before allocating, and `allocate` sends a
+--     `chargebee-idempotency-key`. A paid pack grants once.
+--
+-- AND ONE BEHAVIOUR CHANGE, which is the part worth knowing: a failing handler
+-- now returns 500 instead of 200. The claim row used to be the durable record
+-- that something needed attention; with no row, acknowledging a failure would
+-- drop the event silently. Chargebee retries a non-2xx and shows a permanently
+-- failing webhook in its delivery log, so that log is now the audit trail this
+-- service no longer keeps.
+--
+-- WHAT IS GENUINELY GIVEN UP: per-tenant webhook history in our own database,
+-- and the "unmapped customer" marker. Both are now only in the logs and in
+-- Chargebee's dashboard.
+--
+-- Hand-authored like the others. Apply with `prisma migrate deploy`.
+
+DROP TABLE IF EXISTS "processed_billing_event";

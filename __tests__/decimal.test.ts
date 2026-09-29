@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { add, compare, decimal, divide, multiply, scaled, subtract } from "@/lib/decimal";
+import { add, compare, decimal, divide, multiply, scaled, subtract } from "@/models/decimal";
 
 describe("decimal", () => {
   it("parses and renders without drift", () => {

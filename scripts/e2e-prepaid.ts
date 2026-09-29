@@ -5,7 +5,9 @@
  * on purpose:
  *
  *   enginos-platform :4100   registration (email token read from smtp4dev :5080)
- *   enginos-billing  :4300   internal API + Chargebee webhook
+ *   enginos-billing  :4300   internal API + Chargebee webhook, called directly
+ *                            and with no credentials, standing in for
+ *                            enginos-platform (billing authenticates no caller)
  *   LiteLLM          :4000   team budget, billing_guard hook, real LLM calls
  *   Chargebee test site      customer, subscription, top-up invoice, captures
  *   ClickHouse / Postgres    spans and billing state
@@ -19,6 +21,7 @@
  */
 
 import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -43,7 +46,6 @@ const LITELLM = env("LITELLM_BASE_URL").replace(/\/+$/, "");
 const SMTP4DEV = "http://localhost:5080";
 const CB = `https://${env("CHARGEBEE_SITE")}.chargebee.com/api/v2`;
 const RATE = Number(process.env.USD_PER_CREDIT ?? "0.001");
-const TOPUP_CREDITS = Number(process.env.TOPUP_CREDITS ?? "1000");
 const ITEM_PRICE = process.env.DEFAULT_ITEM_PRICE_ID ?? "pre-paid-test-v1-INR-Monthly";
 const TOPUP_ITEM = process.env.TOPUP_ITEM_PRICE_ID ?? "token-pack-5m-INR";
 const LITELLM_CONTAINER = "enginos-litellm";
@@ -96,8 +98,6 @@ const cb = (method: string, path: string, form?: Record<string, string | number>
 const cbGet = (path: string, query: Record<string, string | number> = {}) =>
   http("GET", `${CB}${path}?${new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]))}`, { headers: cbAuth });
 
-const internal = { Authorization: `Bearer ${env("BILLING_INTERNAL_API_KEY")}` };
-const hookAuth = (user: string, pass: string) => ({ Authorization: `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}` });
 const master = { Authorization: `Bearer ${env("LITELLM_MASTER_KEY")}` };
 
 async function team(slug: string) {
@@ -133,15 +133,30 @@ async function litellmUp() {
 
 // ── the run ─────────────────────────────────────────────────────────────────
 async function main() {
-  const { prisma } = await import("../src/lib/db");
-  const { createAccounts } = await import("../src/lib/account");
-  const { createChargebee } = await import("../src/lib/chargebee");
-  const { gatewayBudgetHooks } = await import("../src/lib/gateway");
-  const { balanceOf } = await import("../src/lib/ledger");
+  const { prisma } = await import("../src/db/prisma");
+  const { createAccountService } = await import("../src/services/account.service");
+  const { createChargebee } = await import("../src/integrations/chargebee");
+  const { gatewayBudgetHooks } = await import("../src/container/budget-hooks");
 
+  const cbClient = createChargebee();
   const account = (tenantId: string) => prisma.billingAccount.findUnique({ where: { tenantId } });
-  const grants = (tenantId: string) => prisma.creditLedgerEntry.findMany({ where: { tenantId, entryType: "grant" } });
-  const billingView = async (tenantId: string) => (await http("GET", `${BILLING}/api/internal/billing/${tenantId}`, { headers: internal })).data;
+  /** THE cursor: where the billing worker has got to, in epoch ms. */
+  const cursorAt = async (tenantId: string) =>
+    (await prisma.billingAccount.findUnique({ where: { tenantId } }))?.lastProcessedIngestedAt?.getTime() ?? null;
+  /** The newest resolved sync — what was billed, as opposed to how far we got. */
+  const lastSync = (tenantId: string) =>
+    prisma.chargebeeSync.findFirst({ where: { tenantId, status: "SUCCESS" }, orderBy: { toIngestedAt: "desc" } });
+  /** Whatever is holding the tenant, if anything. This is the sync status. */
+  const stuckRow = (tenantId: string) =>
+    prisma.chargebeeSync.findFirst({
+      where: { tenantId, status: { not: "SUCCESS" } },
+      orderBy: { fromIngestedAt: "asc" },
+    });
+  // Credits are CHARGEBEE'S. There is no local ledger to read any more, so
+  // every credit figure below comes from the same place the cap does.
+  const grantedCredits = async (subscriptionId: string) => Number((await cbClient.grantedCredits(subscriptionId)).credits);
+  const usable = async (subscriptionId: string) => Number((await cbClient.balance(subscriptionId))?.usable ?? NaN);
+  const billingView = async (tenantId: string) => (await http("GET", `${BILLING}/api/internal/billing/${tenantId}`)).data;
 
   // ── 0. preconditions ──
   log("── 0. preconditions");
@@ -198,13 +213,13 @@ async function main() {
   const view0 = await billingView(tenantId);
   check("B4", "billing page: unlinked, 0 credits", view0?.status === "unlinked" && view0?.credits?.current === "0", JSON.stringify({ status: view0?.status, credits: view0?.credits?.current }));
 
-  const earlyTopup = await http("POST", `${BILLING}/api/internal/topup`, { headers: internal, json: { tenantId, apply: true } });
+  const earlyTopup = await http("POST", `${BILLING}/api/internal/topup`, { json: { tenantId, apply: true } });
   check("B5", "top-up before subscribing refused (409 no-subscription)", earlyTopup.status === 409 && earlyTopup.data?.code === "no-subscription", `HTTP ${earlyTopup.status} ${earlyTopup.data?.code}`);
 
   // ── 3. checkout + subscription ──
   log("── 3. checkout and subscribe (Chargebee test site)");
-  const co1 = await http("POST", `${BILLING}/api/internal/checkout`, { headers: internal, json: { tenantId, itemPriceId: ITEM_PRICE } });
-  const co2 = await http("POST", `${BILLING}/api/internal/checkout`, { headers: internal, json: { tenantId, itemPriceId: ITEM_PRICE } });
+  const co1 = await http("POST", `${BILLING}/api/internal/checkout`, { json: { tenantId, itemPriceId: ITEM_PRICE } });
+  const co2 = await http("POST", `${BILLING}/api/internal/checkout`, { json: { tenantId, itemPriceId: ITEM_PRICE } });
   const cust = await cbGet(`/customers/${tenantId}`);
   check("S1", "checkout creates ONE Chargebee customer whose id is the tenant id (idempotent)", co1.status === 200 && co2.status === 200 && cust.status === 200, `checkout ${co1.status}/${co2.status}, customer ${cust.status}`);
 
@@ -234,17 +249,13 @@ async function main() {
   log("── 4. Chargebee webhook → billing → LiteLLM");
   const eventId = `ev_e2e_${run}_created`;
   const event = { id: eventId, event_type: "subscription_created", content: { subscription: subNow } };
-  const noAuth = await http("POST", `${BILLING}/api/webhooks/chargebee`, { json: event });
-  const badAuth = await http("POST", `${BILLING}/api/webhooks/chargebee`, { headers: hookAuth(env("CHARGEBEE_WEBHOOK_USER"), "wrong"), json: event });
-  check("W1", "webhook without / with wrong credentials refused", noAuth.status === 401 && badAuth.status === 401, `${noAuth.status}/${badAuth.status}`);
-
-  const hook = await http("POST", `${BILLING}/api/webhooks/chargebee`, { headers: hookAuth(env("CHARGEBEE_WEBHOOK_USER"), env("CHARGEBEE_WEBHOOK_PASSWORD")), json: event });
+  const hook = await http("POST", `${BILLING}/api/webhooks/chargebee`, { json: event });
   check("W2", "subscription_created webhook accepted", hook.status === 200 && hook.data?.handled !== false, JSON.stringify(hook.data));
 
   const acct1 = await account(tenantId);
-  const g1 = await grants(tenantId);
-  const bought = g1.reduce((s, e) => s + Number(e.deltaCredits), 0);
-  check("W3", "account active with the granted credits in the ledger", acct1?.status === "active" && g1.length === 1 && bought > 0, `status=${acct1?.status} grants=${g1.length} credits=${bought}`);
+  const bought = await grantedCredits(subscriptionId);
+  const startCursor = await cursorAt(tenantId);
+  check("W3", "account active, Chargebee holds the grant, and the billing cursor is set", acct1?.status === "active" && bought > 0 && startCursor != null, `status=${acct1?.status} credits=${bought} cursor=${startCursor ? new Date(startCursor).toISOString() : "none"}`);
   const baseline = Number((await team(slug))?.metadata.billing_spend_baseline ?? NaN);
   t = await team(slug);
   const expectedCap = (credits: number) => Math.round((baseline + credits * RATE) * 1e6) / 1e6;
@@ -252,16 +263,22 @@ async function main() {
   call = await llm(slug);
   check("W5", "LLM call now allowed", call.status === 200, `HTTP ${call.status} ${call.message.slice(0, 80)}`);
 
-  const dup = await http("POST", `${BILLING}/api/webhooks/chargebee`, { headers: hookAuth(env("CHARGEBEE_WEBHOOK_USER"), env("CHARGEBEE_WEBHOOK_PASSWORD")), json: event });
-  check("W6", "duplicate webhook delivery is a no-op", dup.data?.duplicate === true && (await grants(tenantId)).length === 1, JSON.stringify(dup.data));
+  const cursorBeforeDup = (await cursorAt(tenantId))!;
+  const dup = await http("POST", `${BILLING}/api/webhooks/chargebee`, { json: event });
+  // The replay hazard is no longer a second grant — Chargebee owns those — but
+  // a cursor restarted at now(), which would silently skip everything ingested
+  // in between. `ensureBillingCursor` is create-only for exactly this. Nothing
+  // marks a replay as one any more (the claim row is gone) — it is acknowledged
+  // like any delivery — so what is checked is that it changed nothing.
+  const creditsAfterDup = await grantedCredits(subscriptionId);
+  check("W6", "duplicate webhook delivery is a no-op and does not rewind the cursor", dup.status === 200 && dup.data?.received === true && (await cursorAt(tenantId)) === cursorBeforeDup && creditsAfterDup === bought, `HTTP ${dup.status} ${JSON.stringify(dup.data)} credits=${creditsAfterDup}/${bought}`);
 
   // The customer's browser calls this right after checkout, while Chargebee
   // also sends the webhook: both paths fire for the same term in production.
-  const syncAfter = await http("POST", `${BILLING}/api/internal/sync-subscription`, { headers: internal, json: { tenantId } });
-  const g2 = await grants(tenantId);
-  const allocated2 = g2.reduce((s, e) => s + Number(e.deltaCredits), 0);
+  const syncAfter = await http("POST", `${BILLING}/api/internal/sync-subscription`, { json: { tenantId } });
+  const allocated2 = await grantedCredits(subscriptionId);
   t = await team(slug);
-  check("W7", "webhook + post-checkout sync for the SAME term grant once (no double credits)", syncAfter.status === 200 && allocated2 === bought && t?.maxBudget === expectedCap(bought), `grants=${g2.length} [${g2.map((e) => `${e.sourceRef}:${Number(e.deltaCredits)}`).join(", ")}] cap=${t?.maxBudget}`);
+  check("W7", "webhook + post-checkout sync for the SAME term set ONE cap (no double credits)", syncAfter.status === 200 && allocated2 === bought && t?.maxBudget === expectedCap(bought), `credits=${allocated2} cap=${t?.maxBudget}`);
 
   // ── 5. usage → ClickHouse → capture ──
   log("── 5. usage is metered and billed");
@@ -281,47 +298,49 @@ async function main() {
     return Number(rows[0]?.n ?? 0) >= realCalls + 1 ? Number(rows[0]!.n) : null;
   }, 240_000, 10_000);
   check("U2", "LiteLLM spans routed to the tenant's ClickHouse DB", !!spans, `${spans ?? 0} costed spans (incl. 1 cache hit)`);
-  const captured = await waitFor("captured usage", async () => prisma.usageSyncBatch.findFirst({ where: { tenantId, status: "captured", spanCount: { gt: 0 } }, orderBy: { createdAt: "desc" } }), 300_000, 10_000);
-  check("U3", "worker captured usage events against Chargebee", !!captured, captured ? `spans=${captured.spanCount} credits=${captured.consumeCredits}` : "none within 5 min");
-  if (captured) {
-    const op = await cbGet(`/ledger_operations/${captured.id}`);
-    check("U4", "Chargebee holds the capture under the batch id", op.status === 200 && String(op.data?.ledger_operation?.type).includes("capture"), `HTTP ${op.status}`);
-    const entry = await prisma.creditLedgerEntry.findFirst({ where: { tenantId, sourceRef: captured.id } });
-    check("U5", "ledger consume entry recorded", entry?.entryType === "consume", `${entry?.deltaCredits}`);
-  }
+  const usableBeforeUsage = await usable(subscriptionId);
+  // Two separate things to see, because they are two separate mechanisms now:
+  // the cursor moved (worker progress) and a SUCCESS row covers the range
+  // (what Chargebee was told).
+  const moved = await waitFor("billing advanced past the usage", async () => {
+    const at = await cursorAt(tenantId);
+    return at && at > startCursor! ? at : null;
+  }, 300_000, 10_000);
+  const billed = await lastSync(tenantId);
+  check("U3", "worker billed the usage, and the cursor moved with it", !!moved && billed?.status === "SUCCESS" && billed.eventCount > 0, billed ? `to=${billed.toIngestedAt.toISOString()} amount=${billed.amount} events=${billed.eventCount}` : "billing did not move within 5 min");
+  const ops = await cbClient.ledgerOperations(subscriptionId, 50);
+  const captures = ops.filter((o) => String(o.type ?? "").includes("capture"));
+  check("U4", "Chargebee holds the captures, under ids the worker generated", captures.length > 0, `${captures.length} capture operation(s)`);
+  check("U5", "nothing is left holding the tenant once a capture settles", (await stuckRow(tenantId)) === null, `stuck=${(await stuckRow(tenantId))?.status ?? "none"}`);
   const spendAfter = await waitFor("team spend attributed", async () => { const s = (await team(slug))?.spend ?? 0; return s > before5 ? s : null; }, 60_000, 5000);
   check("U6", "master-key spend counted against the team (guard attribution)", !!spendAfter, `spend ${before5} → ${spendAfter}`);
   t = await team(slug);
   check("U7", "platform reconciler left the prepaid cap alone (> 60 s later)", t?.maxBudget === expectedCap(allocated2), `max=${t?.maxBudget}`);
 
-  // Chargebee and LiteLLM must run down at the same rate, or one runs out first.
-  const settledUsage = await waitFor("every real call billed", async () => {
-    const rows = await prisma.usageSyncBatch.findMany({ where: { tenantId, status: "captured" } });
-    const spansBilled = rows.reduce((s: number, b: { spanCount: bigint }) => s + Number(b.spanCount), 0);
-    return spansBilled >= realCalls ? rows : null;
-  }, 300_000, 10_000);
-  const billedUsd = (settledUsage ?? []).reduce((s: number, b: { billedUsd: unknown }) => s + Number(b.billedUsd), 0);
-  const spansBilled = (settledUsage ?? []).reduce((s: number, b: { spanCount: bigint }) => s + Number(b.spanCount), 0);
-  await sleep(15_000); // LiteLLM flushes team spend in batches
-  const litellmSpend = (await team(slug))?.spend ?? 0;
-  check("U8", "cache hit NOT billed: spans billed = real provider calls", spansBilled === realCalls, `${spansBilled} billed of ${realCalls} real + 1 cached`);
-  check("U9", "Chargebee drawdown equals LiteLLM team spend", Math.abs(billedUsd - (litellmSpend - baseline)) < 1e-9, `billed $${billedUsd} vs LiteLLM $${litellmSpend - baseline}`);
-
-  // The cursor: one idempotency key per billed span, and the cursor at or past
-  // every capture it settled — else the next read would charge that usage again.
-  const keys = await prisma.billedUsageEvent.findMany({ where: { tenantId, batchId: { in: (settledUsage ?? []).map((b: { id: string }) => b.id) } } });
-  check("K1", "one event key per billed span (TraceId:SpanId), none twice", keys.length === spansBilled && new Set(keys.map((k: { eventKey: string }) => k.eventKey)).size === keys.length, `${keys.length} keys for ${spansBilled} spans`);
-  const cur = await prisma.billingCursor.findUnique({ where: { tenantId } });
-  const behind = (settledUsage ?? []).filter((b: { cursorToAt: Date | null; cursorToEventId: string | null }) =>
-    b.cursorToAt && cur && (b.cursorToAt > cur.lastProcessedAt || (b.cursorToAt.getTime() === cur.lastProcessedAt.getTime() && (b.cursorToEventId ?? "") > cur.lastEventId)));
-  check("K2", "cursor is at or past every settled capture", !!cur && behind.length === 0, `cursor ${cur?.lastProcessedAt.toISOString()} / '${cur?.lastEventId}', ${behind.length} capture(s) ahead of it`);
+  // Chargebee and LiteLLM must run down at the same rate, or one runs out
+  // first. This is also what proves the cache hit was not billed: LiteLLM
+  // records spend 0 for it, so any drawdown for it would show up as a gap.
   const lagMs = Number(process.env.BILLING_LAG_MS ?? 120_000);
-  const tracking = await waitFor("cursor tracks safe_until", async () => {
-    const c = await prisma.billingCursor.findUnique({ where: { tenantId } });
-    const gap = c ? Date.now() - c.lastProcessedAt.getTime() : Infinity;
-    return gap >= lagMs - 5_000 && gap <= lagMs + 150_000 ? gap : null;
-  }, 150_000, 5000);
-  check("K3", "idle cursor follows now − lag (empty ticks advance it)", !!tracking, `now − cursor = ${tracking ? Math.round(tracking / 1000) : "?"} s, lag ${lagMs / 1000} s`);
+  await sleep(Math.max(lagMs, 30_000) + 90_000); // let the last span age past the lag and be swept
+  await sleep(15_000); // LiteLLM flushes team spend in batches
+  const usableAfterUsage = await usable(subscriptionId);
+  const litellmSpend = (await team(slug))?.spend ?? 0;
+  const drawdownUsd = (usableBeforeUsage - usableAfterUsage) * RATE;
+  check("U8", "Chargebee drawdown equals LiteLLM team spend — and no cache hit was billed", Math.abs(drawdownUsd - (litellmSpend - baseline)) < 1e-6, `Chargebee $${drawdownUsd} vs LiteLLM $${litellmSpend - baseline}`);
+
+  // The cursor must be at or past every costed span old enough to have been
+  // read, or the next read would charge that usage again — or never.
+  const maxIngested = await clickhouse(`SELECT max(toUnixTimestamp64Milli(ingested_at)) AS m FROM tenant_${slug}.span_nodes FINAL WHERE SpanName = 'litellm_request' AND attrs['gen_ai.cost.total_cost'] != '' AND JSONExtractString(attrs['hidden_params'], 'cache_key') = '' AND ingested_at <= now64(3) - INTERVAL ${Math.ceil(lagMs / 1000)} SECOND`);
+  const newest = Number(maxIngested[0]?.m ?? 0);
+  const cur = await cursorAt(tenantId);
+  check("K1", "billing is at or past every span old enough to have been read", !!cur && !!newest && cur >= newest, `at ${cur ? new Date(cur).toISOString() : "none"} vs newest readable span ${new Date(newest).toISOString()}`);
+  // The cursor is a TIME and is allowed to stand ahead of the newest span: an
+  // empty window is resolved by having been read, not by having found
+  // something. What it must never do is stand ahead of `now − lag`.
+  check("K2", "the cursor never runs ahead of the safe processing time", !!cur && cur <= Date.now() - lagMs + 5_000, `cursor=${cur ? new Date(cur).toISOString() : "none"} safe=${new Date(Date.now() - lagMs).toISOString()}`);
+  const idleBefore = await prisma.chargebeeSync.count({ where: { tenantId } });
+  await sleep(90_000); // two idle ticks
+  check("K3", "an idle tick writes no row at all, and still moves the cursor", (await prisma.chargebeeSync.count({ where: { tenantId } })) === idleBefore && (await cursorAt(tenantId))! >= cur!, `${idleBefore} sync rows before and after`);
 
   // ── 6. LiteLLM down while a top-up lands ──
   log("── 6. LiteLLM outage during a top-up budget update");
@@ -332,7 +351,7 @@ async function main() {
 
   execSync(`docker stop ${LITELLM_CONTAINER}`, { stdio: "ignore" });
   log("LiteLLM stopped");
-  const topup = await http("POST", `${BILLING}/api/internal/topup`, { headers: internal, json: { tenantId, apply: true } });
+  const topup = await http("POST", `${BILLING}/api/internal/topup`, { json: { tenantId, apply: true } });
   const acct2 = await account(tenantId);
   check("O2", "top-up applied, account held 'activating' (push failed)", topup.status === 200 && topup.data?.applied === 1 && acct2?.status === "activating", `HTTP ${topup.status} ${JSON.stringify(topup.data)} status=${acct2?.status}`);
   const view2 = await billingView(tenantId);
@@ -341,7 +360,7 @@ async function main() {
   execSync(`docker start ${LITELLM_CONTAINER}`, { stdio: "ignore" });
   check("O4", "LiteLLM back up", !!(await litellmUp()));
   const active = await waitFor("worker re-activation", async () => (await account(tenantId))?.status === "active", 150_000, 5000);
-  const allocated3 = Number((await balanceOf(tenantId, prisma)).allocated);
+  const allocated3 = await grantedCredits(subscriptionId);
   t = await team(slug);
   check("O5", "per-minute retry activated it: cap raised by the top-up, unblocked", !!active && t?.maxBudget === expectedCap(allocated3) && !t.blocked, JSON.stringify({ status: (await account(tenantId))?.status, max: t?.maxBudget, expected: expectedCap(allocated3), allocated: allocated3 }));
   check("O6", "LLM call allowed again", (await llm(slug)).status === 200);
@@ -349,7 +368,7 @@ async function main() {
   // ── 7. push fails but the block lands (fault injected at the push only) ──
   log("── 7. budget push fails, block succeeds");
   const hooks = gatewayBudgetHooks();
-  const faulty = createAccounts({
+  const faulty = createAccountService({
     chargebee: createChargebee(),
     usdPerCredit: String(RATE),
     logger: { log() {}, warn() {}, error() {} },
@@ -368,38 +387,48 @@ async function main() {
 
   // ── 8. capture response lost: recovery must not charge twice ──
   log("── 8. capture landed but its response was lost");
-  // A worker that dies between Chargebee's reply and the settle leaves its
-  // lease on the cursor and its capture pending. Reproduce exactly that: take
-  // the lease as a dead worker would, record the capture, send it, never settle.
-  const leaseMs = 30_000;
-  const leased = await waitFor("tenant lease free, nothing pending", async () => {
-    if (await prisma.usageSyncBatch.findFirst({ where: { tenantId, status: "pending" } })) return null;
-    const now = new Date();
-    const r = await prisma.billingCursor.updateMany({
-      where: { tenantId, OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }] },
-      data: { lockedUntil: new Date(now.getTime() + leaseMs), lockedBy: `e2e-dead-worker-${run}` },
-    });
-    return r.count === 1 ? now : null;
-  }, 120_000, 2000);
-  check("L0", "dead worker holds the tenant's cursor lease", !!leased);
-  const at = (await prisma.billingCursor.findUnique({ where: { tenantId } }))!;
+  // A worker that dies between Chargebee's reply and its own UPDATE leaves the
+  // row PROCESSING under an operation id that HAS been on the wire. Reproduce
+  // exactly that: write the row as the worker does, capture under its id, and
+  // never move the cursor.
+  const leased = await waitFor("nothing holding the tenant", async () => (await stuckRow(tenantId)) === null, 120_000, 2000);
+  check("L0", "tenant is clear before the fault is injected", !!leased);
+
+  const at = (await cursorAt(tenantId))!;
   const acct3 = (await account(tenantId))!;
-  const cbClient = createChargebee();
-  const usableBefore = Number((await cbClient.balance(acct3.chargebeeSubscriptionId!))?.usable ?? NaN);
-  // cursorTo = where the cursor already is: the capture's usage is behind it.
-  const lost = await prisma.usageSyncBatch.create({
-    data: { tenantId, chargebeeSubscriptionId: acct3.chargebeeSubscriptionId, ledgerUnitId: acct3.ledgerUnitId, windowStart: at.lastProcessedAt, windowEnd: at.lastProcessedAt, cursorToAt: at.lastProcessedAt, cursorToEventId: at.lastEventId, spanCount: BigInt(1), billedUsd: "0.0005", providerUsd: "0.0005", marginUsd: "0", consumeCredits: "0.5", status: "pending" },
+  const usableBefore = await usable(acct3.chargebeeSubscriptionId!);
+  // A sync row left PROCESSING — exactly what a worker that died between
+  // Chargebee's reply and its own UPDATE leaves behind. The window starts where
+  // the cursor already is, so recovery is observable without inventing usage
+  // that never happened.
+  const lostId = randomUUID();
+  await prisma.chargebeeSync.create({
+    data: {
+      id: lostId,
+      tenantId,
+      chargebeeSubscriptionId: acct3.chargebeeSubscriptionId,
+      ledgerUnitId: acct3.ledgerUnitId,
+      fromIngestedAt: new Date(at),
+      toIngestedAt: new Date(at + 1),
+      eventCount: 1,
+      amount: "0.5",
+      billedUsd: "0.0005",
+      status: "PROCESSING",
+    },
   });
-  const landed = await cbClient.capture({ id: lost.id, subscriptionId: acct3.chargebeeSubscriptionId!, unitId: acct3.ledgerUnitId!, amount: "0.5" });
-  check("L1", "capture landed in Chargebee (response 'lost' — batch left pending)", landed.kind === "captured", landed.kind);
-  await sleep(10_000);
-  check("L4", "worker leaves a leased tenant alone (lease not yet expired)", (await prisma.usageSyncBatch.findUnique({ where: { id: lost.id } }))?.status === "pending");
-  const settled = await waitFor("recovery", async () => { const b = await prisma.usageSyncBatch.findUnique({ where: { id: lost.id } }); return b?.status === "captured" ? b : null; }, 150_000, 5000);
-  const usableAfter = Number((await cbClient.balance(acct3.chargebeeSubscriptionId!))?.usable ?? NaN);
-  check("L2", "lease expired; worker recovered the capture by looking it up, not re-sending", settled?.chargebeeOperationId === lost.id, `status=${settled?.status}`);
-  check("L3", "Chargebee balance dropped by exactly 0.5 (charged once)", Math.abs(usableBefore - usableAfter - 0.5) < 1e-6, `usable ${usableBefore} → ${usableAfter}`);
-  const lostEntries = await prisma.creditLedgerEntry.count({ where: { tenantId, sourceRef: lost.id } });
-  check("L5", "exactly one ledger consume entry for the recovered capture", lostEntries === 1, `${lostEntries}`);
+  const landed = await cbClient.capture({ id: lostId, subscriptionId: acct3.chargebeeSubscriptionId!, unitId: acct3.ledgerUnitId!, amount: "0.5" });
+  check("L1", "capture landed in Chargebee (response 'lost' — the row left PROCESSING)", landed.kind === "captured", landed.kind);
+
+  const settled = await waitFor("recovery", async () => {
+    const row = await prisma.chargebeeSync.findUnique({ where: { id: lostId } });
+    return row && row.status === "SUCCESS" ? row : null;
+  }, 150_000, 5000);
+  const usableAfterLost = await usable(acct3.chargebeeSubscriptionId!);
+  check("L2", "the worker resolved the id by looking it up, not by re-sending", settled?.status === "SUCCESS" && settled.settledAt != null, `status=${settled?.status}`);
+  check("L4", "and it retried the SAME row rather than opening a second one", (await prisma.chargebeeSync.count({ where: { tenantId, fromIngestedAt: new Date(at) } })) === 1);
+  check("L3", "Chargebee balance dropped by exactly 0.5 (charged once)", Math.abs(usableBefore - usableAfterLost - 0.5) < 1e-6, `usable ${usableBefore} → ${usableAfterLost}`);
+  const lostOps = (await cbClient.ledgerOperations(acct3.chargebeeSubscriptionId!, 100)).filter((o) => String(o.id) === lostId);
+  check("L5", "exactly one Chargebee operation exists under the recovered id", lostOps.length === 1, `${lostOps.length}`);
 
   // ── 9. Chargebee credits run out ──
   log("── 9. Chargebee credits run out before the LiteLLM cap");
@@ -417,26 +446,29 @@ async function main() {
   check("X4", "requests refused: 402 credits used up", call.status === 402 && /used all of its prepaid credits/i.test(call.message), `HTTP ${call.status} ${call.message.slice(0, 80)}`);
   const view3 = await billingView(tenantId);
   check("X5", "billing page shows exhausted", view3?.status === "exhausted", `status=${view3?.status}`);
-  const held = await prisma.usageSyncBatch.findFirst({ where: { tenantId, status: "failed", lastError: { startsWith: "insufficient credits" } } });
-  log(`held capture (Chargebee refused for balance): ${held ? held.id : "none — the unit allowed overdraft"}`);
-  if (held) {
-    const c = await prisma.billingCursor.findUnique({ where: { tenantId } });
-    check("X9", "cursor did not move past the refused capture", !!c && !!held.cursorToAt && c.lastProcessedAt < held.cursorToAt, `cursor ${c?.lastProcessedAt.toISOString()} < capture end ${held.cursorToAt?.toISOString()}`);
-  }
+  // Usage incurred while the balance is empty. Chargebee refuses it, so the
+  // cursor must stay exactly where it is — that, and nothing else, is what
+  // keeps the usage: there is no held batch to requeue any more.
+  const cursorWhenExhausted = (await cursorAt(tenantId))!;
+  await sleep(Math.max(lagMs, 30_000) + 120_000); // let a refused sweep run at least once
+  const refused = await stuckRow(tenantId);
+  check("X9", "billing did not move past usage Chargebee refused, and says why", (await cursorAt(tenantId)) === cursorWhenExhausted && refused?.status === "OUT_OF_CREDITS", `status=${refused?.status} attempts=${refused?.attemptCount} error=${refused?.error?.slice(0, 60)}`);
 
   const inv2 = (await cb("POST", "/invoices/create_for_charge_items_and_charges", { customer_id: tenantId, "item_prices[item_price_id][0]": TOPUP_ITEM, "item_prices[quantity][0]": 1, auto_collection: "off" })).data?.invoice;
   if (inv2?.id && inv2.amount_due > 0) await cb("POST", `/invoices/${inv2.id}/record_payment`, { "transaction[amount]": inv2.amount_due, "transaction[payment_method]": "cash", "transaction[date]": Math.floor(Date.now() / 1000) });
-  const topup2 = await http("POST", `${BILLING}/api/internal/topup`, { headers: internal, json: { tenantId, apply: true } });
+  const topup2 = await http("POST", `${BILLING}/api/internal/topup`, { json: { tenantId, apply: true } });
   t = await team(slug);
   check("X6", "top-up reopens it: active, unblocked, reason cleared", topup2.data?.applied === 1 && (await account(tenantId))?.status === "active" && !t?.blocked && t?.metadata.billing_block_reason === undefined, JSON.stringify({ topup: topup2.data, status: (await account(tenantId))?.status, blocked: t?.blocked }));
   check("X7", "requests allowed again after the top-up", (await llm(slug)).status === 200);
-  if (held) {
-    const recaptured = await waitFor("held capture settled", async () => { const b = await prisma.usageSyncBatch.findUnique({ where: { id: held.id } }); return b?.status === "captured" ? b : null; }, 180_000, 10_000);
-    const op = await cbGet(`/ledger_operations/${held.id}`);
-    check("X8", "the refused capture was requeued and charged once", !!recaptured && op.status === 200, `status=${recaptured?.status} op=${op.status}`);
-    const c = await prisma.billingCursor.findUnique({ where: { tenantId } });
-    check("X10", "cursor advanced past it only once it was charged", !!c && !!recaptured?.cursorToAt && c.lastProcessedAt >= recaptured.cursorToAt, `cursor ${c?.lastProcessedAt.toISOString()}`);
-  }
+  // The retained usage needs no requeueing: it is still in ClickHouse in front
+  // of a cursor that never moved past it, so the next ordinary tick bills it.
+  const recovered = await waitFor("retained usage billed after the top-up", async () => {
+    const c = await cursorAt(tenantId);
+    return c && c > cursorWhenExhausted ? c : null;
+  }, 240_000, 10_000);
+  const settledRefusal = refused ? await prisma.chargebeeSync.findUnique({ where: { id: refused.id } }) : null;
+  check("X8", "the refused sync settled once credits returned — SAME row, no requeue step", !!recovered && (refused ? settledRefusal?.status === "SUCCESS" : true), `${new Date(cursorWhenExhausted).toISOString()} → ${recovered ? new Date(recovered).toISOString() : "unmoved"}`);
+  check("X10", "and nothing is left holding the tenant", (await stuckRow(tenantId)) === null);
 
   // ── 10. cancellation ──
   // Chargebee refuses an immediate cancel for a subscription with credit
@@ -445,7 +477,7 @@ async function main() {
   const cancel = await cb("POST", `/subscriptions/${subscriptionId}/cancel_for_items`, { end_of_term: "true" });
   check("C0", "Chargebee schedules the cancellation for term end", cancel.status === 200 && cancel.data?.subscription?.status === "non_renewing", `HTTP ${cancel.status} ${cancel.data?.subscription?.status ?? cancel.data?.message}`);
   const cancelled = { ...(cancel.data?.subscription ?? subNow), status: "cancelled" }; // as delivered at term end
-  const cancelHook = await http("POST", `${BILLING}/api/webhooks/chargebee`, { headers: hookAuth(env("CHARGEBEE_WEBHOOK_USER"), env("CHARGEBEE_WEBHOOK_PASSWORD")), json: { id: `ev_e2e_${run}_cancelled`, event_type: "subscription_cancelled", content: { subscription: cancelled } } });
+  const cancelHook = await http("POST", `${BILLING}/api/webhooks/chargebee`, { json: { id: `ev_e2e_${run}_cancelled`, event_type: "subscription_cancelled", content: { subscription: cancelled } } });
   t = await team(slug);
   check("C1", "term-end webhook: account cancelled, team handed back to the plan", cancelHook.status === 200 && (await account(tenantId))?.status === "cancelled" && t?.metadata.billing_managed === undefined, JSON.stringify({ hook: cancelHook.data, status: (await account(tenantId))?.status, managed: t?.metadata.billing_managed }));
   const reset = await waitFor("platform reconciler resets cap to $0", async () => (await team(slug))?.maxBudget === 0, 120_000, 5000);

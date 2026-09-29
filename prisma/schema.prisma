@@ -9,6 +9,39 @@
 // managed from here. `tenant_id` and `routing_slug` are carried as plain
 // columns with no Prisma relation, so `prisma migrate` can never propose a
 // change to a table this service does not own.
+//
+// TWO tables carry usage billing, and this is the whole of it:
+//
+//   billing_account   which Chargebee customer/subscription a tenant is, AND
+//                     how far the billing worker has got: the cursor
+//   chargebee_sync    one row per billing window: the range it covers, what was
+//                     sent, and what Chargebee said about it
+//
+// A third, `topup_grant`, is not usage billing: it is the idempotency record
+// that grants each paid top-up invoice once. Chargebee keeps nothing that ties
+// an allocation to the invoice it paid for, so this is the one fact about
+// credits the service has to remember itself — see the model below.
+//
+// Chargebee owns the money. There is no credit ledger here, no balance and no
+// billed-event table: the customer's credits, grants, top-ups and consumption
+// live in Chargebee and are read from it.
+//
+// The two responsibilities are deliberately separate, and this is the design:
+//
+//   billing_account.last_processed_ingested_at   WHERE THE WORKER IS
+//   chargebee_sync.status                        WHAT CHARGEBEE SAID
+//
+// The cursor is the worker's progress checkpoint and nothing else — not a
+// Chargebee status, not a payment status, not an event id. It only moves once
+// the window in front of it has been resolved, which is what makes a restart
+// safe: whatever the cursor says is unfinished gets picked up again.
+//
+// There is no webhook table. `processed_billing_event` claimed each Chargebee
+// event id before acting, and it is gone. Every subscription event is only a
+// trigger: the handler re-reads the customer's subscriptions from Chargebee and
+// applies what Chargebee says now (services/webhook.service.ts), so a
+// redelivery, a late event and a replayed OLD body all converge on the same
+// state, and the cursor is create-only so none of them can rewind it.
 
 generator client {
   provider      = "prisma-client-js"
@@ -22,8 +55,13 @@ datasource db {
   directUrl = env("DATABASE_DIRECT_URL")
 }
 
-/// One row per tenant. The Chargebee customer id is the external identity key;
-/// `tenant_id` remains the local primary key, unchanged from the platform's model.
+/// One row per tenant: the mapping between our tenant and Chargebee, plus the
+/// billing worker's position. Every field here is either an identifier a
+/// Chargebee call needs, something the billing page renders, or the cursor.
+///
+/// Deliberately absent: `granted_credits`, `budget_usd`, `cached_balance_*`,
+/// `sync_from`. Credit state is Chargebee's; a copy of it here is a second
+/// source of truth that can only ever be wrong.
 model BillingAccount {
   /// FK to master `tenants.tenant_id` — declared as a plain column, not a
   /// Prisma relation, because this service does not own that table.
@@ -31,7 +69,8 @@ model BillingAccount {
 
   /// Denormalised from `org_llm_gateways.routing_slug`. Carried here rather
   /// than joined because the gateway row is created fail-open and may be
-  /// absent entirely, and because this is the key the ClickHouse query needs.
+  /// absent entirely, and because this is the key the ClickHouse query needs:
+  /// `tenant_<routing_slug>.span_nodes`.
   routingSlug String @unique @map("routing_slug") @db.VarChar(100)
 
   /// We supply the Chargebee customer id ourselves (the tenant UUID) rather
@@ -40,209 +79,239 @@ model BillingAccount {
   /// second customer for the same tenant.
   chargebeeCustomerId String? @unique @map("chargebee_customer_id") @db.VarChar(100)
 
-  /// Null until the tenant subscribes. Unique: one active subscription per
-  /// tenant in v1 — splitting one span stream across two subscriptions needs
-  /// an allocation rule that is a pricing decision, not a technical one.
+  /// The subscription usage is billed against. WHICH subscription that is, when
+  /// the customer has several, is a business decision made in
+  /// `lib/subscription.ts` — the database only stores the answer.
   chargebeeSubscriptionId String? @unique @map("chargebee_subscription_id") @db.VarChar(100)
 
+  /// The item price the subscription was created from; it carries the Credit
+  /// Grant configuration. Rendered on the billing page.
   chargebeeItemPriceId String? @map("chargebee_item_price_id") @db.VarChar(100)
 
   /// The credit unit from `ledger_account_balances.unit_id`, e.g. "token".
+  /// Required on every capture call, so it is cached here rather than fetched
+  /// once a minute per tenant.
   ledgerUnitId String? @map("ledger_unit_id") @db.VarChar(50)
-
-  /// Current grant, mirrored from Chargebee `grant_blocks`. Recomputed whole
-  /// on renewal rather than incremented, so a correction in Chargebee converges.
-  grantedCredits Decimal @default(0) @map("granted_credits") @db.Decimal(20, 10)
-
-  /// grantedCredits x USD_PER_CREDIT — what we pushed to LiteLLM as max_budget.
-  /// Stored so a drift check can compare intent against the gateway's actual state.
-  budgetUsd Decimal @default(0) @map("budget_usd") @db.Decimal(20, 10)
-
-  /// Display cache only. The authoritative balance is SUM(delta) over the
-  /// ledger; this exists so a page render does not need an aggregate.
-  cachedBalanceCredits Decimal?  @map("cached_balance_credits") @db.Decimal(20, 10)
-  cachedBalanceAt      DateTime? @map("cached_balance_at") @db.Timestamptz()
 
   /// Billing contact on the Chargebee customer. Captured at provisioning from
   /// the admin email, because no User row exists yet at that point.
   billingEmail String? @map("billing_email") @db.VarChar(320)
 
+  /// Is this org put on the free plan? Null follows FREE_PLAN_DEFAULT. An org
+  /// it is not for is offered the paid plans instead, and cannot check out the
+  /// free one. Set by an operator (POST /api/internal/free-plan) and never by
+  /// the org itself. Deciding who is PUT on the free plan is all it does: an
+  /// org already on it keeps its subscription when this is turned off.
+  freePlan Boolean? @map("free_plan")
+
+  /// Mirrored from the subscription for display, and for the expiry date a
+  /// top-up allocation requires.
   currentTermStart DateTime? @map("current_term_start") @db.Timestamptz()
   currentTermEnd   DateTime? @map("current_term_end") @db.Timestamptz()
 
   /// unlinked | activating | active | cancelled | exhausted
+  ///
+  /// Operational state, not financial state: which of them the gateway should
+  /// be enforcing and what the page should say. The credit figures behind
+  /// `exhausted` come from Chargebee, never from here.
   status String @default("unlinked") @db.VarChar(20)
 
-  /// Never bill usage before this instant. Set when the subscription starts,
-  /// and set to now() when backfilling an existing tenant — the ClickHouse
-  /// tenant tables hold 90 days of spans, and billing them all on day one
-  /// would be a catastrophe.
-  syncFrom DateTime @map("sync_from") @db.Timestamptz()
+  /// THE BILLING CURSOR — `span_nodes.ingested_at` up to which this tenant is
+  /// fully billed. The next window starts here.
+  ///
+  /// It is the worker's progress checkpoint and NOTHING else: not a Chargebee
+  /// status, not a payment status, not an event id. It moves only when the
+  /// window in front of it has been resolved, so a worker that crashes
+  /// mid-window finds the cursor still behind that window on restart and
+  /// resolves it rather than skipping it.
+  ///
+  /// Null until the tenant subscribes. Set to now() at activation rather than
+  /// left at epoch, because ClickHouse holds 90 days of spans and a cursor at
+  /// zero would invoice a quarter of free-plan usage on the first tick.
+  ///
+  /// Millisecond precision to match `ingested_at`, which is DateTime64(3).
+  lastProcessedIngestedAt DateTime? @map("last_processed_ingested_at") @db.Timestamptz(3)
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
 
-  ledgerEntries CreditLedgerEntry[]
-  batches       UsageSyncBatch[]
-  cursor        BillingCursor?
-  billedEvents  BilledUsageEvent[]
+  syncs  ChargebeeSync[]
+  topUps TopUpGrant[]
 
   @@index([status])
   @@map("billing_account")
 }
 
-/// Where usage billing has reached for a tenant — the ONE record of progress.
-/// A position in ClickHouse span_nodes order: (ingested_at, TraceId:SpanId).
-/// It moves only after the events before it are captured and in the ledger.
-model BillingCursor {
-  tenantId String         @id @map("tenant_id") @db.Uuid
-  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
-
-  lastProcessedAt DateTime @map("last_processed_at") @db.Timestamptz(3)
-  /// Tie-break for events sharing lastProcessedAt; "" = before any of them.
-  lastEventId     String   @default("") @map("last_event_id") @db.VarChar(200) // COLLATE "C" in SQL: byte order, as ClickHouse
-
-  /// Tenant lease: one worker per tenant at a time (see usage-sync.ts).
-  lockedUntil DateTime? @map("locked_until") @db.Timestamptz(3)
-  lockedBy    String?   @map("locked_by") @db.VarChar(100)
-
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
-
-  @@map("billing_cursor")
-}
-
-/// One row per usage event assigned to a capture. The key is deterministic
-/// (TraceId:SpanId), so reading a range twice — or a span the collector
-/// re-sent, which lands again with a later ingested_at — cannot charge twice.
-model BilledUsageEvent {
-  tenantId String         @map("tenant_id") @db.Uuid
-  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
-  eventKey String         @map("event_key") @db.VarChar(200)
-
-  /// The capture that charged it; null for events billed before the cursor existed.
-  batchId String?         @map("batch_id") @db.Uuid
-  batch   UsageSyncBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
-
-  ingestedAt DateTime @map("ingested_at") @db.Timestamptz(3)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-
-  @@id([tenantId, eventKey])
-  @@index([tenantId, ingestedAt], map: "billed_usage_event_ingested_idx")
-  @@map("billed_usage_event")
-}
-
-/// Append-only. Balance is SUM(delta_credits) — there is no mutable counter
-/// anywhere in this design, which is what makes the audit trail trustworthy
-/// and a replay safe.
-model CreditLedgerEntry {
+/// One row per billing window: the ClickHouse range it covers, the usage found
+/// in it, and what Chargebee said when it was sent.
+///
+/// The id is ALSO the Chargebee ledger operation id. One value in two systems
+/// is what makes a retry settle instead of re-charge: the id is written here
+/// BEFORE the capture is sent, so after a timeout, a crash or a lost response
+/// the next tick can ask Chargebee `GET /ledger_operations/{id}` instead of
+/// guessing.
+///
+/// A row exists only where there was usage. An empty window moves the cursor
+/// and writes nothing — a log of empty rows is noise, not history.
+model ChargebeeSync {
+  /// Client-supplied, and sent to Chargebee as the ledger operation id.
   id String @id @default(uuid()) @db.Uuid
 
   tenantId String         @map("tenant_id") @db.Uuid
   account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
 
-  /// grant | consume | adjustment | expiry
-  entryType String @map("entry_type") @db.VarChar(16)
-
-  /// Signed. Positive grants, negative consumption. Ten decimal places is
-  /// exactly Chargebee's ledger precision, so a value that survives this
-  /// column survives the wire without further rounding.
-  deltaCredits Decimal @map("delta_credits") @db.Decimal(20, 10)
-
-  /// THE anti-double-charge. Unique with tenant_id: the batch UUID for a
-  /// consume; `sub:<subscription>:<term start>` for a term's grant (the webhook
-  /// and the post-checkout sync share it — see termGrantRef); `invoice:<id>`
-  /// for a top-up. A replayed webhook or batch collides here instead of
-  /// writing a second entry.
-  sourceRef String @map("source_ref") @db.VarChar(100)
-
-  /// The dollar figure this entry came from. Null for a grant or an expiry.
-  billedUsd Decimal? @map("billed_usd") @db.Decimal(20, 10)
-
-  chargebeeOperationId String? @map("chargebee_operation_id") @db.VarChar(50)
-
-  /// Business time, not write time.
-  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz()
-
-  @@unique([tenantId, sourceRef], map: "credit_ledger_tenant_source_uq")
-  @@index([tenantId, occurredAt(sort: Desc)], map: "credit_ledger_tenant_occurred_idx")
-  @@map("credit_ledger_entry")
-}
-
-/// One row per Chargebee capture — the capture LOG, not a progress record
-/// (billing_cursor is). The id is ALSO the Chargebee ledger operation id —
-/// one value in two systems is what makes a replay settle instead of re-charge.
-/// Rows before the cursor cutover are window-era: windowStart/End were LLM
-/// Timestamp windows; since then they are the ingested_at range captured.
-model UsageSyncBatch {
-  id String @id @default(uuid()) @db.Uuid
-
-  tenantId String         @map("tenant_id") @db.Uuid
-  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Cascade)
-
-  /// Pinned when the window opens, so a mid-term subscription change still
+  /// Pinned when the row is created, so a mid-term subscription change still
   /// settles against the subscription that incurred the usage.
   chargebeeSubscriptionId String? @map("chargebee_subscription_id") @db.VarChar(100)
   ledgerUnitId            String? @map("ledger_unit_id") @db.VarChar(50)
 
-  /// window | adjustment
-  kind String @default("window") @db.VarChar(12)
+  /// The window, exclusive of `from`, inclusive of `to`. `from` is the cursor
+  /// the window opened at, which is what makes the log a chain with no gaps:
+  /// the cursor cannot pass a point without a row covering it.
+  ///
+  /// Both are TIMES. There is no event id in the window boundary — see the
+  /// cursor's comment above, and `usage-events.ts` for why a half-open range on
+  /// a time boundary cannot split a millisecond the way a row cursor could.
+  fromIngestedAt DateTime @map("from_ingested_at") @db.Timestamptz(3)
+  toIngestedAt   DateTime @map("to_ingested_at") @db.Timestamptz(3)
 
-  /// The range captured, for audit: from the cursor before it to the cursor after.
-  windowStart DateTime @map("window_start") @db.Timestamptz()
-  windowEnd   DateTime @map("window_end") @db.Timestamptz()
+  /// PENDING | PROCESSING | SUCCESS | UNKNOWN | RATE_LIMITING | OUT_OF_CREDITS | INVALID | WRITTEN_OFF
+  ///
+  /// RESOLVED — the cursor may move past it:
+  ///   SUCCESS        Chargebee took it, confirmed it already had, or there was
+  ///                  nothing chargeable in the window.
+  ///   WRITTEN_OFF    refused (OUT_OF_CREDITS or INVALID) on a subscription
+  ///                  that has since ended. Nothing was charged and nothing can
+  ///                  be; logged once as `billing.sync.written_off`.
+  /// UNRESOLVED — the tenant is held here and the row is recovered each tick:
+  ///   PENDING        written, not yet sent. Safe to send: the id has never
+  ///                  been on the wire.
+  ///   PROCESSING     on the wire, outcome not yet recorded. A crash leaves
+  ///                  this, and it is resolved by lookup, never by re-sending.
+  ///   UNKNOWN        timeout, 5xx, bad credential, disabled site. Same
+  ///                  treatment as PROCESSING: ask, do not guess.
+  ///   RATE_LIMITING  Chargebee throttled us. Refused before it was applied, so
+  ///                  it is simply sent again on a backoff.
+  ///   OUT_OF_CREDITS the customer has no balance. Retried every tick, because
+  ///                  a top-up clears it with no requeue step.
+  ///   INVALID        rejected for bad data or configuration. Retried on a long
+  ///                  backoff so a fix heals it, but it needs a person.
+  status String @db.VarChar(16)
 
-  /// Where billing_cursor moves when this capture settles. Null on window-era rows.
-  cursorToAt      DateTime? @map("cursor_to_at") @db.Timestamptz(3)
-  cursorToEventId String?   @map("cursor_to_event_id") @db.VarChar(200)
+  /// What was sent to Chargebee, in credits. Ten decimal places is exactly
+  /// Chargebee's ledger precision, so a value that survives this column
+  /// survives the wire without rounding.
+  amount Decimal @default(0) @db.Decimal(20, 10)
 
-  spanCount BigInt @default(0) @map("span_count")
+  /// The dollar figure behind `amount`, for the billing page. Kept because the
+  /// page renders it and credits alone do not mean anything to a customer.
+  billedUsd Decimal @default(0) @map("billed_usd") @db.Decimal(20, 10)
 
-  billedUsd   Decimal @default(0) @map("billed_usd") @db.Decimal(20, 10)
-  providerUsd Decimal @default(0) @map("provider_usd") @db.Decimal(20, 10)
-  marginUsd   Decimal @default(0) @map("margin_usd") @db.Decimal(20, 10)
+  eventCount Int @default(0) @map("event_count")
 
-  /// billedUsd / USD_PER_CREDIT at the rate in force when the window opened.
-  consumeCredits Decimal @default(0) @map("consume_credits") @db.Decimal(20, 10)
+  error String?
 
-  /// pending | captured | failed | skipped
-  status String @default("pending") @db.VarChar(20)
+  /// Sends attempted for THIS row. It is never turned into a failure by
+  /// counting: only Chargebee can resolve an unknown. It sets the backoff for
+  /// RATE_LIMITING and INVALID, and past `maxAttempts` the logging gets louder.
+  attemptCount Int @default(0) @map("attempt_count")
 
-  attempts  Int     @default(0)
-  lastError String? @map("last_error")
-
-  chargebeeOperationId String?  @map("chargebee_operation_id") @db.VarChar(50)
-  balanceAfter         Decimal? @map("balance_after") @db.Decimal(20, 10)
-
-  /// Correlates a batch back to the workflow run that created it.
+  /// Correlates a sync back to the workflow run that created it.
   hatchetRunId String? @map("hatchet_run_id") @db.VarChar(100)
 
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz()
-  capturedAt DateTime? @map("captured_at") @db.Timestamptz()
-  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  settledAt DateTime? @map("settled_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  events BilledUsageEvent[]
-
-  @@index([tenantId, windowEnd(sort: Desc)], map: "usage_sync_batch_cursor_idx")
-  @@index([status], map: "usage_sync_batch_status_idx")
-  @@map("usage_sync_batch")
+  /// One row per window, ever. Two workers that read the same cursor and both
+  /// open a window for it collide here — §6, "do not create duplicate sync
+  /// records for the same unresolved billing window", as a constraint rather
+  /// than as a rule a caller has to remember.
+  @@unique([tenantId, fromIngestedAt], map: "chargebee_sync_window_uq")
+  /// The billing page's "last synced".
+  @@index([tenantId, toIngestedAt(sort: Desc)], map: "chargebee_sync_progress_idx")
+  @@index([status], map: "chargebee_sync_status_idx")
+  @@map("chargebee_sync")
 }
 
-/// Webhook idempotency. Claimed BEFORE any effect, so a Chargebee retry never
-/// reaches a handler. Chargebee does not sign webhooks, so this table is also
-/// the only thing standing between a replayed request and a second credit grant.
-model ProcessedBillingEvent {
-  eventId   String @id @map("event_id") @db.VarChar(100)
-  eventType String @map("event_type") @db.VarChar(64)
+/// One row per paid top-up invoice this service has acted on — the guard that
+/// grants a paid pack EXACTLY ONCE.
+///
+/// Why it is local. `/ledger_operations/allocate` takes no client-supplied id,
+/// and Chargebee keeps nothing that ties an allocation to the invoice it was
+/// for: MEASURED on the test site, the `metadata` sent on allocate is never
+/// returned (not on the ledger operation, list or retrieve; the grant block it
+/// creates carries only `{"done_by": <api key name>}`). The old guard scanned
+/// for that metadata, matched nothing, and every repeat of `apply` past the
+/// 30-minute idempotency-key window granted the pack again (known defect #1).
+///
+/// How it is written. The row is CLAIMED (status SENDING) and committed before
+/// the allocate leaves, carrying every parameter the allocate is sent with; it
+/// becomes APPLIED with the operation id once Chargebee answers. A crash in
+/// between leaves the claim, so the record is never lost, and the retry
+/// re-sends the SAME request under the SAME `chargebee-idempotency-key` —
+/// which Chargebee answers with the original result rather than granting
+/// again. See account.service.ts applyPaidTopUps for the whole state machine.
+///
+/// A pack whose item price carries its OWN Credit Grant is granted by
+/// Chargebee, not by us; it is recorded here as `catalogue_grant` with the
+/// grant block that proves it, and nothing is allocated.
+///
+/// NEVER DROP, TRUNCATE OR EMPTY THIS TABLE once it is in use, and never delete
+/// a row: every paid pack invoice stays listed by Chargebee for good, and one
+/// with no row here is granted again. That is also why the account relation is
+/// RESTRICT, not CASCADE — deleting a billing_account row (a common dev repair)
+/// must not take the guard with it.
+model TopUpGrant {
+  id String @id @default(uuid()) @db.Uuid
 
-  /// Null when the event cannot be mapped to a tenant — kept anyway, because
-  /// an unmappable event is itself a signal worth alerting on.
-  tenantId String? @map("tenant_id") @db.Uuid
+  tenantId String         @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Restrict)
 
-  receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz()
-  /// Null means claimed but not finished — a crash mid-handler is visible here.
-  processedAt DateTime? @map("processed_at") @db.Timestamptz()
-  error       String?
+  /// The paid Chargebee invoice. One row per (tenant, invoice), ever.
+  invoiceId String @map("invoice_id") @db.VarChar(100)
 
-  @@index([receivedAt(sort: Desc)], map: "processed_billing_event_received_idx")
-  @@map("processed_billing_event")
+  /// Where the credits went — pinned when the row is claimed, so a retry
+  /// after a resubscription still completes against the same subscription.
+  chargebeeSubscriptionId String  @map("chargebee_subscription_id") @db.VarChar(100)
+  ledgerUnitId            String  @map("ledger_unit_id") @db.VarChar(50)
+  credits                 Decimal @db.Decimal(20, 10)
+
+  /// The allocate request, stored before it is first sent, so every retry is
+  /// byte-for-byte the same request — which is what the idempotency key
+  /// requires. Null for a catalogue grant, which sends nothing. Replaced, with
+  /// the key, only when a NEW key is issued (the old one's window has passed,
+  /// so the body may change): then it is recomputed from the current term.
+  expiresAt      DateTime? @map("expires_at") @db.Timestamptz(3)
+  idempotencyKey String?   @map("idempotency_key") @db.VarChar(120)
+  /// When this key was first sent. Chargebee replays a key for 30 minutes.
+  keyIssuedAt    DateTime? @map("key_issued_at") @db.Timestamptz(3)
+
+  /// SENDING | PENDING | APPLIED
+  ///   SENDING   claimed; an allocate is on the wire under this claim
+  ///   PENDING   an allocate may have landed, outcome unknown; retried
+  ///   APPLIED   granted — by our allocate, or by Chargebee's own grant
+  status String @db.VarChar(16)
+
+  /// allocation | catalogue_grant
+  source String @db.VarChar(20)
+
+  /// What proves it was granted: `ledger_operation:<id>` or `grant_block:<id>`.
+  chargebeeRef String? @map("chargebee_ref") @db.VarChar(120)
+  /// When Chargebee made the grant: the allocation's `created_at`, which is its
+  /// grant block's. How the guard tells THIS row's block from another's when it
+  /// searches the blocks for an allocation whose answer was lost. Null when
+  /// Chargebee did not say; read back by operation id when it is needed.
+  operationAt  DateTime? @map("operation_at") @db.Timestamptz(3)
+
+  attemptCount Int     @default(0) @map("attempt_count")
+  error        String?
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  appliedAt DateTime? @map("applied_at") @db.Timestamptz(3)
+
+  /// The guard itself: two callers applying the same invoice collide here.
+  @@unique([tenantId, invoiceId], map: "topup_grant_invoice_uq")
+  @@map("topup_grant")
 }
