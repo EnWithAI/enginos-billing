@@ -74,6 +74,21 @@ describe("a top-up of several units grants what the PAID invoice says", () => {
   });
 });
 
+describe("a pack billing must allocate itself, with TOPUP_CREDITS unset", () => {
+  it("is held and said out loud — never granted a guessed amount — and granted once it is set", async () => {
+    const r = await subscribed();
+    r.cb.payPack("inv_1", 2);
+
+    expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "")).toEqual({ applied: 0, credits: "0" });
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
+    expect(r.metrics()).toContain("billing.topup.credits_per_unit_unset");
+
+    expect(await r.accounts.applyPaidTopUps(TENANT, PACK, "1000")).toEqual({ applied: 1, credits: "2000" });
+    expect(r.cb.allocations).toHaveLength(1);
+  });
+});
+
 describe("topUpUnits", () => {
   const line = (entity_id: string, quantity?: unknown) => ({ id: `li_${entity_id}`, entity_id, ...(quantity === undefined ? {} : { quantity }) });
 

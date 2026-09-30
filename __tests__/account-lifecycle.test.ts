@@ -18,7 +18,6 @@ function fakeChargebee(over: Record<string, unknown> = {}) {
     capture: async () => ({ kind: "captured" as const }),
     captureIdempotent: async () => ({ kind: "captured" as const }),
     findOperation: async () => null,
-    ledgerOperations: async () => [],
     allocate: async () => ({ operationId: "op_1", balanceAfter: null }),
     paidInvoicesFor: async () => [],
     subscription: async () => null,

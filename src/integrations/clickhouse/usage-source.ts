@@ -8,16 +8,33 @@
  * is what forced the cursor to carry an event id so a truncated page could be
  * resumed. Aggregating here removes all of that.
  *
- * TIME WINDOWS, AND WHY THE BOUNDARY IS SAFE
+ * TIME WINDOWS, ON WHEN THE LLM CALL ENDED
  *
- *   WHERE ingested_at > :from AND ingested_at <= :to
+ *   ended_at = Timestamp + duration_ms
+ *   WHERE ended_at > :from AND ended_at <= :to
  *
- * Half-open, and both ends are TIMES the worker chose. `ingested_at` is
- * DateTime64(3) and several spans routinely share a millisecond, but that is
- * only a hazard when a boundary can fall INSIDE one — which is what happened
- * when the boundary was "the last event of a page". A time boundary cannot:
- * every millisecond belongs whole to exactly one window, so consecutive windows
- * lose nothing between them and overlap nowhere.
+ * `Timestamp` is when the call STARTED (MEASURED 2026-09-30 against LiteLLM's
+ * own spend log: equal to its startTime within 0.1 s) and `duration_ms` is how
+ * long it ran; both are read from span_nodes as they are — billing adds no
+ * column and changes nothing in ClickHouse. The window is on the END because
+ * that is when a span is written: a window on the start would have to wait out
+ * the longest call (LiteLLM's 600 s request_timeout) before it was complete.
+ *
+ * Half-open, and both ends are TIMES the worker chose. Several spans routinely
+ * share a millisecond, but that is only a hazard when a boundary can fall
+ * INSIDE one — which is what happened when the boundary was "the last event of
+ * a page". A time boundary cannot: every millisecond belongs whole to exactly
+ * one window, so consecutive windows lose nothing between them and overlap
+ * nowhere.
+ *
+ * THE LAG IS WHAT MAKES A WINDOW COMPLETE
+ *
+ * A span is written once its call has ended, then batched by the collector
+ * and inserted. A window is read only once it is BILLING_LAG_MS in the past
+ * (60 s by default, never under 30), so the calls that ended in it have
+ * landed. MEASURED 2026-09-30 over 421 local spans: p50 23 s and p99 44 s from
+ * the call's end to the row; 3 took over 45 s and 1 over 60 s. A span that
+ * lands later than the lag is behind the cursor and is never billed.
  *
  * DEDUPLICATION IS A SEPARATE JOB FROM THE CURSOR
  *
@@ -26,41 +43,18 @@
  * is keyed on — it is a ReplacingMergeTree ORDER BY (TraceId, SpanId) — so the
  * grouping agrees with the table rather than guessing at it.
  *
- * Grouping inside one window is not enough on its own: a span the collector
- * re-sends gets a second copy with a LATER ingested_at, possibly in a later
- * window, after the first copy's window has already been billed. What stops
- * that copy billing again is which copy FINAL keeps. Since tenant migration
- * 030 (enginos-platform, 030_span_nodes_first_copy_wins.sql) span_nodes keeps
- * the FIRST copy: its version column falls as ingested_at rises, so FINAL
- * returns each span once, at its earliest ingested_at, and a re-send's window
- * never sees it. That makes a span exactly-once across windows with no billing
- * state at all. (Before 030 the version was Timestamp, the LAST copy won, and
- * the re-send billed again: live case C12.)
- *
- * That only holds if the ingested_at filter is applied to the copy FINAL chose,
- * never to the copies before FINAL chooses. Two things would filter first, and
- * both were measured to bill the re-send again:
- *   - `use_skip_indexes_if_final_exact_mode = 0` lets the ingested_at skip index
- *     drop the granules holding the first copy, so FINAL sees only the re-send.
- *     Pinned to 1 below (the server default since 25.6, but not ours to trust;
- *     a server too old to know the setting now fails the read instead of
- *     double-billing quietly).
- *   - a PREWHERE on ingested_at, for the same reason. Keep it in WHERE.
+ * A span the collector re-sends carries the SAME Timestamp and duration, so it falls in the
+ * same window as the first copy: inside a window not yet billed the GROUP BY
+ * counts it once, and after the window is billed it is behind the cursor and
+ * never read again. Exactly once across windows, with no billing state.
  *
  * Why these rows and not others:
  *
  *   - `span_nodes FINAL`, not `otel_traces`: span_nodes collapses a re-sent
- *     span to one row, the first. FINAL decides WHICH window a span belongs to;
- *     the GROUP BY is what counts it once within that window, and it does not
+ *     span to one row. The GROUP BY is what counts it once, and it does not
  *     rely on FINAL having collapsed anything.
  *   - One tenant database, never merged with otel_landing: the tenant table is
  *     a copy of its slice of landing, and a union counts every span twice.
- *   - `ingested_at` (tenant migration 029), never `Timestamp`. The worker polls
- *     for usage that has BECOME AVAILABLE, not usage that happened: a span can
- *     land in ClickHouse long after the call it describes, and a cursor on span
- *     time that has already moved past it would skip it for good. There is no
- *     Timestamp predicate here at all — no billing floor, no sync_from, no
- *     lookback.
  *   - Cache hits are excluded. MEASURED: a response served from LiteLLM's Redis
  *     cache still carries the full `gen_ai.cost.total_cost` while LiteLLM
  *     records spend 0 for it. A cache hit is the span whose
@@ -97,14 +91,14 @@ export interface UsageWindow {
 }
 
 export interface ReadWindowArgs {
-  /** Exclusive lower bound on `ingested_at` — the cursor. */
+  /** Exclusive lower bound on when the call ended — the cursor. */
   fromMs: number;
   /** Inclusive upper bound — the safe processing time. */
   toMs: number;
 }
 
 export interface UsageSource {
-  /** ClickHouse's clock, epoch ms — ingested_at is stamped by it, so lag is measured against it. */
+  /** ClickHouse's clock, epoch ms — the lag is measured against it. */
   now(): Promise<number>;
   readWindow(slug: string, args: ReadWindowArgs): Promise<UsageWindow>;
 }
@@ -122,8 +116,11 @@ export interface UsageSource {
  * cost, and if they ever disagreed, taking the larger would be a quiet upward
  * bias on the invoice.
  *
- * The SETTINGS are part of the exactly-once guarantee, not tuning: see
- * "DEDUPLICATION" above for why exact mode is pinned.
+ * span_nodes is partitioned by toDate(Timestamp), so `Timestamp` is bounded
+ * too: a call that ended in the window started at most an hour before it (the
+ * gateway gives up after 600 s, retries included well inside an hour), which
+ * prunes the read to one or two day partitions. A duration that is missing or
+ * not a number counts as zero.
  */
 export function windowQuery(slug: string): string {
   assertSlug(slug);
@@ -139,11 +136,12 @@ export function windowQuery(slug: string): string {
       WHERE SpanName = {span:String}
         AND attrs['gen_ai.cost.total_cost'] != ''
         AND JSONExtractString(attrs['hidden_params'], 'cache_key') = ''
-        AND ingested_at >  {from:DateTime64(3)}
-        AND ingested_at <= {to:DateTime64(3)}
+        AND Timestamp >  {from:DateTime64(3)} - INTERVAL 1 HOUR
+        AND Timestamp <= {to:DateTime64(3)}
+        AND addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0)) >  {from:DateTime64(3)}
+        AND addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0)) <= {to:DateTime64(3)}
       GROUP BY event_key
     )
-    SETTINGS use_skip_indexes_if_final = 1, use_skip_indexes_if_final_exact_mode = 1
   `;
 }
 

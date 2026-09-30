@@ -75,11 +75,17 @@ describe("the ClickHouse query", () => {
     expect(sql).toContain("count()          AS event_count");
   });
 
-  it("reads a half-open window on ingested_at, and never on Timestamp", () => {
-    expect(sql).toContain("ingested_at >  {from:DateTime64(3)}");
-    expect(sql).toContain("ingested_at <= {to:DateTime64(3)}");
-    expect(sql).not.toMatch(/\bTimestamp\b/);
+  it("reads a half-open window on when the LLM call ENDED — no ClickHouse column of billing's", () => {
+    const ended = "addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0))";
+    expect(sql).toContain(`${ended} >  {from:DateTime64(3)}`);
+    expect(sql).toContain(`${ended} <= {to:DateTime64(3)}`);
+    expect(sql).not.toContain("ingested_at");
     expect(sql).not.toContain("sync_from");
+  });
+
+  it("bounds the start too, so the read prunes to the window's day partitions", () => {
+    expect(sql).toContain("Timestamp >  {from:DateTime64(3)} - INTERVAL 1 HOUR");
+    expect(sql).toContain("Timestamp <= {to:DateTime64(3)}");
   });
 
   it("carries no LIMIT, because the window is bounded by time rather than by rows", () => {
@@ -93,16 +99,10 @@ describe("the ClickHouse query", () => {
     expect(sql).toContain("JSONExtractString(attrs['hidden_params'], 'cache_key') = ''");
   });
 
-  it("filters the window only AFTER FINAL has picked a span's first copy", () => {
-    // span_nodes keeps a span's FIRST copy (tenant migration 030), so a re-send
-    // never reaches a later window — but only if the ingested_at filter sees
-    // the copy FINAL chose. Exact mode off, or the filter in PREWHERE, lets
-    // FINAL choose among the window's copies alone, and the re-send bills
-    // again. Both were measured against ClickHouse 26.3.
+  it("reads span_nodes FINAL with no settings tied to a column billing added", () => {
     expect(sql).toContain("span_nodes FINAL");
-    expect(sql).toContain("SETTINGS use_skip_indexes_if_final = 1, use_skip_indexes_if_final_exact_mode = 1");
+    expect(sql).not.toContain("SETTINGS");
     expect(sql).not.toContain("PREWHERE");
-    expect(sql).not.toMatch(/apply_prewhere_after_final|optimize_move_to_prewhere_if_final|do_not_merge_across_partitions_select_final/);
   });
 
   it("refuses a slug that could alter the query", () => {
@@ -327,71 +327,74 @@ describe("a backlog", () => {
     for (let i = 1; i <= 3; i += 1) usage.add(`t${i}:s1`, T0 + i * MINUTE - 1_000, 0.001);
     usage.nowMs = T0 + 5 * MINUTE;
 
-    const result = await build({ windowMs: MINUTE }).runTenant(SLUG);
+    const result = await build({ maxRangeMs: MINUTE }).runTenant(SLUG);
 
     expect(result.windows).toBe(3);
     expect(chargebee.appliedCount).toBe(3);
     expect(prisma._cursor).toBe(T0 + 4 * MINUTE);
   });
 
-  it("stops at maxWindowsPerTick and resumes there next tick, losing nothing", async () => {
+  it("past the run's deadline it starts no new range, and the next run goes on from the cursor — losing nothing", async () => {
     const { prisma, usage, chargebee, build } = setup();
     for (let i = 1; i <= 4; i += 1) usage.add(`t${i}:s1`, T0 + i * MINUTE - 1_000, 0.001);
-    usage.nowMs = T0 + 6 * MINUTE;
-    const sync = build({ windowMs: MINUTE, maxWindowsPerTick: 2 });
+    usage.nowMs = T0 + 6 * MINUTE; // until = T0 + 5 min
+    const sync = build({ maxRangeMs: MINUTE });
+
+    await sync.runTenant(SLUG, 0); // a deadline long gone: the range in hand, and no more
+    expect(prisma._cursor).toBe(T0 + MINUTE);
 
     await sync.runTenant(SLUG);
-    expect(prisma._cursor).toBe(T0 + 2 * MINUTE);
 
-    await sync.runTenant(SLUG);
-
-    expect(prisma._cursor).toBe(T0 + 4 * MINUTE);
+    expect(prisma._cursor).toBe(T0 + 5 * MINUTE);
     expect(chargebee.appliedCount).toBe(4);
     expect(chargebee.taken).toBe(4);
   });
 
-  it("reads fixed-size windows, so a long outage is never one enormous scan", async () => {
+  it("reads a long outage in ranges of at most maxRange — never one enormous charge", async () => {
     const { usage, build } = setup();
-    usage.nowMs = T0 + 10 * MINUTE;
+    usage.nowMs = T0 + 10 * MINUTE; // until = T0 + 9 min
 
-    await build({ windowMs: 2 * MINUTE, maxWindowsPerTick: 2 }).runTenant(SLUG);
+    await build({ maxRangeMs: 2 * MINUTE }).runTenant(SLUG);
 
     expect(usage.reads).toEqual([
       { fromMs: T0, toMs: T0 + 2 * MINUTE },
       { fromMs: T0 + 2 * MINUTE, toMs: T0 + 4 * MINUTE },
+      { fromMs: T0 + 4 * MINUTE, toMs: T0 + 6 * MINUTE },
+      { fromMs: T0 + 6 * MINUTE, toMs: T0 + 8 * MINUTE },
+      { fromMs: T0 + 8 * MINUTE, toMs: T0 + 9 * MINUTE },
     ]);
   });
 
-  it("derives a window's end from its start, never from how much happens to be available", async () => {
-    // THE anti-race property. Two workers reading the same cursor a few
-    // milliseconds apart must compute the SAME window, or the uniqueness index
-    // — which is on (tenant_id, from_ingested_at) — cannot tell that they are
-    // competing, and one could charge a range the other has already advanced
-    // the cursor over.
+  it("a range runs from the cursor to now − lag — the minute since the last run, not a fixed window", async () => {
+    // Two workers a moment apart read DIFFERENT ends for the same start. That
+    // is safe because a row is opened, and an empty range passed, only while
+    // the cursor still sits at its start, under the account row's lock — the
+    // races are exercised in failure-matrix-crash.test.ts (two workers,
+    // different ranges from one cursor).
     const { usage, build } = setup();
-    const a = build({ windowMs: MINUTE });
-    const b = build({ windowMs: MINUTE });
+    usage.nowMs = T0 + 5 * MINUTE + 137; // until = T0 + 4 min + 137 ms
 
-    usage.nowMs = T0 + 5 * MINUTE;
-    await a.runTenant(SLUG);
-    const firstOfA = usage.reads[0]!;
+    await build({ maxRangeMs: 60 * MINUTE }).runTenant(SLUG);
 
-    // A second worker, a different `until`, the same cursor.
-    const { usage: usage2, build: build2 } = setup();
-    usage2.nowMs = T0 + 5 * MINUTE + 137; // a few ms later
-    await build2({ windowMs: MINUTE }).runTenant(SLUG);
-
-    expect(usage2.reads[0]).toEqual(firstOfA);
-    void b;
+    expect(usage.reads).toEqual([{ fromMs: T0, toMs: T0 + 4 * MINUTE + 137 }]);
   });
 
-  it("leaves a window that does not yet fit inside the safe range alone", async () => {
-    // A partial window would have to be re-read later to be complete, and the
-    // aggregate is taken once. So it waits.
+  it("bills whatever has settled — half a minute is a range too", async () => {
     const { prisma, usage, build } = setup();
-    usage.nowMs = T0 + MINUTE + 30_000; // until = T0 + 30s, half a window
+    usage.nowMs = T0 + MINUTE + 30_000; // until = T0 + 30s
 
-    const result = await build({ windowMs: MINUTE }).runTenant(SLUG);
+    const result = await build({ maxRangeMs: MINUTE }).runTenant(SLUG);
+
+    expect(usage.reads).toEqual([{ fromMs: T0, toMs: T0 + 30_000 }]);
+    expect(result.outcome).toBe(OUTCOME.IDLE);
+    expect(prisma._cursor).toBe(T0 + 30_000);
+  });
+
+  it("reads nothing while the cursor is already at now − lag", async () => {
+    const { prisma, usage, build } = setup();
+    usage.nowMs = T0 + MINUTE; // until = T0: nothing has settled past the cursor
+
+    const result = await build({ maxRangeMs: MINUTE }).runTenant(SLUG);
 
     expect(usage.reads).toEqual([]);
     expect(result.outcome).toBe(OUTCOME.IDLE);
@@ -855,7 +858,7 @@ describe("when the cursor falls behind a window that was already billed", () => 
     // window index refuses the insert, the existing row says SUCCESS, so the
     // cursor is put where that row already reached.
     const { prisma, usage, chargebee, build } = setup();
-    const sync = build({ windowMs: MINUTE });
+    const sync = build({ maxRangeMs: MINUTE });
     usage.add("t1:s1", T0 + 30_000, 0.002);
     usage.nowMs = T0 + 2 * MINUTE;
     await sync.runTenant(SLUG);

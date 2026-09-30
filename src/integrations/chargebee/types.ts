@@ -207,7 +207,7 @@ export interface ChargebeeClient {
   grantedCredits(subscriptionId: string, unitId?: string, now?: number): Promise<{ credits: string; blocks: number }>;
   /** Every grant block on the subscription, oldest first, with the invoice that issued each. */
   grantBlocks(subscriptionId: string): Promise<{ blocks: GrantBlock[]; complete: boolean }>;
-  /** Chargebee's own record of what was granted and captured, newest first. */
+  /** One page of the subscription's ledger operations, newest first. Read by scripts/e2e-prepaid.ts only. */
   ledgerOperations(subscriptionId: string, limit?: number): Promise<Array<Record<string, any>>>;
   /** One ledger operation by id (GET /ledger_operations/{id}). Null only on a definite 404. */
   ledgerOperation(id: string): Promise<LedgerOperation | null>;
@@ -257,8 +257,6 @@ export interface ChargebeeClient {
     itemPriceId: string;
     now?: number;
   }): Promise<string>;
-  /** Payments and refunds for a customer, newest first. */
-  transactionsFor(customerId: string, limit?: number): Promise<Transaction[]>;
   /** One page of payments, newest first, and the opaque cursor for the next (null at the end). */
   transactionsPage(
     customerId: string,

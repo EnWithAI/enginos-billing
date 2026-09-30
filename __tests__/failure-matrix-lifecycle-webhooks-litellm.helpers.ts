@@ -200,6 +200,12 @@ export class ChargebeeWorld {
   allocateFaults: Array<"lose-response" | "unreachable" | "refuse"> = [];
   /** GET /grant_blocks stops before the last page. */
   grantBlocksIncomplete = false;
+  /**
+   * Subscriptions that have a credit wallet (ledger account). MEASURED
+   * 2026-09-30: a plan that grants zero gets none — no block, no balance —
+   * until something is granted into it (a plan grant, a pack, an allocate).
+   */
+  wallets = new Set<string>();
   /** Balances of units other than the plan's (a pack granted into the wrong unit). */
   otherUnits = new Map<string, number>();
   paidInvoices: Array<{ id: string; paid_at?: number; line_items?: Array<{ id: string; entity_id: string; quantity?: unknown }> }> = [];
@@ -234,8 +240,10 @@ export class ChargebeeWorld {
     return sub;
   }
 
-  /** The item price's Credit Grant: a new live plan block. */
+  /** The item price's Credit Grant: a new live plan block. A grant of zero makes no block and no wallet. */
   grantPlan(subscriptionId: string, credits: number) {
+    if (credits === 0) return;
+    this.wallets.add(subscriptionId);
     const n = ++this.seq;
     this.blocks.push({
       id: `gb_${n}`,
@@ -260,6 +268,7 @@ export class ChargebeeWorld {
     const lineItemId = `li_${invoiceId}`;
     const unit = opts.unit ?? UNIT;
     const credits = opts.credits ?? 1000;
+    this.wallets.add(opts.subscriptionId ?? "sub_1");
     this.paidInvoices.push({ id: invoiceId, paid_at: Math.floor(this.now() / 1000), line_items: [{ id: lineItemId, entity_id: opts.itemPriceId ?? PACK }] });
     this.blocks.push({
       id: `gb_${++this.seq}`,
@@ -328,6 +337,7 @@ export class ChargebeeWorld {
     /** One unit's balance; without a unit, the oldest — the plan's — as the real client picks it. */
     balance: async (subscriptionId: string, unitId?: string | null) => {
       if (!this.subscriptions.some((s) => s.id === subscriptionId)) return null;
+      if (!this.wallets.has(subscriptionId)) return null;
       const unitCount = 1 + this.otherUnits.size;
       if (!unitId || unitId === UNIT) return { unitId: UNIT, unitName: UNIT, usable: String(this.ledger.balance), onHold: "0", unitCount };
       const other = this.otherUnits.get(unitId);
@@ -356,11 +366,6 @@ export class ChargebeeWorld {
             .filter((s) => s.customer_id === customerId && ["active", "in_trial", "non_renewing"].includes(s.status))
             .map((s) => structuredClone(s))
             .sort((a, b) => b.created_at - a.created_at),
-    /** As the live site answers: operations carry NO metadata — what allocate was sent is not returned. */
-    ledgerOperations: async (subscriptionId: string) =>
-      this.allocations
-        .filter((a) => a.subscriptionId === subscriptionId)
-        .map((_a, i) => ({ id: `alloc_${i}`, type: "allocation", subscription_id: subscriptionId })),
     /** GET /ledger_operations/{id}: an allocation this fake made, in the client's shape — no metadata, as live. */
     ledgerOperation: async (id: string) => {
       const n = /^alloc_(\d+)$/.exec(id);
@@ -421,6 +426,7 @@ export class ChargebeeWorld {
       }
 
       this.allocations.push({ ...args, atMs: this.now() });
+      this.wallets.add(args.subscriptionId);
       this.blocks.push({
         id: `gb_${++this.seq}`,
         subscription_id: args.subscriptionId,
@@ -460,7 +466,12 @@ export function webhook(eventType: string, sub: FakeSubscription, id = `ev_${eve
 
 // ── the rig ────────────────────────────────────────────────────────────────
 
-export function lifecycleRig() {
+/**
+ * `freePlanCredits`: PLAN is the free plan, and billing grants this many credits
+ * once to an org on it, into `freePlanCreditUnit` (UNIT unless given) when the
+ * subscription has no wallet.
+ */
+export function lifecycleRig({ freePlanCredits, freePlanCreditUnit = UNIT }: { freePlanCredits?: string; freePlanCreditUnit?: string } = {}) {
   let now = T0;
   const prisma = makeFakePrisma({
     chargebeeSubscriptionId: null,
@@ -501,6 +512,7 @@ export function lifecycleRig() {
     chargebee: cb.client as never,
     usdPerCredit: RATE,
     billingItemPriceIds: [PLAN, PLAN_B],
+    ...(freePlanCredits ? { freeItemPriceId: PLAN, freePlanCredits, freePlanCreditUnit } : {}),
     clock: () => now,
     logger,
     ...hooks,
@@ -517,7 +529,7 @@ export function lifecycleRig() {
     chargebee: cb.sync,
     usdPerCredit: RATE,
     lagMs: MINUTE,
-    windowMs: MINUTE,
+    maxRangeMs: MINUTE,
     clock: () => now,
     logger,
     blockBudget: hooks.blockBudget,

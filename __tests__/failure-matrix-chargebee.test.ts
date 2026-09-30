@@ -569,7 +569,7 @@ describe("C21 Chargebee unavailable", () => {
 
     r.cb.outage = null;
     r.at(32);
-    await r.tick(); // recovery + 20 windows (maxWindowsPerTick)
+    await r.tick(); // recovery, then the backlog in ranges
     r.at(33);
     await r.tick(); // the rest
 

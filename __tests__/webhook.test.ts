@@ -79,11 +79,15 @@ function created(id: string, customerId = TENANT) {
   };
 }
 
-async function deliver(event: unknown) {
+const WEBHOOK_USER = "chargebee";
+const WEBHOOK_PASSWORD = "s3cret:with-colon";
+const basic = (user: string, password: string) => `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
+
+async function deliver(event: unknown, authorization: string | null = basic(WEBHOOK_USER, WEBHOOK_PASSWORD)) {
   const res = await POST(
     new Request("http://billing.test/api/webhooks/chargebee", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) },
       body: JSON.stringify(event),
     }),
   );
@@ -122,6 +126,8 @@ beforeEach(async () => {
   process.env.CHARGEBEE_SITE = "test-site";
   process.env.CHARGEBEE_API_KEY = "test_key";
   process.env.CLICKHOUSE_PASSWORD = "pw";
+  process.env.CHARGEBEE_WEBHOOK_USER = WEBHOOK_USER;
+  process.env.CHARGEBEE_WEBHOOK_PASSWORD = WEBHOOK_PASSWORD;
   (await import("@/config/config")).resetConfig();
 
   // Unlinked and never polled: linking and the first cursor are what these
@@ -129,6 +135,65 @@ beforeEach(async () => {
   held.prisma = makeFakePrisma({ chargebeeSubscriptionId: null, ledgerUnitId: null });
   held.prisma._accounts.get(TENANT)!.chargebeeCustomerId = TENANT;
   held.chargebee = chargebee();
+});
+
+describe("Chargebee's HTTP Basic credentials, checked here in billing", () => {
+  it("a delivery with the right credentials is handled", async () => {
+    expect((await deliver(created("ev_auth_ok"))).status).toBe(200);
+    expect(linked()).toBe("sub_1");
+  });
+
+  it.each([
+    ["no Authorization header", null],
+    ["a wrong password", basic(WEBHOOK_USER, "wrong")],
+    ["a wrong user", basic("someone", WEBHOOK_PASSWORD)],
+    ["a bearer token", "Bearer abc"],
+    ["garbage", "Basic !!!"],
+  ])("%s is refused with 401, and nothing is handled", async (_label, authorization) => {
+    const res = await deliver(created("ev_auth_bad"), authorization);
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid webhook credentials", code: "webhook-unauthorized" });
+    expect(linked()).toBeNull();
+  });
+
+  it("unset credentials refuse every delivery — webhooks off, never open", async () => {
+    delete process.env.CHARGEBEE_WEBHOOK_PASSWORD;
+    (await import("@/config/config")).resetConfig();
+
+    const res = await deliver(created("ev_auth_unset"));
+
+    expect(res.status).toBe(401);
+    expect(linked()).toBeNull();
+  });
+});
+
+describe("Chargebee's \"Test Webhook\" button", () => {
+  // The body Chargebee's test button sent on 2026-09-30, trimmed: sample data
+  // for a demo customer that is no org's.
+  const sample = {
+    id: "ev_AziJ5iVUF4hLlhel",
+    event_type: "subscription_created",
+    content: {
+      subscription: { id: "cbdemo__XpbKpmKUbu8jffPy", customer_id: "cbdemo_tom", status: "cancelled" },
+      customer: { id: "cbdemo_tom" },
+    },
+  };
+
+  it("sample data (a cbdemo_ customer) is acknowledged with 200, and nothing is touched", async () => {
+    const res = await deliver(sample);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ received: true });
+    expect(linked()).toBeNull();
+  });
+
+  it("an unknown REAL customer still answers 500, so Chargebee retries it", async () => {
+    const res = await deliver({ ...sample, id: "ev_real_unknown", content: { subscription: { id: "sub_x", customer_id: "customer-made-by-hand" } } });
+
+    expect(res.status).toBe(500);
+    expect(linked()).toBeNull();
+  });
 });
 
 describe("a webhook with no claim row in front of it", () => {

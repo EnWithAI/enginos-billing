@@ -17,7 +17,7 @@ import { createBillingAccountRepository } from "@/repositories/billing-account.r
 import { createAccountService } from "@/services/account.service";
 import { createCheckoutService } from "@/services/checkout.service";
 import { createInvoiceService } from "@/services/invoice.service";
-import { describeTopUp } from "@/services/plan-catalog.service";
+import { describeTopUp, type TopUpOffer } from "@/services/plan-catalog.service";
 import { createPortalService } from "@/services/portal.service";
 import { createPaymentMethodService } from "@/services/payment-method.service";
 import { AppError, conflict } from "@/shared/errors";
@@ -82,6 +82,7 @@ function checkoutRig(
   account: Record<string, unknown> = {},
   logger: Logger = quietLogger,
   prepare?: (prisma: ReturnType<typeof makeFakePrisma>) => void,
+  topUpOffer?: () => Promise<TopUpOffer>,
 ) {
   const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, ...account } as never);
   prepare?.(prisma);
@@ -96,6 +97,7 @@ function checkoutRig(
     defaultItemPriceId: "plan-monthly",
     topUpItemPriceId: "pack",
     topUpCredits: "1000",
+    ...(topUpOffer ? { topUpOffer } : {}),
     logger: quietLogger,
   });
 }
@@ -208,7 +210,7 @@ describe("checkout", () => {
     expect(chargeItem).toHaveBeenCalledWith({ subscriptionId: "sub_1", itemPriceId: "pack", quantity: 3 });
   });
 
-  it.each([0, -1, 1.5, 101, Number.NaN, "3" as unknown as number])(
+  it.each([0, -1, 1.5, Number.NaN, "3" as unknown as number])(
     "refuses quantity %s before anything reaches Chargebee",
     async (quantity) => {
       const chargeItem = vi.fn(async () => PAID);
@@ -219,6 +221,47 @@ describe("checkout", () => {
       expect(chargeItem).not.toHaveBeenCalled();
     },
   );
+
+  describe("TOPUP_MIN_AMOUNT / TOPUP_MAX_AMOUNT, enforced by billing — not only shown by the page", () => {
+    // ₹1 a unit, ₹50 to ₹10,000: 50 to 10,000 units.
+    const offer = async (): Promise<TopUpOffer> => ({
+      itemPriceId: "pack",
+      name: "Pack",
+      unitPriceMinor: 100,
+      currencyCode: "INR",
+      presetAmounts: [50, 100],
+      minQuantity: 50,
+      maxQuantity: 10_000,
+    });
+    const active = { chargebeeSubscriptionId: "sub_1", ledgerUnitId: "token", status: "active" };
+
+    it.each([1, 49, 10_001])("refuses %s units, naming the amounts allowed", async (quantity) => {
+      const chargeItem = vi.fn(async () => PAID);
+      const rig = checkoutRig({ chargeItem }, active, quietLogger, undefined, offer);
+
+      const err = await rejection(rig.startTopUp(TENANT, quantity));
+      expect([err.kind, err.code, err.message]).toEqual(["invalid", "topup-quantity-invalid", "Choose an amount from 50 to 10000 INR"]);
+      expect(chargeItem).not.toHaveBeenCalled();
+    });
+
+    it.each([50, 100, 10_000])("charges %s units, inside the limits", async (quantity) => {
+      const chargeItem = vi.fn(async () => PAID);
+      const rig = checkoutRig({ chargeItem }, active, quietLogger, undefined, offer);
+
+      expect(await rig.startTopUp(TENANT, quantity)).toMatchObject({ quantity });
+      expect(chargeItem).toHaveBeenCalledWith({ subscriptionId: "sub_1", itemPriceId: "pack", quantity });
+    });
+
+    it("has no maximum while TOPUP_MAX_AMOUNT is unset — the minimum still holds", async () => {
+      const chargeItem = vi.fn(async () => PAID);
+      const noMax = async (): Promise<TopUpOffer> => ({ ...(await offer()), maxQuantity: null });
+      const rig = checkoutRig({ chargeItem }, active, quietLogger, undefined, noMax);
+
+      expect(await rig.startTopUp(TENANT, 1_000_000)).toMatchObject({ quantity: 1_000_000 });
+      const err = await rejection(rig.startTopUp(TENANT, 49));
+      expect([err.code, err.message]).toEqual(["topup-quantity-invalid", "Choose an amount of at least 50 INR"]);
+    });
+  });
 
   it("names a card Chargebee could not charge, with its reason, as a 409 — not an outage", async () => {
     const declined = Object.assign(new Error("Your card was declined."), { status: 402, apiErrorCode: "payment" });
@@ -403,8 +446,21 @@ describe("invoice download", () => {
 
 describe("describeTopUp", () => {
   // Distinct ids per case: the cache is module-level, keyed by item price.
-  const describe$ = (itemPriceId: string, itemPrice: ChargebeeClient["itemPrice"]) =>
-    describeTopUp({ itemPriceId, creditsPerUnit: "1000", maxQuantity: 100 }, chargebeeStub({ itemPrice }), { logger: quietLogger });
+  const settings = { presetAmounts: [50, 100], minAmount: null, maxAmount: null };
+  const describe$ = (
+    itemPriceId: string,
+    itemPrice: ChargebeeClient["itemPrice"],
+    limits: Partial<{ minAmount: number | null; maxAmount: number | null }> = {},
+  ) => describeTopUp({ itemPriceId, ...settings, ...limits }, chargebeeStub({ itemPrice }), { logger: quietLogger });
+  const perUnit = (priceMinor: number): ChargebeeClient["itemPrice"] => async (id) => ({
+    id,
+    name: "Credit top-up",
+    priceMinor,
+    currencyCode: "INR",
+    period: null,
+    periodUnit: null,
+    pricingModel: "per_unit",
+  });
 
   it("quotes the price of one unit when Chargebee prices the charge per unit", async () => {
     const offer = await describe$("topup-per-unit", async (id) => ({
@@ -421,9 +477,32 @@ describe("describeTopUp", () => {
       name: "Credit top-up",
       unitPriceMinor: 49900,
       currencyCode: "INR",
-      creditsPerUnit: "1000",
-      maxQuantity: 100,
+      presetAmounts: [50, 100],
+      minQuantity: 1,
+      maxQuantity: null,
     });
+  });
+
+  it("quotes amounts, never credits: nothing in the offer names a credit figure", async () => {
+    const offer = await describe$("topup-no-credits", perUnit(100));
+    expect(Object.keys(offer)).not.toContain("creditsPerUnit");
+  });
+
+  it("turns TOPUP_MIN_AMOUNT / TOPUP_MAX_AMOUNT into units of the charge's price", async () => {
+    // ₹1 a unit, ₹50 to ₹10,000 → 50 to 10,000 units.
+    const offer = await describe$("topup-limits-1", perUnit(100), { minAmount: 50, maxAmount: 10_000 });
+    expect([offer.minQuantity, offer.maxQuantity]).toEqual([50, 10_000]);
+  });
+
+  it("rounds the minimum UP and the maximum DOWN to whole units", async () => {
+    // ₹499 a unit: ₹50 needs one unit; ₹10,000 buys twenty (₹9,980), not twenty-one.
+    const offer = await describe$("topup-limits-499", perUnit(49_900), { minAmount: 50, maxAmount: 10_000 });
+    expect([offer.minQuantity, offer.maxQuantity]).toEqual([1, 20]);
+  });
+
+  it("has no maximum while TOPUP_MAX_AMOUNT is unset: TOPUP_MAX_AMOUNT is the only cap", async () => {
+    const offer = await describe$("topup-limits-open", perUnit(100), { minAmount: 50 });
+    expect([offer.minQuantity, offer.maxQuantity]).toEqual([50, null]);
   });
 
   it("sells a flat-fee charge one at a time, and quotes no unit price for it", async () => {
@@ -443,7 +522,8 @@ describe("describeTopUp", () => {
     const offer = await describe$("topup-down", async () => {
       throw new Error("timeout");
     });
-    expect(offer).toMatchObject({ itemPriceId: "topup-down", name: "topup-down", unitPriceMinor: null, maxQuantity: 100 });
+    // No price, no amounts: one unit at a time, as the page buys it then.
+    expect(offer).toMatchObject({ itemPriceId: "topup-down", name: "topup-down", unitPriceMinor: null, minQuantity: 1, maxQuantity: 1 });
   });
 });
 

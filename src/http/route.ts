@@ -12,11 +12,12 @@
  * So a controller is written for the path that works, throws AppError for the
  * paths it knows about, and cannot leak an exception it did not.
  *
- * There is NO caller authentication here, or anywhere in this service. The
- * caller is enginos-platform, which authenticates the user — and Chargebee's
- * webhook — before forwarding, and passes the tenant id it resolved itself.
- * Billing trusts that id, which is why it must only be reachable from
- * enginos-platform on the private network and never published.
+ * There is NO caller authentication here. The caller of every internal route
+ * is enginos-platform, which authenticates the user before forwarding and
+ * passes the tenant id it resolved itself. Billing trusts that id, which is why
+ * /api/internal/* must only be reachable from enginos-platform on the private
+ * network and never published. The one exception is Chargebee's webhook, which
+ * checks its own credentials (controllers/webhook.controller.ts).
  */
 
 import { NextResponse } from "next/server";

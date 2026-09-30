@@ -310,5 +310,3 @@ export function createBillingOverviewService(deps: {
 
   return { overview, paymentsPage };
 }
-
-export type BillingOverviewService = ReturnType<typeof createBillingOverviewService>;

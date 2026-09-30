@@ -26,7 +26,7 @@ import { createUsageSyncService, OUTCOME } from "@/services/usage-sync.service";
 
 import { FakeChargebee, FakeUsageSource, MINUTE, RATE, SLUG, T0, TENANT, makeFakePrisma, quietLogger } from "./harness";
 
-/** windowMs = lagMs = one minute, so a window at cursor C is due at C + 2 min. */
+/** maxRangeMs = lagMs = one minute, so a window at cursor C is due at C + 2 min. */
 const LAG = MINUTE;
 
 function rig(opts: { balance?: number; account?: Record<string, unknown>; cursorAt?: number } = {}) {
@@ -43,7 +43,7 @@ function rig(opts: { balance?: number; account?: Record<string, unknown>; cursor
       chargebee,
       usdPerCredit: RATE,
       lagMs: LAG,
-      windowMs: MINUTE,
+      maxRangeMs: MINUTE,
       clock: () => now,
       logger: quietLogger,
       blockBudget: async (tenantId, reason) => void blocked.push({ tenantId, reason }),
@@ -188,7 +188,7 @@ describe("credits run out, usage keeps arriving, then a top-up", () => {
 
 describe("a crash part-way through draining a backlog", () => {
   it("resumes at the window it died on, billing each window exactly once", async () => {
-    // maxWindowsPerTick means a tick can bill several windows. Dying inside
+    // A tick can bill several ranges (a catch-up goes an hour at a time). Dying inside
     // that loop is the case where "how far did it get" and "what did Chargebee
     // take" can most easily disagree.
     const r = rig();
@@ -407,7 +407,7 @@ describe("a subscription change while a window is still owed", () => {
 
 // ── the window size changing between deploys ──────────────────────────────
 
-describe("BILLING_WINDOW_MS changed while a settled row was owed", () => {
+describe("a settled row of a different length, owed when the cursor reaches it", () => {
   it("follows the cursor the database committed, not the window it asked for", async () => {
     // FOUND BY AUDIT. The repair path moves the cursor to the SETTLED ROW's end,
     // which is not the end of the window the loop asked for once the two were
@@ -427,7 +427,7 @@ describe("BILLING_WINDOW_MS changed while a settled row was owed", () => {
 
     // Deploy 2 raises the window to two minutes. The worker now asks for
     // (0, 2min] while a settled row covers only (0, 1min].
-    const wide = r.build({ windowMs: 2 * MINUTE });
+    const wide = r.build({ maxRangeMs: 2 * MINUTE });
     r.usage.add("b:1", T0 + 90_000, 0.002);
     r.usage.add("c:1", T0 + 150_000, 0.002);
     r.at(8);

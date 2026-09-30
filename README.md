@@ -6,12 +6,16 @@ either way Chargebee grants it credits, and customers buy more as top-ups. Every
 ClickHouse and captures it against those credits in Chargebee, and the LiteLLM
 gateway refuses service once the credits are gone.
 
-Two processes from one image:
+Two processes from one image, plus Prisma Studio to look at the tables:
 
 ```bash
-npm run dev      # API on :4300  (webhooks + internal reads)
-npm run worker   # Hatchet worker (the cron sweep)
-npm test         # vitest, no external services needed
+make dev         # all three in one terminal, lines tagged [api] [worker] [studio];
+                 # Ctrl-C stops all three. Refuses while :4300 or :5555 is taken.
+make dev-api     # only the API on :4300 (webhooks + internal routes) — npm run dev
+make dev-worker  # only the Hatchet worker (the cron sweep)       — npm run worker
+make db-studio   # only Prisma Studio on :5555 — billing's three tables
+make test        # vitest, no external services needed          — npm test
+make help        # everything else (setup, db-migrate, check, …)
 ```
 
 Next.js loads `.env` for the API; the worker scripts load it with
@@ -20,6 +24,23 @@ Next.js loads `.env` for the API; the worker scripts load it with
 `tsx worker/hatchet-worker.ts` — runs with none of its settings: no Chargebee,
 no database, and no Sentry, so it can raise no alerts.
 
+## The database
+
+Billing has no database of its own. Its three tables — `billing_account`,
+`chargebee_sync`, `topup_grant` — live in the **shared master database,
+`enginos_master`**, beside the platform's (`tenants`, `org_llm_gateways`, …).
+Two connections, both in `.env`:
+
+| Variable | Goes to | Role | Used by |
+|---|---|---|---|
+| `DATABASE_URL` | PgBouncer `localhost:6432` → `enginos_master` (`?pgbouncer=true&connection_limit=1`) | `enginos_app` | the API, the worker, **Prisma Studio** |
+| `DATABASE_DIRECT_URL` | Postgres `localhost:5432` → `enginos_master` (session mode) | `enginos_owner` | **migrations only** (`make db-migrate` = `prisma migrate deploy`) — the app role cannot create tables |
+
+**Prisma Studio shows only billing's three tables**: it shows the models in
+`prisma/schema.prisma`, and billing's schema models only those, although the
+database holds the platform's tables too. For the platform's, run Studio in
+`enginos-platform` instead.
+
 ## The whole flow
 
 ```
@@ -27,9 +48,9 @@ LLM call → LiteLLM → OpenTelemetry → ClickHouse tenant_<slug>.span_nodes
                                               │
                                       every 1 minute
                                               ▼
-                    read billing_account.last_processed_ingested_at
+      read billing_account.last_processed_ingested_at (a call end time)
                                               │
-               window = (cursor, cursor + BILLING_WINDOW_MS], once it fits
+        range = (cursor, min(now − lag, cursor + BILLING_MAX_RANGE_MS)]
                                               │
                   SELECT count(), sum(cost) … GROUP BY TraceId:SpanId
                                               │
@@ -39,7 +60,7 @@ LLM call → LiteLLM → OpenTelemetry → ClickHouse tenant_<slug>.span_nodes
                                               │
                                     status = SUCCESS
                                               ▼
-                              cursor ← the window's end
+                              cursor ← the range's end
 ```
 
 Two tables in PostgreSQL carry usage billing:
@@ -47,7 +68,7 @@ Two tables in PostgreSQL carry usage billing:
 ```
 billing_account   which Chargebee customer/subscription a tenant is,
                   AND how far the worker has got — the cursor
-chargebee_sync    one row per billing window, and what Chargebee said
+chargebee_sync    one row per billed range, and what Chargebee said
 ```
 
 and a third, `topup_grant`, is the top-up guard: one row per paid top-up
@@ -71,17 +92,35 @@ chargebee_sync.status                        WHAT CHARGEBEE SAID
   waits for Chargebee's credit ledger (about three seconds) before calling the
   org set up. The billing page does the same for any org it finds with no
   subscription.
+- **The free plan's credits are granted once.** It is a yearly plan, and a
+  plan's own Credit Grant comes again at every renewal, so the plan's grant is
+  cut to zero (or a single token) in the catalogue and billing grants the
+  credits itself the first time the org is linked to the plan.
+  `FREE_PLAN_CREDITS` is the TOTAL each free org starts with: billing
+  allocates it less whatever the plan's own grant gave, exactly once per org
+  (a `topup_grant` row, `free-plan-credits`), with an expiry 10 years out.
+  MEASURED: a zero-grant plan gets no credit wallet from Chargebee — the
+  allocate into `FREE_PLAN_CREDIT_UNIT` (required with `FREE_PLAN_CREDITS`)
+  creates it, and the account adopts that unit. Until the credits land the org
+  is held `activating` and the minute's cron retries. An org the plan already
+  gave at least that much is recorded and allocated nothing.
 - **Who gets it** is per org: `billing_account.free_plan`, or
   `FREE_PLAN_DEFAULT` (off) when an operator has not set one with
   `POST /api/internal/free-plan {tenantId, enabled}`. Every other org sees the
   paid plans (`ITEM_PRICE_IDS`) and subscribes through Chargebee's hosted
   checkout, which returns it to the billing page.
 - **Top-ups** are charged to the card on file once the customer confirms an
-  amount (₹50, ₹100 or a custom figure): `POST /invoices/create_for_charge_items_and_charges`,
+  amount — one of `TOPUP_AMOUNTS` (₹50 and ₹100 by default) or a custom figure,
+  within `TOPUP_MIN_AMOUNT`..`TOPUP_MAX_AMOUNT`, which billing enforces. The page
+  quotes the amount, never the credits: `POST /invoices/create_for_charge_items_and_charges`,
   the API form of the admin UI's *Add Charge*. The `api_token` charge carries its
   own Credit Grant, so Chargebee grants the credits and billing records the
   grant and moves the LiteLLM cap. The `payment_succeeded` webhook does the same
   for a buyer who closed the tab.
+- **Credits added any other way** — a charge or a grant made by hand in the
+  Chargebee dashboard, a renewal's grant — arrive as `grant_blocks_created`;
+  billing re-reads the org at once, so its LiteLLM cap rises (and an exhausted
+  team reopens) within seconds. The daily resync is only the backstop.
 - **Credits roll over.** Chargebee's grant rollover carries unused credits into
   the next term, and the LiteLLM cap follows Chargebee's usable balance — with
   no monthly reset.
@@ -101,23 +140,43 @@ key out of every other service's process.
 
 ## Who calls it
 
-Only enginos-platform — and billing checks nothing about it.
+enginos-platform, for everything but Chargebee's webhook — and billing checks
+nothing about it. Chargebee, for the webhook — and billing checks its
+credentials itself.
 
 ```
 browser   → crewpe-ui /enginos-api/billing/* → enginos-platform /api/v1/billing/* → billing /api/internal/*
-Chargebee → enginos-platform /api/v1/webhooks/chargebee                          → billing /api/webhooks/chargebee
+Chargebee → billing /api/webhooks/chargebee   (directly: the ONE public path of billing)
 ```
 
 The platform authenticates the user and takes the tenant id from the
-authenticated request, never from what the browser sent. It also checks
-Chargebee's HTTP Basic webhook credentials, which are Chargebee's only
-authentication because it does not sign webhooks. Billing then trusts the
-tenant id it is handed: there is no API key, no webhook password and no 401
-anywhere in this service.
+authenticated request, never from what the browser sent. Billing then trusts
+the tenant id it is handed: there is no API key on `/api/internal/*`.
 
-So **billing must only be reachable from enginos-platform on the private
-network.** Anyone who can reach `:4300` can read and act on any tenant's
-billing, and can forge a Chargebee webhook. `POST /api/internal/sync` (run the
+The webhook is the exception. Chargebee does not sign webhooks, so the HTTP
+Basic credentials set on the endpoint are its only authentication, and
+`POST /api/webhooks/chargebee` checks them against `CHARGEBEE_WEBHOOK_USER` /
+`CHARGEBEE_WEBHOOK_PASSWORD` (constant-time; either one unset refuses every
+delivery with 401). Chargebee calls billing directly: the load balancer (Caddy
+locally) sends exactly `POST /api/webhooks/chargebee` on the app host to
+billing, and no other path of billing is public.
+
+What the webhook acts on (everything else is acknowledged and ignored):
+
+| Event | Billing does |
+|---|---|
+| `subscription_created` `_activated` `_changed` `_renewed` `_reactivated` `_resumed` `_cancelled` `_deleted` | Re-reads the org from Chargebee (the body is only a trigger): link, term, free credits owed, LiteLLM cap; cancels an ended subscription |
+| `payment_succeeded` (invoice with a top-up line) | Records the paid pack once and moves the cap; 500 while its grant block is not visible yet, so Chargebee redelivers |
+| `grant_blocks_created` | Finds the org by its CURRENT subscription (the event names no customer) and re-reads it — credits added by hand reach the cap in seconds |
+| `payment_failed`, `alert_status_changed` | Logged only |
+| anything for a `cbdemo_` customer or subscription | Chargebee's **Test Webhook** sample data: 200, nothing done |
+
+An unknown REAL customer on an event billing acts on answers 500, so Chargebee
+retries it and the failure shows in its delivery log.
+
+So **`/api/internal/*` must only be reachable from enginos-platform on the
+private network.** Anyone who can reach it can read and act on any tenant's
+billing. `POST /api/internal/sync` (run the
 usage sync now) is deliberately not proxied by the platform; it is for operators
 on that network.
 
@@ -139,7 +198,8 @@ is exactly one pricing system and it is the gateway's.
 on subscription creation, and the top-up charge's own Credit Grant when a pack
 is paid (`TOPUP_CHARGEBEE_GRANTS=true`) — billing records that grant and
 allocates nothing. `/ledger_operations/allocate` is used only for a top-up
-charge that carries no grant of its own (`TOPUP_CHARGEBEE_GRANTS=false`).
+charge that carries no grant of its own (`TOPUP_CHARGEBEE_GRANTS=false`), and
+for the free plan's one-time credits (`FREE_PLAN_CREDITS`).
 
 **It does not block LLM requests.** Enforcement is the LiteLLM team's
 `max_budget`, set from Chargebee's live grant blocks at subscription time and
@@ -152,19 +212,19 @@ Three things, in order of how often they do the work:
 
 | Guard | What it stops |
 |---|---|
-| `billing_account.last_processed_ingested_at` | Usage behind the cursor being read again. The cursor moves ONLY past a window Chargebee resolved, so a failure of any kind re-offers the same usage rather than losing or repeating it. It advances by compare-and-set, so a stale worker cannot rewind it either. |
-| `GROUP BY concat(TraceId, ':', SpanId)` | One logical usage event being counted twice inside a window — a re-sent span, or a read that caught `span_nodes` mid-merge. This is event *identity*, and it is a different job from the cursor's. |
-| `chargebee_sync_window_uq` on `(tenant_id, from_ingested_at)` | Two workers opening the same window, and so sending one range under two operation ids. |
+| `billing_account.last_processed_ingested_at` | Usage behind the cursor being read again. The cursor moves ONLY past a range Chargebee resolved, so a failure of any kind re-offers the same usage rather than losing or repeating it. It advances by compare-and-set, so a stale worker cannot rewind it either. |
+| `GROUP BY concat(TraceId, ':', SpanId)` | One logical usage event being counted twice inside a range — a re-sent span, or a read that caught `span_nodes` mid-merge. This is event *identity*, and it is a different job from the cursor's. |
+| `chargebee_sync_window_uq` on `(tenant_id, from_ingested_at)`, and a range opened (or an empty one passed) only while the cursor still sits at its start, under the account row's lock | Two workers reading the same cursor — which compute different ends, since a range runs to `now − lag` — both billing it: exactly one opens or passes it, the other backs off. |
 | `chargebee_sync.id`, written before the capture and sent as the Chargebee ledger operation id | A capture whose response was lost being sent again. The next tick asks Chargebee about that exact id: found → mark SUCCESS and move the cursor; 404 → it never landed, so send it again under the SAME id. |
 
 What that adds up to is **at-least-once processing plus Chargebee's own
 idempotency**, which is the strongest guarantee available across two systems
 that cannot share a transaction. The `GROUP BY` alone does not give exactly-once
-and is not claimed to: it deduplicates one window's rows and has no memory.
+and is not claimed to: it deduplicates one range's rows and has no memory.
 
 ## Reading usage
 
-One query per tenant per window, against that tenant's own database
+One query per tenant per range, against that tenant's own database
 ([`src/integrations/clickhouse/usage-source.ts`](src/integrations/clickhouse/usage-source.ts)). It returns a count and a
 total, not rows:
 
@@ -176,10 +236,10 @@ FROM (
   FROM tenant_<slug>.span_nodes FINAL
   WHERE SpanName = 'litellm_request' AND attrs['gen_ai.cost.total_cost'] != ''
     AND <not a LiteLLM cache hit>
-    AND ingested_at >  {from} AND ingested_at <= {to}
+    AND Timestamp + duration_ms >  {from} AND Timestamp + duration_ms <= {to}
+    AND Timestamp > {from} - 1 hour            -- prunes to the range's day partitions
   GROUP BY event_key
 )
-SETTINGS use_skip_indexes_if_final = 1, use_skip_indexes_if_final_exact_mode = 1
 ```
 
 Things about that are load-bearing:
@@ -188,23 +248,22 @@ Things about that are load-bearing:
   dedup the platform's own migration calls "best-effort by design… not an
   idempotency guarantee". `span_nodes` is a ReplacingMergeTree on
   `(TraceId, SpanId)` — a real per-span dedup key, and the event key here.
-  Since platform tenant migration 030 it keeps a span's FIRST copy, so a
-  collector re-send stays in the window that already billed it; exact mode is
-  pinned so the window filter sees the copy `FINAL` chose
-  ([BILLING-ARCHITECTURE.md §3](docs/BILLING-ARCHITECTURE.md)).
 - **One tenant database, never `merge()` across `otel_landing` and `tenant_*`.**
   The tenant table is a *copy* of landing, so a union counts every routed span
   twice.
-- **`ingested_at`, and no `Timestamp` clause at all.** The worker polls for usage
-  that has *become available*, not usage that happened. A span can land in
-  ClickHouse long after the call it describes; a cursor on span time that has
-  already moved past it would skip it for good. There is no billing floor, no
-  `sync_from`, and no lookback window in this query.
-- **The window is half-open on TIMES, and that is why there is no event id in
+- **When the LLM call ended — `Timestamp + duration_ms` — and nothing billing
+  added to ClickHouse.** Both are read from `span_nodes` as they are: no extra
+  column, no migration. A span is written once its call ends and lands about
+  23 s later (p99 44 s, measured), so a range is read only once it is
+  `BILLING_LAG_MS` old (60 s default, never under 30 s); a span landing later
+  than that is behind the cursor and never billed. A collector re-send carries
+  the same start and duration, so it falls in the same range and is never
+  billed twice.
+- **The range is half-open on TIMES, and that is why there is no event id in
   the cursor.** Many spans share one millisecond. A boundary that was "the last
   event of a page" could fall inside one, which is what the old
-  `(ingested_at, TraceId:SpanId)` cursor pair existed to survive. A boundary that
-  is a time cannot: every millisecond belongs whole to exactly one window.
+  `(time, TraceId:SpanId)` cursor pair existed to survive. A boundary that
+  is a time cannot: every millisecond belongs whole to exactly one range.
 - **`GROUP BY event_key` is the deduplication**, and it is a separate job from
   the cursor. The cursor says which time range; the key says which rows are the
   same event. `any()` rather than `max()` on the cost, because copies of one span
@@ -215,35 +274,38 @@ Things about that are load-bearing:
 
 ## The cursor
 
-It moves to the end of a window Chargebee resolved, and to nothing else.
+It moves to the end of a range Chargebee resolved, and to nothing else.
 
-- **An unresolved window leaves it exactly where it is**, so the same usage is
+- **An unresolved range leaves it exactly where it is**, so the same usage is
   offered again next minute. That, and nothing else, is what retains usage a
   customer had no credits for — there is no requeue step because nothing was ever
   dequeued.
-- **An empty window still advances it.** The aggregate covered the whole range
-  rather than a page of it, so "no events" is a fact about the window, not a
+- **An empty range still advances it.** The aggregate covered the whole range
+  rather than a page of it, so "no events" is a fact about the range, not a
   failure to read it. No row is written: a log of empty minutes is noise.
-- **A window is a FIXED span starting at the cursor** (`BILLING_WINDOW_MS`,
-  default one minute), processed only once it fits entirely inside `now − lag`.
-  Its end is therefore a function of its start — which is what lets two workers
-  reading the same cursor agree on which window they are looking at, so the
-  uniqueness index can tell that they are competing. A window sized to "whatever
-  is available" would give them different ends for the same start, and one could
-  charge a range the other had already advanced the cursor over.
-- **Catch-up is bounded by time, not by rows.** A tenant behind after an outage
-  drains one window at a time, up to `BILLING_MAX_WINDOWS_PER_TICK` per tick.
+- **A range runs from the cursor to `now − lag`** — ordinarily the minute since
+  the last pass. Two workers reading the same cursor a moment apart compute
+  different ends, and that is safe: a row is opened, and an empty range passed,
+  only while the cursor still sits at its start, under the account row's lock,
+  so exactly one of them bills or passes it and the other backs off. A retry
+  never recomputes a range: it re-sends the row it stored, under that row's id.
+- **Catch-up goes an hour at a time** (`BILLING_MAX_RANGE_MS`), one Chargebee
+  charge per hour. Chargebee refuses a charge larger than the balance whole, so
+  an org that ran out mid-outage has at most an hour held, not the whole outage.
+  A pass starts no new range after 3 minutes; the next minute's pass carries on
+  from each cursor, so a long outage never runs the task into its timeout.
 
 ## Cadence is not freshness
 
-The cron runs every minute and reads only what ClickHouse ingested before
-`now − BILLING_LAG_MS` (taken from ClickHouse's own clock) — reading up to the
-instant would race rows still being inserted.
+The cron runs every minute and reads only LLM calls that ended before
+`now − BILLING_LAG_MS` (taken from ClickHouse's own clock; 60 s by default,
+never under 30 s) — reading closer to the present would bill a range before
+its spans land.
 
 A tenant can be run by more than one caller at once — the cron, the manual sync
-route, a second replica, an old worker mid-rollout — and each window is still
-charged once. `chargebee_sync_window_uq` refuses a second row for a window; a
-window is written, and an empty one passed, only while the cursor still sits at
+route, a second replica, an old worker mid-rollout — and each range is still
+charged once. `chargebee_sync_window_uq` refuses a second row for a range start; a
+range is written, and an empty one passed, only while the cursor still sits at
 its start; the cursor advances only by compare-and-set; every send first claims
 its row by compare-and-set; and a `PROCESSING` row is left to its sender for a
 5-minute lease, so a capture still on the wire is never sent again. See

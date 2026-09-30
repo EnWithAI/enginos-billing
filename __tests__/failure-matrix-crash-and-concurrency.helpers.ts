@@ -56,7 +56,7 @@ export function rig(opts: { balance?: number; cursorAt?: number; account?: Recor
       chargebee,
       usdPerCredit: RATE,
       lagMs: LAG,
-      windowMs: MINUTE,
+      maxRangeMs: MINUTE,
       clock,
       logger: recordingLogger(logs),
       ...overrides,

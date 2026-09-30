@@ -8,6 +8,28 @@ This is the third and last step of the table reduction. The first two are
 history; they are recorded here because the reasoning for what was removed still
 applies, and because the migrations are hand-authored and read in order.
 
+> **Since this plan (2026-09-30).** The plan below is kept as written; the
+> current behaviour is in [SCHEMA.md](SCHEMA.md) and [UPDATE-PATHS.md](UPDATE-PATHS.md).
+>
+> - **Usage is read by call END time**, `addMilliseconds(Timestamp, duration_ms)`,
+>   from `span_nodes FINAL` as it is: no ClickHouse change. Tenant migrations
+>   029 (`ingested_at`) and 030 (first copy wins) are withdrawn. The
+>   `*_ingested_at` column names are kept; they hold call end times.
+> - **Ranges replace fixed windows**: cursor → `now − BILLING_LAG_MS`, at most
+>   `BILLING_MAX_RANGE_MS` (1 h). `BILLING_WINDOW_MS` and
+>   `BILLING_MAX_WINDOWS_PER_TICK` are removed, and the "fixed span" argument
+>   in change 1 no longer holds: two workers with different ends from one
+>   cursor are kept apart by `openWindow` and `advancePastEmptyWindow`, both
+>   compare-and-set on the cursor under the account row's lock.
+> - **The Chargebee webhook goes to billing directly**, which checks the HTTP
+>   Basic credentials itself; enginos-platform no longer forwards it.
+> - **Free-plan credits are granted once** by billing — `FREE_PLAN_CREDITS`
+>   less the plan's own grant, into `FREE_PLAN_CREDIT_UNIT` when there is no
+>   wallet — under a `free-plan-credits` row in `topup_grant`.
+> - **Two schema additions:** `WRITTEN_OFF`, an eighth sync status
+>   (`20260924120000`), and `topup_grant` (`20260924190000`), which replaced the
+>   ledger-metadata top-up guard below.
+
 ## Where it started, and where it is
 
 | Step | Migration | Tables carrying usage billing |
@@ -160,8 +182,10 @@ credit ledger gone, every one of them re-reads Chargebee and applies what it
 says, so a redelivery converges rather than doubling.
 
 The two writes that are not convergent are guarded at the write: the cursor
-update is create-only, and top-up grants are keyed on the invoice id inside
-Chargebee's own ledger with an idempotency header on the allocate.
+update is create-only, and top-up grants are keyed on the invoice id — since
+`20260924190000_topup_grant` in a local `topup_grant` row, because Chargebee
+never returns the metadata the ledger scan looked for — with an idempotency
+header on the allocate.
 
 The cost is real and worth naming: per-tenant webhook history and the
 `unmapped customer` marker are gone from our database. In exchange a failing

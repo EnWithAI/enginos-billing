@@ -33,10 +33,11 @@ the top-up charge. It moves money, and a timeout says nothing about whether the
 card was charged — a second send could charge it twice.
 
 **The idempotency header is used sparingly.** `chargebee-idempotency-key` is sent
-on two calls — `/ledger_operations/allocate` and the free-plan subscribe
-(`free-plan:<tenant>`) — because its replay window is 30 minutes: fine for a
-repeat seconds later, useless for a capture stuck behind an hours-long outage.
-Capture uses a client-supplied `id` instead.
+on two calls — `/ledger_operations/allocate` (`invoice:<id>` for a pack,
+`free-plan-credits:<tenant>` for the free plan's credits) and the free-plan
+subscribe (`free-plan:<tenant>`) — because its replay window is 30 minutes:
+fine for a repeat seconds later, useless for a capture stuck behind an
+hours-long outage. Capture uses a client-supplied `id` instead.
 
 ---
 
@@ -44,8 +45,8 @@ Capture uses a client-supplied `id` instead.
 
 An org the free plan is for — `billing_account.free_plan`, or
 `FREE_PLAN_DEFAULT` (off) when that is empty — is put on
-`FREE_PLAN_ITEM_PRICE_ID` (`pre-paid-test-v1-INR-Yearly`, ₹0 a year, 1,000
-credits) by `checkout.provisionFreePlan`: enginos-platform calls
+`FREE_PLAN_ITEM_PRICE_ID` (`pre-paid-test-v1-INR-Yearly`, ₹0 a year, its own
+Credit Grant cut to zero) by `checkout.provisionFreePlan`: enginos-platform calls
 `POST /api/internal/provision` once the org's LiteLLM team exists, and the
 billing page calls it again for such an org with no subscription. It creates
 the customer (§1 below) for **every** org, with the admin's email; for an org
@@ -61,20 +62,60 @@ subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Yearly
 ```
 
 MEASURED 2026-09-28 with a customer that has **no card**: the subscription came
-back `active` and its ₹0 invoice `paid`, and Chargebee granted 1,000 `token-test`.
-The grant block — and the ledger account billing charges usage against — came
-**three seconds after** the subscription, so the link (§5) is repeated once a
-second until `ledger_unit_id` is set. From sign-up to a $20 LiteLLM cap
+back `active` and its ₹0 invoice `paid`, and — while the plan still carried a
+grant — Chargebee granted 1,000 `token-test`. The grant block, and the ledger
+account billing charges usage against, came **three seconds after** the
+subscription, so the link (§5) is repeated once a second, up to 10 times, until
+`ledger_unit_id` is set. From sign-up to a $20 LiteLLM cap
 (`CREDITS_PER_USD=50`) took about twelve seconds for `org-billtest2-com`.
+
+## The free credits — billing's own allocate, once per org
+
+A plan's Credit Grant comes again at every renewal, so the yearly free plan's
+is cut to zero (or a single token) and billing grants the credits itself:
+`FREE_PLAN_CREDITS` is the **total** each free-plan org starts with, granted
+**once per org, ever**, into `FREE_PLAN_CREDIT_UNIT` (required with it). It runs
+inside the link (`syncSubscription` → `grantFreePlanCredits`), before the
+account is activated:
+
+```http
+POST /api/v2/ledger_operations/allocate
+chargebee-idempotency-key: free-plan-credits:<tenant uuid>
+
+subscription_id=<subscription>
+&unit_id=token-test
+&amount=1000.0000000000
+&expires_at=<10 years out>
+&metadata[json]={"invoice_id":"free-plan-credits","tenant_id":"<tenant uuid>"}
+```
+
+- **A zero-grant plan has no wallet.** MEASURED 2026-09-30: no grant block, no
+  balance, no unit on the subscription. The allocate into
+  `FREE_PLAN_CREDIT_UNIT` creates the wallet, and the account then **adopts**
+  that unit as its `ledger_unit_id`.
+- **Amount** = `FREE_PLAN_CREDITS` − what the plan's own grant gave (floor 0),
+  read from `GET /grant_blocks`. A plan that gave at least that — every org put
+  on it before the cut — is recorded and nothing is allocated.
+- **Exactly once**: the `topup_grant` row `free-plan-credits`, claimed before
+  the call, and the key above. `expires_at` is 10 years out (allocate requires
+  one).
+- **A failed allocate** holds the account `activating`, its team blocked, and
+  `activatePending` retries it every minute.
+
+MEASURED 2026-09-30: `org_aaa_com`, created on the zero-grant plan, had no
+wallet and got nothing before this; after it, billing allocated 1,000
+`token-test`, the wallet appeared, and the account adopted it.
 
 # Subscription creation, end to end
 
 What happens from "customer clicks Subscribe" to "credits enforced at the gateway".
-The page no longer offers a paid plan; steps 3 and 4 are how one would be bought.
+The page offers the paid plans (`ITEM_PRICE_IDS`) to an org the free plan is not
+for; steps 3 and 4 are how one is bought.
 
 ## 1. `POST /customers` — ensure the customer
 
-Called before checkout, from `ensureCustomer()`.
+Called at onboarding for every org (`provisionFreePlan` → `ensureCustomer()`),
+and again before a checkout if it is still missing.
 
 ```http
 POST /api/v2/customers
@@ -142,6 +183,7 @@ POST /api/v2/hosted_pages/checkout_new_for_items
 customer[id]=5f0335de-d45e-411b-80da-1c1fc8d3ace1
 &subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Monthly
 &subscription_items[quantity][0]=1
+&redirect_url=https://dev.127.0.0.1.nip.io/organization/billing?from=checkout
 ```
 
 ```json
@@ -149,9 +191,11 @@ customer[id]=5f0335de-d45e-411b-80da-1c1fc8d3ace1
                    "type": "checkout_new", "state": "created", "expires_at": 1789812108 } }
 ```
 
-**No `redirect_url` is sent, deliberately.** Setting one makes Chargebee navigate
-away instead of calling `openCheckout`'s `success` callback in place — and that
-callback is what triggers the post-checkout pull in step 5.
+**`redirect_url` is `APP_URL/organization/billing?from=checkout`.** The browser is
+sent to the page, and Chargebee returns it with `&id=<hosted page>&state=succeeded`
+— which is what triggers the post-checkout pull in step 5. (With Chargebee.js's
+`openCheckout` it would have to be left out: a `redirect_url` makes Chargebee
+navigate away instead of calling the `success` callback in place.)
 
 The `item_price_id` is validated against the `ITEM_PRICE_IDS` allowlist *before*
 this call. It arrives in the request body from the browser, so without that check a
@@ -161,11 +205,13 @@ tampered request could subscribe a tenant to any item price in the catalogue.
 
 Chargebee creates the subscription and — because the item price carries a **Credit
 Grant configuration** — issues the credits automatically. We never call an allocate
-endpoint for a plan's credits; we read what Chargebee granted and mirror it.
+endpoint for a paid plan's credits; we read what Chargebee granted and mirror it.
+The one plan billing allocates for is the free plan, once per org (above).
 
 ## 5. `GET /subscriptions` — the pull path
 
-The UI calls it from the checkout success callback, through enginos-platform
+The page calls it when Chargebee returns the browser with
+`?from=checkout&state=succeeded`, through enginos-platform
 (`POST /api/v1/billing/sync-subscription` → `/api/internal/sync-subscription`), which
 reaches `activeSubscriptions()`:
 
@@ -176,7 +222,10 @@ GET /api/v2/subscriptions
   &limit=10
 ```
 
-Results are sorted newest-first by `created_at`; the first is used.
+Results are sorted newest-first by `created_at`. Which one gets the usage is
+decided in `models/subscription.ts`: the one already linked while it is still
+active, else the only one, else the newest selling a plan on `ITEM_PRICE_IDS`,
+else the newest.
 
 ```json
 {
@@ -199,13 +248,15 @@ Results are sorted newest-first by `created_at`; the first is used.
 }
 ```
 
-**`current_term_start` (a unix second) is load-bearing** — it is half the grant
-idempotency key, `sub:<subscription id>:<term start>`.
+**`current_term_start` (a unix second) is load-bearing** — a term start later
+than the one on file is how a renewal is recognised, and it is the term the
+LiteLLM spend baseline is recorded for (`billing_baseline_term`), so a second
+delivery of the same renewal moves nothing.
 
-This exists because the webhook is not enough on its own: Chargebee cannot reach a
-developer machine at all, and even in production a delivery can be delayed, dropped,
-or land mid-deploy. Both paths are idempotent and share one key, so whichever
-arrives first does the work.
+This exists because the webhook is not enough on its own: Chargebee reaches a
+developer machine only through a tunnel, and even in production a delivery can be
+delayed, dropped, or land mid-deploy. Both paths re-read Chargebee and apply it
+whole, so whichever arrives first does the work and the other changes nothing.
 
 ## 6. `GET /ledger_account_balances` — the credit unit and balance
 
@@ -279,16 +330,19 @@ granted`, and the team's own cumulative spend is what consumes it.
 ```
 billing_account   subscription id, unit, item price, term, status
 billing_account   last_processed_ingested_at = now()  ← billing starts here, never earlier
+topup_grant       free-plan-credits (free plan only)  ← the one-time allocate's guard; ledger_unit_id adopted
 LiteLLM /team/update  max_budget = baseline + USD(live grant blocks), budget_duration = null
 billing_account   status → active
 ```
 
-No credit figure is written anywhere. The grant lives in Chargebee and is
-re-read from `/grant_blocks` whenever the cap is set or the page is rendered.
+No balance is written anywhere — only the guard row's record of what one
+allocate asked for. The grant lives in Chargebee and is re-read from
+`/grant_blocks` whenever the cap is set or the page is rendered.
 
 The account only becomes `active` once the gateway holds the budget. If the push
-fails it is held `activating` with its team blocked — the customer has paid, but the
-gateway would otherwise enforce a budget nobody computed.
+fails — or the free plan's credits are still owed — it is held `activating` with
+its team blocked, and `activatePending` retries every minute: the customer has
+paid, but the gateway would otherwise enforce a budget nobody computed.
 
 ---
 
@@ -357,10 +411,11 @@ The match is strict: same id, `type` containing `capture`, and the same
 subscription. A grant is not a charge, and matching one would suppress a real
 capture forever.
 
-## `POST /ledger_operations/allocate` — top-up only
+## `POST /ledger_operations/allocate` — a grant-free top-up, and the free credits
 
-The **only** call using `chargebee-idempotency-key`, because Chargebee accepts no
-client-supplied id here. Requires a mandatory `expires_at`.
+Uses `chargebee-idempotency-key` (`invoice:<id>`, or `free-plan-credits:<tenant>`),
+because Chargebee accepts no client-supplied id here. Requires a mandatory
+`expires_at`.
 
 MEASURED (2026-09-24): the key replays only the **same request** — a second call
 under it with a different `expires_at` is refused ("The idempotency key provided
@@ -377,9 +432,10 @@ the original grant); past it, the subscription's `grant_blocks` are searched for
 the allocation before anything is sent again. See BILLING-ARCHITECTURE.md §10.
 
 Allocate is the path for a pack whose charge carries **no** Credit Grant
-(`TOPUP_CHARGEBEE_GRANTS=false`). A pack whose charge carries its **own** grant is
-granted by Chargebee, and billing records that grant and allocates nothing — see
-**Top-up** below.
+(`TOPUP_CHARGEBEE_GRANTS=false`), and for the free plan's one-time credits (a
+`topup_grant` row under `free-plan-credits`, above). A pack whose charge carries
+its **own** grant is granted by Chargebee, and billing records that grant and
+allocates nothing — see **Top-up** below.
 
 ---
 
@@ -389,6 +445,12 @@ The pack is `api_token-INR`: a charge, `per_unit`, `price: 100` (₹1.00 a unit)
 carrying its **own** Credit Grant of **50 `token-test` per unit** (measured from
 the grant blocks — the grant configuration is not readable over the API, see §2).
 `TOPUP_CHARGEBEE_GRANTS=true` tells billing that Chargebee grants it.
+
+**A top-up is always in the subscription's currency.** MEASURED 2026-09-30: a
+charge in a different currency from the subscription is refused —
+`currency_mismatched`, *"currency of the item(s) is different from the expected
+value 'INR'"*. Everything on the site is INR today; `api_token-USD` exists but
+nothing uses it.
 
 ## `POST /invoices/create_for_charge_items_and_charges` — charge the pack
 
@@ -623,19 +685,22 @@ every tenant at once and a person fixes it.
 | `paidInvoicesFor()` | `GET /invoices?customer_id[is]=…&status[is]=paid&sort_by[desc]=date` | Proof of payment for a top-up. See **Top-up**. |
 | `transactionsPage()` | `GET /transactions?customer_id[is]=…&offset=…` | The payment history, by cursor. See **The billing page's reads**. |
 | `managePaymentSourcesPage()` | `POST /hosted_pages/manage_payment_sources` | The *Update card* page. See **The billing page's reads**. |
-| `ledgerOperations()` | `GET /ledger_operations?subscription_id[is]=…` | One page of history. **Not** a top-up guard: operation metadata is never returned. |
+| `ledgerOperations()` | `GET /ledger_operations?subscription_id[is]=…` | One page of history, read only by `scripts/e2e-prepaid.ts` to see the captures the worker sent. **Not** a top-up guard: operation metadata is never returned. |
 | `grantBlocks()` | `GET /grant_blocks?subscription_id[is]=…` (paginated) | Every grant block with the invoice line that issued it — how the top-up guard recognises a pack Chargebee granted itself, and finds a lost allocation past the key's window. |
 | `subscription()` | `GET /subscriptions/{id}` | One subscription by id. Null only on a 404 `resource_not_found`; anything unclear throws. |
 
 # Webhooks (inbound)
 
-Chargebee POSTs to **enginos-platform** (`/api/v1/webhooks/chargebee`) with **HTTP
-Basic** credentials (`CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD`, in the
-platform's env). The platform checks them and forwards the body verbatim to billing's
-`/api/webhooks/chargebee`, which checks no credentials of its own and must not be
-reachable from the internet. **Chargebee does not sign webhooks** — there is no HMAC
-to verify — so those credentials are the only thing in front of an endpoint that
-grants credits.
+Chargebee POSTs **directly to billing**'s `/api/webhooks/chargebee` — the one
+public path of billing. The load balancer (Caddy locally) has an exact-path,
+POST-only rule for it on the app host; nothing else of billing is public, and
+crewpe-ui and enginos-platform are not in the path (`/api/internal/*` stays
+private, reachable only from the platform). Billing checks the **HTTP Basic**
+credentials (`CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD`, in billing's
+env, compared in constant time) before anything else; either one unset refuses
+every delivery with 401 `webhook-unauthorized`. **Chargebee does not sign
+webhooks** — there is no HMAC to verify — so those credentials are the only thing
+in front of an endpoint that grants credits.
 
 ```json
 { "id": "ev_…", "event_type": "subscription_created",
@@ -646,31 +711,42 @@ grants credits.
                "customer": { "id": "…" } } }
 ```
 
+`grant_blocks_created` is shaped differently: `content.grant_blocks[]`, each naming
+its `subscription_id`, and **no customer** (MEASURED 2026-09-30).
+
 Handled:
 
 | Event | Effect |
 |---|---|
 | `subscription_created`, `_activated`, `_changed`, `_renewed`, `_reactivated`, `_resumed`, `_cancelled`, `_deleted` | A trigger only: the customer's subscriptions are re-read from Chargebee and applied (`syncFromChargebee`). |
-| `payment_succeeded` | For an invoice with a line for the top-up item price only: applies paid packs, exactly as the page's own apply does — what grants a pack whose buyer closed the tab. While a grant-carrying pack's block is not visible yet it answers **500 on purpose**, so Chargebee redelivers once the block is there. Any other payment is ignored. |
+| `payment_succeeded` | For an invoice with a line for the top-up item price only: applies paid packs (`applyPaidTopUps`), exactly as the page's own apply does — what grants a pack whose buyer closed the tab. While a grant-carrying pack's block is not visible yet it answers **500 on purpose**, so Chargebee redelivers once the block is there. Any other payment is ignored. |
+| `grant_blocks_created` | Credits were added to a subscription — any credits: a pack's grant, a charge or grant made **by hand in the Chargebee dashboard**, a renewal's grant, billing's own allocate. The org whose **current** subscription it names is re-read (`syncFromChargebee`): its LiteLLM limit rises, and an exhausted team reopens, within seconds instead of at the daily resync. A declined pack's credits stay held back there. A subscription that is no org's current one (an ended one, a `cbdemo_` one) is logged `billing.webhook.grant_unlinked_subscription` and answered 200 — never retried. |
 | `payment_failed`, `alert_status_changed` | Logged only. |
+| Any event for a `cbdemo_` customer | Chargebee's sample data (the **Test Webhook** button, e.g. `subscription_created` for `cbdemo_tom`): 200, logged `billing.webhook.sample_event`, nothing done. |
 
 Any other event type is acknowledged with **200** and ignored — nothing is logged
-or stored for it. The platform has authenticated the delivery before billing sees
-it.
+or stored for it. An unknown **real** customer on an event billing acts on answers
+**500** (`unmapped customer`), so Chargebee retries it.
 
 **Delivery, measured end to end (2026-09-28).** Endpoint `whv2_169rpvVWV3RVFFh0`
-("test"): all events, API version v2, Basic auth, pointed at a `cloudflared` quick
-tunnel to the platform on `:4100`. A ₹1 pack charged straight in Chargebee —
-invoice 109, no billing page involved, so only the webhook could record it —
-produced five events, every one delivered `succeeded`:
+("test"): all events, API version v2, Basic auth, then pointed at a `cloudflared`
+quick tunnel (to the platform, which forwarded it in those days). A ₹1 pack
+charged straight in Chargebee — invoice 109, no billing page involved, so only the
+webhook could record it — produced five events, every one delivered `succeeded`:
 
 | Event | Billing |
 |---|---|
 | `payment_succeeded` | Recorded invoice 109's grant (`catalogue_grant`, 50) in `topup_grant`, 3 s after payment |
 | `invoice_generated` | Acknowledged, ignored |
-| `grant_blocks_created` | Acknowledged, ignored |
+| `grant_blocks_created` | Acknowledged, ignored then; today it re-reads the org (above) |
 | `ledger_updated` | Acknowledged, ignored |
 | `ledger_account_balance_updated` | Acknowledged, ignored |
+
+**Direct to billing, measured (2026-09-30)** on the test site through a tunnel to
+Caddy's app host: real `customer_changed` deliveries `ev_AzyoW0VWhVc2QURM` and
+`ev_AzZMkgVWhVgznUur` → `succeeded`. Chargebee's Test Webhook sample
+(`subscription_created` for `cbdemo_tom`) got 500 before the `cbdemo_` rule and
+200 after.
 
 **Read delivery per endpoint, not per event.** `GET /events` returns a top-level
 `webhook_status` that stays `not_configured` even when the event was delivered to
@@ -686,21 +762,29 @@ an endpoint added under Webhooks; the delivery is in `webhooks[]`:
 Before any endpoint existed (up to 2026-09-28 08:00), `webhooks` was empty on every
 event. `GET /webhook_endpoints` lists the endpoints themselves.
 
-**Subscribe to what is handled.** Four of the five events a top-up produces are
+**Subscribe to what is handled.** Three of the five events a top-up produces are
 acknowledged and ignored, so an endpoint taking ALL events carries mostly noise.
 Selecting only the events in the table above loses nothing.
 
-**Setting it up.** *Settings → Configure Chargebee → API Keys and Webhooks →
-Webhooks → Add webhook*: the platform's public URL + `/api/v1/webhooks/chargebee`,
-*Protect webhook URL with basic authentication* ticked with the platform's
-`CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD`, API version V2. Wrong or
-missing credentials answer 401 `webhook-unauthorized`, and Chargebee retries. A
-developer machine needs a tunnel — `cloudflared tunnel --url http://localhost:4100`
-— whose URL changes on every restart, so the endpoint's URL has to be updated in
-Chargebee each time.
+**Setting it up.** *Settings → Configure Chargebee → Webhooks*: URL
+`https://<app host>/api/webhooks/chargebee` (production
+`https://app.enwithai.com/api/webhooks/chargebee`), *Protect webhook URL with
+basic authentication* ticked with billing's `CHARGEBEE_WEBHOOK_USER` /
+`CHARGEBEE_WEBHOOK_PASSWORD`, API version V2. Wrong or missing credentials answer
+401 `webhook-unauthorized`, and Chargebee retries. A developer machine needs a
+`cloudflared` tunnel to Caddy's app host — never straight to billing's `:4300`,
+which would publish `/api/internal/*`:
+
+```bash
+cloudflared tunnel --url https://127.0.0.1:443 --http-host-header dev.127.0.0.1.nip.io \
+  --origin-server-name dev.127.0.0.1.nip.io --no-tls-verify
+```
+
+The tunnel's URL changes on every restart, so the endpoint's URL has to be updated
+in Chargebee each time.
 
 A body with no `id` or `event_type` gets **400**. A failed handler returns **500**,
-not 200, and enginos-platform hands that status to Chargebee unchanged. Billing
+not 200, and Chargebee sees that status. Billing
 keeps no record of the event (see **Webhook replays** in SCHEMA.md), so handing the
 failure back is what keeps it from vanishing: Chargebee retries a non-2xx, and a
 webhook that keeps failing shows up in Chargebee's own delivery log.

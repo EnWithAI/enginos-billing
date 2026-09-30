@@ -414,7 +414,6 @@ export function matrixRig(
   opts: {
     balance?: string;
     timeoutMs?: number;
-    maxWindowsPerTick?: number;
     blockBudget?: (tenantId: string, reason?: BlockReason) => Promise<void>;
     prismaWrap?: (prisma: any) => any;
   } = {},
@@ -446,8 +445,7 @@ export function matrixRig(
       chargebee: client,
       usdPerCredit: RATE,
       lagMs: LAG,
-      windowMs: MINUTE,
-      ...(opts.maxWindowsPerTick ? { maxWindowsPerTick: opts.maxWindowsPerTick } : {}),
+      maxRangeMs: MINUTE,
       clock: () => {
         prisma._now = now;
         return now;
