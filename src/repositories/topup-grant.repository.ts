@@ -38,6 +38,13 @@ export const TOPUP_SOURCE = {
   CATALOGUE_GRANT: "catalogue_grant",
 } as const;
 
+/**
+ * The row that grants the free plan's credits (`FREE_PLAN_CREDITS`), stored
+ * under this in place of an invoice id — so the unique index allows one per
+ * tenant, ever, and the rest of the guard treats it exactly as a pack.
+ */
+export const FREE_PLAN_GRANT = "free-plan-credits";
+
 /** One caller's right to send a row's allocate: which row, and the attempt it claimed. */
 export interface TopUpAttempt {
   id: string;

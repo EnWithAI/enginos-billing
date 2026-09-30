@@ -450,9 +450,12 @@ describe("the gate check reopens only what billing blocked, within its time", ()
   it("runs after the usage sync in the worker, so a hung LiteLLM cannot starve billing", () => {
     const worker = readFileSync(fileURLToPath(new URL("../worker/hatchet-worker.ts", import.meta.url)), "utf8");
     const sweep = worker.slice(worker.indexOf('name: "sweep"'));
-    expect(sweep.indexOf(".runOnce()")).toBeGreaterThan(0);
-    expect(sweep.indexOf(".reopenBlockedActive(")).toBeGreaterThan(sweep.indexOf(".runOnce()"));
+    expect(sweep.indexOf(".runOnce(")).toBeGreaterThan(0);
+    expect(sweep.indexOf(".reopenBlockedActive(")).toBeGreaterThan(sweep.indexOf(".runOnce("));
     expect(sweep).toMatch(/reopenBlockedActive\(\{ deadline:/);
+    // And the usage sync has its own deadline, so a catch-up after an outage
+    // cannot run the task into its timeout before the gate check gets a turn.
+    expect(sweep).toMatch(/runOnce\(undefined, \{ deadline:/);
   });
 });
 

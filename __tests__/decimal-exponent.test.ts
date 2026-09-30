@@ -135,7 +135,7 @@ describe("a window worth less than a millionth of a dollar bills, and never wedg
       chargebee,
       usdPerCredit: RATE,
       lagMs: MINUTE,
-      windowMs: MINUTE,
+      maxRangeMs: MINUTE,
       clock: () => now,
       logger: { ...quietLogger, error: (o: unknown) => void errors.push(o as Record<string, unknown>) },
     });

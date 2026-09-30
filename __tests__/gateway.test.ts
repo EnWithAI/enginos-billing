@@ -259,7 +259,6 @@ describe("account lifecycle drives the cap", () => {
     createCustomer: async ({ id }: { id: string }) => ({ id }),
     balance: async () => ({ unitId: "token-test", unitName: "token-test", usable, onHold: "0" }),
     grantedCredits: async () => ({ credits: granted, blocks: 1 }),
-    ledgerOperations: async () => [],
     paidInvoicesFor: async () => [],
     subscriptionIdsOf: async () => ["sub_1"],
     activeSubscriptions: async () => [

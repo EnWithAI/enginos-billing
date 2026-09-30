@@ -10,7 +10,7 @@ budget. The running example is the org **Ee** (tenant id `691d4664-…`, team
 `org_ee_com`).
 
 **Money in one line.** `CREDITS_PER_USD=50`: 50 credits buy $1 of AI usage, so
-the free plan's 1,000 credits are a $20 budget.
+the free plan's 1,000 credits (`FREE_PLAN_CREDITS`) are a $20 budget.
 
 ---
 
@@ -37,13 +37,16 @@ the free plan's 1,000 credits are a $20 budget.
 1. A subscription is created **in Chargebee** — by billing itself (the free
    plan), by the customer paying on Chargebee's checkout (a paid plan), or by
    someone in the Chargebee dashboard.
-2. Chargebee issues the plan's **credits** as a grant block, a few seconds
-   after the subscription.
+2. A paid plan's **credits** are issued by Chargebee as a grant block, a few
+   seconds after the subscription. The free plan's own grant is cut to zero,
+   so a renewal gives nothing: billing **allocates** its credits itself, once
+   per org, ever.
 3. Billing finds out — from the call it made itself, from Chargebee's webhook,
    from the billing page right after checkout, or from the daily resync. **All
    of them run the same code:** `syncFromChargebee()`.
 4. Billing **links** the subscription to the org's `billing_account`, and
-   **starts billing usage from now**.
+   **starts billing usage from now**. On the free plan it grants the org's
+   free credits here, before the account is activated.
 5. Billing sets the org's **LiteLLM budget** to its credits in USD and opens
    the team. The account becomes `active`, and the gateway lets the org's AI
    calls through.
@@ -57,9 +60,10 @@ the free plan's 1,000 credits are a $20 budget.
 | **Started by** | Billing — at sign-up, by an operator, or by the billing page | The org's admin, clicking **Subscribe** | Someone in the Chargebee dashboard or API |
 | **For** | An org the free plan is for | An org with no plan (the default) | Any org |
 | **Card** | None — it costs ₹0 | Entered on Chargebee's page | Whatever they set up |
-| **Chargebee call** | `POST /customers/{id}/subscription_for_items` | `POST /hosted_pages/checkout_new_for_items`, then the customer pays | — |
-| **Billing finds out from** | Its own call, waiting for the credits | The webhook **and** the page's return | The webhook, or the daily resync |
-| **Ready in** | ~3–10 s, inside the request | Seconds after payment | Seconds (webhook) to a day (resync) |
+| **Chargebee call** | `POST /customers/{id}/subscription_for_items`, then `POST /ledger_operations/allocate` (the free credits) | `POST /hosted_pages/checkout_new_for_items`, then the customer pays | — |
+| **Credits from** | Billing's one-time allocate (`FREE_PLAN_CREDITS`) | The plan's Credit Grant | The plan's Credit Grant |
+| **Billing finds out from** | Its own call, which also grants the credits | The webhook **and** the page's return | The webhook, or the daily resync |
+| **Ready in** | Seconds, inside the request | Seconds after payment | Seconds (webhook) to a day (resync) |
 
 ---
 
@@ -93,8 +97,7 @@ sequenceDiagram
         UI->>P: POST /billing/sync-subscription
         P->>B: POST /api/internal/sync-subscription
     and Chargebee's webhook
-        CB->>P: POST /api/v1/webhooks/chargebee (subscription_created, Basic auth)
-        P->>B: POST /api/webhooks/chargebee
+        CB->>B: POST /api/webhooks/chargebee, direct (subscription_created, Basic auth)
     end
 
     B->>CB: GET subscriptions, balance, grant blocks
@@ -126,10 +129,31 @@ Billing creates it in `checkout.provisionFreePlan()`, from three places:
 | 5 | Link, don't create, if Chargebee already holds a live subscription (a call that died half-way) | `GET /subscriptions` |
 | 6 | The plan must cost **₹0** — a card-less customer is never put on a paid plan | `GET /item_prices/{id}` |
 | 7 | Create it. Idempotency key `free-plan:<tenant id>` makes concurrent calls create **one** | `POST /customers/{id}/subscription_for_items` |
-| 8 | Link it, **waiting for the credits**: `syncFromChargebee()` once a second, up to 10 times, until the credit unit appears | see [section 8](#8-linking-and-activation--the-common-path) |
+| 8 | Link it — `syncFromChargebee()`, which **grants the free credits** before activating (section 8.2 step 5). Repeated once a second, up to 10 times, until the account has a credit unit; normally the first pass has one | see [section 8](#8-linking-and-activation--the-common-path) |
 
-Chargebee then also sends `subscription_created`; the webhook runs the same
-link again and changes nothing.
+### The free credits — granted once per org
+
+`FREE_PLAN_CREDITS` is the **total** each free-plan org starts with, granted
+**once per org, ever**; `FREE_PLAN_CREDIT_UNIT` (`token-test`) is required with
+it. The plan's own Credit Grant is cut to zero (or a single token) in the
+catalogue, because Chargebee issues a plan's grant again at every yearly
+renewal; this one is not.
+
+| Rule | Detail |
+| --- | --- |
+| Where | Inside the link (`syncSubscription` → `grantFreePlanCredits()`), before `activate()` — so the budget pushed already counts them |
+| How much | `FREE_PLAN_CREDITS` − what the plan's own grant gave (floor 0). A plan that gave at least that — every org put on it before the cut — is recorded, and nothing allocated |
+| The wallet | MEASURED 2026-09-30: a zero-grant plan gets **no wallet** from Chargebee — no grant block, no balance, no unit. The allocate into `FREE_PLAN_CREDIT_UNIT` creates it, and the account then **adopts** that unit (`ledger_unit_id`) |
+| Exactly once | A `topup_grant` row under `free-plan-credits`, claimed before the call, and idempotency key `free-plan-credits:<tenant id>`. A resubscription to the free plan gets nothing |
+| Expiry | 10 years out — allocate requires one; in effect they last until used |
+| If it fails | The account is held `activating`, team blocked (`activating`); `activatePending` retries every minute, never granting twice |
+
+MEASURED 2026-09-30: `org_aaa_com`, created on the zero-grant plan, had no
+wallet and got nothing before this; after it, billing allocated 1,000
+`token-test`, the wallet appeared, and the account adopted it.
+
+Chargebee then also sends `subscription_created`, and `grant_blocks_created`
+for the allocate; each runs the same link again and changes nothing.
 
 ---
 
@@ -160,7 +184,11 @@ On Chargebee's page the admin enters a card and pays. Chargebee then:
 4. sends the `subscription_created` webhook.
 
 Chargebee also sends `payment_succeeded` for the plan's invoice. Billing acts on
-`payment_succeeded` only for **top-up** invoices, so this one is ignored.
+`payment_succeeded` only for **top-up** invoices, so this one is ignored. It
+sends `grant_blocks_created` for the plan's credits too: once the subscription
+is linked, that re-reads the org; arriving before the link, it names a
+subscription that is no org's yet and is logged
+(`billing.webhook.grant_unlinked_subscription`) and acknowledged.
 
 ---
 
@@ -173,7 +201,8 @@ The link is the same as every other way.
 
 A subscription made for a customer that is **not** the tenant id — one Chargebee
 generated an id for — is never linked: the webhook is answered `500
-unmapped customer` and Chargebee keeps retrying it.
+unmapped customer` and Chargebee keeps retrying it. (Chargebee's own sample
+customers, `cbdemo_…`, are the exception: answered `200`, nothing done.)
 
 ---
 
@@ -185,10 +214,54 @@ repeated or out of order ends in the same state.
 
 | Trigger | Path | Notes |
 | --- | --- | --- |
-| **Billing's own call** | `provisionFreePlan()` → `linkWithLedger()` | Way 1 only. Waits up to 10 s for the credits |
-| **Webhook** | Chargebee → platform `POST /api/v1/webhooks/chargebee` → billing `POST /api/webhooks/chargebee` | The platform checks Chargebee's HTTP Basic credentials (Chargebee does not sign webhooks); unset credentials refuse everything. Events that trigger a sync: `subscription_created`, `_activated`, `_changed`, `_renewed`, `_reactivated`, `_resumed`, `_cancelled`, `_deleted`. A failure answers `500`, and Chargebee redelivers. **Cannot reach a developer machine.** |
+| **Billing's own call** | `provisionFreePlan()` → `linkWithLedger()` | Way 1 only. Grants the free credits; retries the link for up to 10 s until the account has a credit unit |
+| **Webhook** | Chargebee → billing `POST /api/webhooks/chargebee`, directly (the one public path of billing) | Billing checks Chargebee's HTTP Basic credentials (Chargebee does not sign webhooks). Events that trigger a sync: `subscription_created`, `_activated`, `_changed`, `_renewed`, `_reactivated`, `_resumed`, `_cancelled`, `_deleted`, and `grant_blocks_created`. A failure answers `500`, and Chargebee redelivers. Reaches a developer machine only through a tunnel — see below |
 | **The page's return** | UI sees `?from=checkout&state=succeeded` → `POST /enginos-api/billing/sync-subscription` → billing `POST /api/internal/sync-subscription` | Way 2. Makes the link immediate without waiting for the webhook |
 | **Daily resync** | Hatchet `billing-subscription-reconcile`, cron `11 2 * * *` | Every org with a Chargebee customer — every org signed up since customers are made at sign-up; an older org once it has checked out |
+
+### The webhook
+
+Chargebee calls billing **directly**. The load balancer (Caddy locally) sends
+exactly `POST /api/webhooks/chargebee` on the app host to billing — an
+exact-path, POST-only rule — and no other path of billing is public.
+crewpe-ui and enginos-platform are not in the path. `/api/internal/*` stays
+private, reachable only from the platform.
+
+Billing checks the HTTP Basic credentials itself, against
+`CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD` in **billing's** env,
+in constant time. Either one unset → every delivery `401 webhook-unauthorized`.
+
+| Event | Billing |
+| --- | --- |
+| `subscription_*` (the eight above) | `syncFromChargebee(tenant)` — the body is only a trigger; Chargebee is re-read |
+| `payment_succeeded` | Only for an invoice with a top-up line: `applyPaidTopUps`. `500` on purpose while a grant-carrying pack's block is not visible yet |
+| `grant_blocks_created` | Names the **subscription** and no customer (measured). The org whose **current** subscription it is is re-read: its LiteLLM limit rises, and an exhausted team reopens, within seconds — credits added by hand in the dashboard no longer wait for the daily resync. A subscription that is no org's current one, or a `cbdemo_` one → logged `billing.webhook.grant_unlinked_subscription`, `200` |
+| `payment_failed`, `alert_status_changed` | Logged only |
+| Any other event | `200`, ignored |
+| A `cbdemo_` customer (the **Test Webhook** button's sample data, e.g. `cbdemo_tom`) | `200`, logged `billing.webhook.sample_event`, nothing done |
+| An unknown **real** customer, on an event billing acts on | `500` — Chargebee retries |
+| No `id` or `event_type` | `400` |
+| Handler failure | `500` |
+
+**Setting it up.** Chargebee *Settings → Configure Chargebee → Webhooks*: URL
+`https://<app host>/api/webhooks/chargebee` (production
+`https://app.enwithai.com/api/webhooks/chargebee`), *Protect webhook URL with
+basic authentication* = billing's credentials, API version V2. Select only
+the events above.
+
+**Locally**, a `cloudflared` tunnel to Caddy's app host — never straight to
+`:4300`, which would publish `/api/internal/*`:
+
+```bash
+cloudflared tunnel --url https://127.0.0.1:443 --http-host-header dev.127.0.0.1.nip.io \
+  --origin-server-name dev.127.0.0.1.nip.io --no-tls-verify
+```
+
+The tunnel URL changes on every restart, so Chargebee's URL has to be updated
+each time. MEASURED 2026-09-30 on the test site through such a tunnel: real
+`customer_changed` deliveries `ev_AzyoW0VWhVc2QURM` and `ev_AzZMkgVWhVgznUur`
+→ `succeeded`; the Test Webhook sample (`subscription_created` for
+`cbdemo_tom`) got `500` before the `cbdemo_` rule and `200` after.
 
 ---
 
@@ -217,13 +290,14 @@ the account is cancelled instead.
 
 | # | Step | Writes |
 | --- | --- | --- |
-| 1 | Read the credit unit usage will be charged in: the unit already on file for this subscription, or — for a new link — the subscription's **oldest** unit, the plan's. A subscription with several units is logged | Chargebee `GET /ledger_account_balances` |
+| 1 | Read the credit unit usage will be charged in: the unit already on file for this subscription, or — for a new link — the subscription's **oldest** unit, the plan's. A subscription with several units is logged. The zero-grant free plan has **none** yet; its unit comes from step 5 | Chargebee `GET /ledger_account_balances` |
 | 2 | **Coming back from a cancellation?** Restart usage billing at now, so the cancelled period is never charged to the new plan | `last_processed_ingested_at = now()` |
 | 3 | Link | `billing_account`: `chargebee_subscription_id`, `chargebee_item_price_id`, `ledger_unit_id`, `current_term_start/end`, status **`activating`** |
 | 4 | **Start usage billing** — create-only: the first link sets it to now; a later link never moves it | `last_processed_ingested_at` if empty |
-| 5 | Read the usable balance, less any unpaid top-up | Chargebee balance, invoices |
-| 6 | **Set the LiteLLM budget** and open the team — one update, see 8.3 | LiteLLM `GET /team/info`, `POST /team/update` |
-| 7 | Mark it | **`active`** — or `exhausted` / `activating`, see 8.4 |
+| 5 | **Free plan only — grant the free credits**, once per org (section 4): allocate what is owed into `FREE_PLAN_CREDIT_UNIT`, then adopt the wallet's unit. A failure is logged, and step 8 holds the account `activating` | `topup_grant` `free-plan-credits`; Chargebee `GET /grant_blocks`, `POST /ledger_operations/allocate`; `ledger_unit_id` |
+| 6 | Read the usable balance, less any unpaid top-up | Chargebee balance, invoices |
+| 7 | **Set the LiteLLM budget** and open the team — one update, see 8.3 | LiteLLM `GET /team/info`, `POST /team/update` |
+| 8 | Mark it | **`active`** — or `exhausted` / `activating`, see 8.4 |
 
 A second run of the same link (the webhook after the page's sync) finds
 everything already so and changes nothing.
@@ -249,7 +323,7 @@ max_budget = spend baseline + (live, paid grant credits ÷ CREDITS_PER_USD)
 | --- | --- | --- |
 | **`active`** | The budget landed and there are credits | AI calls pass the gateway |
 | **`exhausted`** | Chargebee says the usable balance is 0 | Team blocked (`exhausted`); AI refused until a top-up |
-| **`activating`** | LiteLLM could not be updated | Team blocked (`activating`); the worker retries every minute (`activatePending`) until it lands |
+| **`activating`** | LiteLLM could not be updated, or the free plan's credits are still owed (the allocate failed) | Team blocked (`activating`); the worker retries every minute (`activatePending`) — the free credits first, then the budget — until it lands |
 | stays **`cancelled`** | A cancellation got in while activating | The team is handed back to the platform |
 
 ---
@@ -258,15 +332,19 @@ max_budget = spend baseline + (live, paid grant credits ÷ CREDITS_PER_USD)
 
 | System | Holds |
 | --- | --- |
-| Chargebee | Subscription, its term, the plan's grant block (credits), the paid invoice (Way 2) |
+| Chargebee | Subscription, its term, its credits — the plan's grant block (Ways 2–3) or billing's free-credits block (Way 1) — and the paid invoice (Way 2) |
 | `billing_account` | `active`, subscription, item price, credit unit, term, usage cursor = link time |
+| `topup_grant` | Way 1: the `free-plan-credits` row, `applied` — the free credits are never granted again |
 | LiteLLM team `org_ee_com` | `max_budget` = credits in USD, no reset, `billing_managed`, unblocked |
 | Gateway gate | Allows the org's AI calls |
 | `chargebee_sync` | Nothing yet — the first row appears when there is usage to bill |
 
 From the next minute the usage sync (Hatchet `billing-usage-sync`) reads the
 org's usage from ClickHouse since the cursor and captures it against the
-credits. See [BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
+credits. A call is billed by when it **ended** (`Timestamp + duration_ms` in
+`span_nodes`), once it is `BILLING_LAG_MS` old (60 s; 45 s locally), so the
+balance moves about 1–2 minutes after a call ends. See
+[BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
 
 ---
 
@@ -278,7 +356,7 @@ credits. See [BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
 | Clicked Subscribe | *Opening checkout…*, then Chargebee's page |
 | Back from Chargebee, not linked yet | **Finishing your subscription** — never the plan list, so nobody pays twice; asks again every 5 s |
 | Linked, budget set | Balance, plan and renewal date, and *"You're subscribed — your plan's credits are ready to use."* |
-| Linked, LiteLLM not updated yet | **Activating your credits** — AI paused; the page updates itself |
+| Linked, LiteLLM not updated yet — or the free credits not granted yet | **Activating your credits** — AI paused; the page updates itself |
 | A plan refused | *That plan is not available — choose one of the plans listed.* Nothing charged |
 
 ---
@@ -287,10 +365,11 @@ credits. See [BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
 
 | Store | What | By |
 | --- | --- | --- |
-| Chargebee | Subscription; grant block; invoice and payment (Way 2) | Billing (Way 1), the customer (Way 2), an operator (Way 3) |
+| Chargebee | Subscription; grant block (Way 1: billing's allocate, which also creates the wallet); invoice and payment (Way 2) | Billing (Way 1), the customer (Way 2), an operator (Way 3) |
 | Postgres — `billing_account` | subscription, item price, credit unit, term, status, usage cursor | `syncSubscription()` / `activate()` |
+| Postgres — `topup_grant` | Way 1: one `free-plan-credits` row per org, ever | `grantFreePlanCredits()` |
 | LiteLLM — team | `max_budget`, `budget_duration`, `blocked`, billing metadata | `activate()` → gateway-budget `push()` |
-| Logs | `billing.subscription.renewed`, `.multiple_active`, `.multiple_units`, `billing.cursor.restarted`, `billing.budget.push_failed` | as they happen |
+| Logs | `billing.subscription.renewed`, `.multiple_active`, `.multiple_units`, `billing.cursor.restarted`, `billing.budget.push_failed`, `billing.free_credits.granted` / `.plan_granted` / `.wallet_adopted` / `.failed`, `billing.webhook.grant_unlinked_subscription`, `billing.webhook.sample_event` | as they happen |
 
 ---
 
@@ -303,21 +382,24 @@ credits. See [BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
 | Webhook lost or delayed | The page's own sync links it | Daily resync |
 | The admin closes the tab before returning | The webhook links it | Daily resync |
 | LiteLLM down at activation | `activating`, team blocked | `activatePending` every minute |
+| The free credits' allocate fails (Way 1) | `activating`, team blocked; *Activating your credits* | `activatePending` every minute — the `topup_grant` row makes it grant once |
 | Customer id is not the tenant id (Way 3) | Webhook answered `500`, never linked | A person: recreate it for the right customer |
+| Webhook credentials unset or wrong | Every delivery `401 webhook-unauthorized` | Set billing's `CHARGEBEE_WEBHOOK_USER` / `_PASSWORD` to match Chargebee; meanwhile the page's sync and the daily resync |
 | Free plan misconfigured (Way 1) | `409 free-plan-misconfigured`; no subscription | Fix `FREE_PLAN_ITEM_PRICE_ID` / `ITEM_PRICE_IDS` |
 
 ---
 
 ## 13. Known gaps
 
-1. **A checkout linked before its credits exist gets a $0 budget.** Only Way 1
-   waits for Chargebee's credits. In Way 2, if the page's sync runs before the
-   grant block appears (~3 s on the free plan), the account links with no credit unit, goes
-   `active` with a $0 LiteLLM budget, and the gateway refuses the org as having
-   no plan — until the next sync. In production the webhook usually arrives
-   after the credits and repairs it; on a developer machine, which webhooks
-   cannot reach, it waits for the daily resync. Fix: make `sync-subscription`
-   wait for the credit unit the way `linkWithLedger()` does.
+1. **A checkout linked before its credits exist gets a $0 budget, briefly.**
+   Only Way 1 waits for a credit unit. In Way 2, if the page's sync runs before
+   the plan's grant block appears (~3 s, measured), the account links with no
+   credit unit, goes `active` with a $0 LiteLLM budget, and the gateway refuses
+   the org as having no plan — until the next sync. Chargebee's
+   `grant_blocks_created` for that block now names the linked subscription and
+   repairs it within seconds; with no webhook reaching billing (a developer
+   machine with no tunnel) it waits for the daily resync. Fix: make
+   `sync-subscription` wait for the credit unit the way `linkWithLedger()` does.
 2. **A free-plan org cannot move to a paid plan.** `checkout_new_for_items`
    creates a **second** subscription; the free one is still active, so the
    "current wins" rule keeps billing on it and the paid plan's credits go
@@ -327,6 +409,7 @@ credits. See [BILLING-ARCHITECTURE.md](BILLING-ARCHITECTURE.md).
 3. **A cancelled org is not re-subscribed to the free plan** by
    `/api/internal/free-plan`: its old subscription id is still on the account,
    so it counts as "already subscribed". It has to check out again.
-4. **Webhooks do not reach a developer machine**, so locally Way 3 is only
+4. **Webhooks reach a developer machine only through a tunnel** (section 7),
+   whose URL changes on every restart. Without one, locally Way 3 is only
    picked up by the daily resync, or by calling
    `POST /api/internal/sync-subscription {tenantId}` on billing.

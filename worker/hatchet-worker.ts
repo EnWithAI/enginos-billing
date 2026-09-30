@@ -75,6 +75,14 @@ export const BILLING_SUBSCRIPTION_RECONCILE_CRON = "11 2 * * *";
 export const GATE_CHECK_DEADLINE_MS = 4 * 60_000;
 
 /**
+ * How far into the run the usage sync may still start a range: three minutes,
+ * leaving the fourth for the gate check and the fifth as margin. Only a
+ * catch-up after an outage comes near it; what one run does not reach, the
+ * next continues from each tenant's cursor.
+ */
+export const SYNC_DEADLINE_MS = 3 * 60_000;
+
+/**
  * With several passes a minute (BILLING_SWEEP_INTERVAL_MS under 60 s), the run
  * must END before the next minute's tick: the workflow runs one at a time and
  * cancels the tick that finds one running (CANCEL_NEWEST), which would lose a
@@ -142,7 +150,10 @@ async function main() {
       // every BILLING_SWEEP_INTERVAL_MS until LAST_PASS_START_MS (passes.ts).
       const sync = services.usageSync(ctx?.workflowRunId?.(), alertingLogger());
       const passes = await runPasses({
-        runOnce: () => sync.runOnce(),
+        // Each pass stops starting ranges at the same point the passes stop
+        // starting — so a catch-up after an outage cannot run the task into
+        // its timeout or the next minute's tick.
+        runOnce: () => sync.runOnce(undefined, { deadline: startedAt + (multiPass ? LAST_PASS_START_MS : SYNC_DEADLINE_MS) }),
         intervalMs: sweepIntervalMs,
         lastStartMs: LAST_PASS_START_MS,
         startedAt,

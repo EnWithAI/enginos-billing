@@ -9,23 +9,26 @@
  * Chargebee customer and subscription a tenant is — and the operational status
  * that decides what the gateway enforces.
  *
- * `/ledger_operations/allocate` is still called for one thing only: a top-up
- * pack, which is an ad-hoc grant Chargebee does not issue by itself. And the
- * one record of money kept here is the top-up guard (`topup_grant`): which
- * paid invoices have been granted. Chargebee keeps nothing that ties an
- * allocation to its invoice, so this is the only place that can know.
+ * `/ledger_operations/allocate` is still called for two things only: a top-up
+ * pack, which is an ad-hoc grant Chargebee does not issue by itself, and the
+ * free plan's credits, granted once per org (grantFreePlanCredits). And the
+ * one record of money kept here is the guard for both (`topup_grant`): which
+ * paid invoices, and which orgs' free credits, have been granted. Chargebee
+ * keeps nothing that ties an allocation to its reason, so this is the only
+ * place that can know.
  */
 
 import type { PrismaClient } from "../db/prisma";
 import { isDefiniteRefusal, type ChargebeeClient, type ChargebeeError, type GrantBlock } from "../integrations/chargebee";
 import { ACCOUNT, type BlockReason } from "../models/account-status";
-import { add, compare, multiply, subtractFloorZero } from "../models/decimal";
+import { add, compare, isPositive, multiply, subtractFloorZero } from "../models/decimal";
 import { isBillable } from "../models/rate";
 import { realmToRoutingSlug } from "../models/routing-slug";
 import { chooseBillingSubscription, itemPriceIdOf } from "../models/subscription";
 import { createBillingAccountRepository, type BillingAccountRepository } from "../repositories/billing-account.repository";
 import { createPlatformRepository, type PlatformRepository } from "../repositories/platform.repository";
 import {
+  FREE_PLAN_GRANT,
   TOPUP,
   TOPUP_SOURCE,
   createTopUpGrantRepository,
@@ -70,6 +73,12 @@ export const TOPUP_MIN_EXPIRY_LEAD_MS = 60 * 60_000;
 /** The expiry used when no term end can be trusted: 30 days out. */
 const TOPUP_FALLBACK_EXPIRY_MS = 30 * 24 * 60 * 60_000;
 
+/**
+ * How far out the free plan's credits expire. They are meant to last until
+ * used, but allocate requires an `expires_at`, so it is set this far away.
+ */
+export const FREE_PLAN_CREDITS_YEARS = 10;
+
 export interface AccountDeps {
   /** Builds the repositories when they are not given. Tests pass a fake here. */
   prisma?: PrismaClient;
@@ -105,6 +114,19 @@ export interface AccountDeps {
    * back from the usable balance. Absent: nothing is held back.
    */
   topUpItemPriceId?: string;
+  /**
+   * The free plan (`FREE_PLAN_ITEM_PRICE_ID`) and the credits billing grants
+   * an org on it once (`FREE_PLAN_CREDITS`). Both are needed; either absent,
+   * the plan's own Credit Grant is all an org on it gets.
+   */
+  freeItemPriceId?: string;
+  freePlanCredits?: string;
+  /**
+   * The unit those credits go into when the subscription has no wallet yet
+   * (`FREE_PLAN_CREDIT_UNIT`): a free plan that grants zero gets none from
+   * Chargebee, and the allocate is what creates it.
+   */
+  freePlanCreditUnit?: string;
   /** Is the tenant's LiteLLM team blocked BY BILLING right now? Read by the minute's gate check. */
   budgetBlocked?: (tenantId: string) => Promise<boolean>;
   clock?: () => number;
@@ -325,6 +347,11 @@ export function createAccountService(deps: AccountDeps) {
     // Before activate(), so the tenant cannot become billable without a cursor.
     await ensureBillingCursor(account.tenantId);
 
+    // Before activate() too, so the budget it pushes already counts them. A
+    // failure holds the account `activating` (see activate) rather than
+    // failing the link, and the minute's activatePending tries again.
+    await grantFreePlanCreditsOrLog(args.tenantId);
+
     // The gateway budget is the enforcement gate, and it is driven by the GRANT,
     // never by the remaining balance: the usage sync lags by an ingestion buffer
     // plus a cron interval, so a balance-derived budget would let a tenant
@@ -384,6 +411,20 @@ export function createAccountService(deps: AccountDeps) {
 
     const usable = await usableCredits(account);
     const exhausted = usable != null && !isBillable(usable);
+
+    // Out of credits — or with no credit wallet at all yet, which is how a new
+    // org on a free plan that grants zero starts — only because the free
+    // plan's credits are still on their way: an allocate that failed, or one
+    // another caller has on the wire. Held as `activating`, not left exhausted
+    // or open on nothing: the minute's activatePending grants them and opens
+    // the team, where nothing else would look at the account again until a
+    // top-up or the daily resync.
+    if ((exhausted || !account.ledgerUnitId) && (await freePlanCreditsOwed(account))) {
+      const held = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.ACTIVATING);
+      if (!held.changed) return handBack(tenantId, held.account);
+      await block(tenantId, "activating");
+      return (await handBackIfCancelled(tenantId)) ?? held.account;
+    }
 
     try {
       // No gateway configured means nothing to hold for: active immediately.
@@ -518,6 +559,8 @@ export function createAccountService(deps: AccountDeps) {
 
     let activated = 0;
     for (const tenantId of held) {
+      // One held for the free plan's credits gets them first.
+      await grantFreePlanCreditsOrLog(tenantId);
       const account = await activate(tenantId);
       if (account.status === ACCOUNT.ACTIVE) activated += 1;
     }
@@ -990,7 +1033,7 @@ export function createAccountService(deps: AccountDeps) {
       // under the same key must be the same request, and `expires_at` from
       // the clock is not.
       expiresAt,
-      idempotencyKey: `invoice:${invoiceId}`,
+      idempotencyKey: allocationKey({ tenantId, invoiceId }),
       at: new Date(clock()),
     });
     if (!claimed) {
@@ -1111,10 +1154,15 @@ export function createAccountService(deps: AccountDeps) {
     // Certainly never landed, and nobody holds it: send it again under a new
     // key. A new key may carry a new body, so `expires_at` is computed afresh
     // — the one first stored may have gone stale while the row waited.
-    const account = await accounts.findByTenantId(record.tenantId);
-    const termEnd = account?.chargebeeSubscriptionId === record.chargebeeSubscriptionId ? account.currentTermEnd : null;
-    const expiresAt = await topUpExpiry(record.tenantId, record.invoiceId, record.chargebeeSubscriptionId, termEnd);
-    const idempotencyKey = `invoice:${record.invoiceId}:${record.attemptCount + 1}`;
+    let expiresAt: Date;
+    if (record.invoiceId === FREE_PLAN_GRANT) {
+      expiresAt = freePlanCreditsExpiry();
+    } else {
+      const account = await accounts.findByTenantId(record.tenantId);
+      const termEnd = account?.chargebeeSubscriptionId === record.chargebeeSubscriptionId ? account.currentTermEnd : null;
+      expiresAt = await topUpExpiry(record.tenantId, record.invoiceId, record.chargebeeSubscriptionId, termEnd);
+    }
+    const idempotencyKey = `${allocationKey(record)}:${record.attemptCount + 1}`;
     const attempt = await topUps.takeAttempt(record, new Date(now), { idempotencyKey, expiresAt });
     return attempt ? sendTopUp(record, attempt) : null;
   }
@@ -1311,6 +1359,192 @@ export function createAccountService(deps: AccountDeps) {
     return { credits };
   }
 
+  /**
+   * The free plan's credits, granted ONCE per org (`FREE_PLAN_CREDITS`).
+   *
+   * The free plan is a yearly plan, and a plan's own Credit Grant is issued
+   * again at every renewal. So its grant is set to zero in the Chargebee
+   * catalogue, and billing allocates the credits itself the first time the
+   * org is linked to the plan, with an expiry FREE_PLAN_CREDITS_YEARS out —
+   * allocate requires one; in effect they last until used.
+   *
+   * Exactly once, by the top-up guard: a `topup_grant` row under
+   * FREE_PLAN_GRANT, claimed with the whole allocate request before it is
+   * sent, then completed or resumed by resumeTopUp exactly as a pack is. One
+   * row per tenant, ever — a resubscription to the free plan grants nothing.
+   *
+   * Every free org starts with FREE_PLAN_CREDITS in all, counting what the
+   * plan's own Credit Grant gave: an org the plan already gave that much —
+   * every org put on it before its grant was cut — is recorded from that block
+   * and allocated nothing; one it gave less (zero, or a single token kept so
+   * Chargebee opens a wallet) is allocated the rest.
+   *
+   * A free plan that grants zero gets NO credit wallet from Chargebee
+   * (MEASURED 2026-09-30: no grant block, no balance, no unit), so a new org
+   * has no unit to read. The credits then go into FREE_PLAN_CREDIT_UNIT, and
+   * the allocate is what creates the wallet (MEASURED the same day); the
+   * account adopts that unit once the grant lands, so the usage sync and the
+   * cap read the right balance. An org whose wallet exists keeps its own unit.
+   *
+   * Returns what THIS call granted.
+   */
+  async function grantFreePlanCredits(tenantId: string): Promise<{ credits: string } | null> {
+    const account = await accounts.findByTenantId(tenantId);
+    if (!account || !onFreePlanCredits(account) || account.status === ACCOUNT.CANCELLED) return null;
+    const subscriptionId = account.chargebeeSubscriptionId!;
+    const record = await topUps.findByInvoice(tenantId, FREE_PLAN_GRANT);
+    if (record?.status === TOPUP.APPLIED) {
+      // Granted — but a crash between the grant and the adoption can leave
+      // the account without the unit its wallet was made in.
+      await adoptWalletUnit(tenantId, subscriptionId, account.ledgerUnitId, record);
+      return null;
+    }
+
+    const unitId = account.ledgerUnitId ?? (deps.freePlanCreditUnit || null);
+    if (!unitId) {
+      log.error?.(
+        { metric: "billing.free_credits.no_credit_unit", tenantId, subscriptionId },
+        "The free plan's subscription has no credit wallet and FREE_PLAN_CREDIT_UNIT is not set; nothing granted",
+      );
+      return null;
+    }
+
+    const listed = await deps.chargebee.grantBlocks(subscriptionId);
+    const ledger = new Map([[subscriptionId, listed]]);
+    if (record) return adopted(tenantId, subscriptionId, account.ledgerUnitId, record, await resumeTopUp(record, ledger));
+
+    // What the plan's own Credit Grant gave this subscription. Every org on
+    // the free plan starts with FREE_PLAN_CREDITS in all: one the plan gave at
+    // least that much (every org put on it before its grant was cut) is
+    // recorded and allocated nothing; one it gave less — a grant cut to zero,
+    // or to a token kept only so Chargebee opens a wallet — gets the rest.
+    const planBlocks = listed.blocks.filter(
+      (b) => b.itemPriceId === deps.freeItemPriceId && compare(b.grantedAmount, "0") > 0,
+    );
+    const planGranted = add("0", ...planBlocks.map((b) => b.grantedAmount));
+    const owed = subtractFloorZero(deps.freePlanCredits!, planGranted);
+    if (planBlocks.length > 0 && !isPositive(owed)) {
+      const credits = planGranted;
+      await topUps.recordCatalogueGrant({
+        tenantId,
+        invoiceId: FREE_PLAN_GRANT,
+        chargebeeSubscriptionId: subscriptionId,
+        ledgerUnitId: planBlocks[0]!.unitId,
+        credits,
+        grantBlockId: planBlocks[0]!.id,
+        at: new Date(clock()),
+      });
+      log.log?.(
+        { metric: "billing.free_credits.plan_granted", tenantId, subscriptionId, grantBlockIds: planBlocks.map((b) => b.id), credits },
+        "The free plan's own Credit Grant already gave this org its credits; recorded, nothing allocated",
+      );
+      return null;
+    }
+    if (!listed.complete) {
+      // A plan block may be past the part of the list we got.
+      log.error?.(
+        { metric: "billing.free_credits.unresolved", tenantId, subscriptionId },
+        "Cannot tell whether the free plan already granted this org's credits (grant block list cut short); nothing allocated, tried again on the next link",
+      );
+      return null;
+    }
+
+    const claimed = await topUps.claim({
+      tenantId,
+      invoiceId: FREE_PLAN_GRANT,
+      chargebeeSubscriptionId: subscriptionId,
+      ledgerUnitId: unitId,
+      credits: owed,
+      expiresAt: freePlanCreditsExpiry(),
+      idempotencyKey: allocationKey({ tenantId, invoiceId: FREE_PLAN_GRANT }),
+      at: new Date(clock()),
+    });
+    if (!claimed) {
+      // Another caller claimed it between our read and our insert; it is theirs.
+      const current = await topUps.findByInvoice(tenantId, FREE_PLAN_GRANT);
+      return current && current.status !== TOPUP.APPLIED ? resumeTopUp(current, ledger) : null;
+    }
+    const granted = await sendTopUp(claimed, { id: claimed.id, attemptCount: claimed.attemptCount });
+    if (granted) {
+      log.log?.(
+        { metric: "billing.free_credits.granted", tenantId, subscriptionId, unitId, credits: granted.credits, planGranted },
+        "Granted the free plan's credits",
+      );
+    }
+    return adopted(tenantId, subscriptionId, account.ledgerUnitId, claimed, granted);
+  }
+
+  /** Pass a grant's result through, adopting its wallet's unit first when it landed. */
+  async function adopted<T>(
+    tenantId: string,
+    subscriptionId: string,
+    accountUnit: string | null,
+    row: Pick<TopUpGrant, "chargebeeSubscriptionId" | "ledgerUnitId">,
+    granted: T | null,
+  ): Promise<T | null> {
+    if (granted) await adoptWalletUnit(tenantId, subscriptionId, accountUnit, row);
+    return granted;
+  }
+
+  /**
+   * The account had no unit because its subscription had no wallet; the free
+   * credits' allocate made one. Record that unit — only for the subscription
+   * the grant went to, and never over a unit the account already has.
+   */
+  async function adoptWalletUnit(
+    tenantId: string,
+    subscriptionId: string,
+    accountUnit: string | null,
+    row: Pick<TopUpGrant, "chargebeeSubscriptionId" | "ledgerUnitId">,
+  ) {
+    if (accountUnit || row.chargebeeSubscriptionId !== subscriptionId) return;
+    if (await accounts.adoptLedgerUnit(tenantId, subscriptionId, row.ledgerUnitId)) {
+      log.log?.(
+        { metric: "billing.free_credits.wallet_adopted", tenantId, subscriptionId, unitId: row.ledgerUnitId },
+        "The free credits created the subscription's credit wallet; the account now bills against its unit",
+      );
+    }
+  }
+
+  /** grantFreePlanCredits for a caller that goes on either way: a failure is logged, and the account's activation holds it. */
+  async function grantFreePlanCreditsOrLog(tenantId: string) {
+    try {
+      await grantFreePlanCredits(tenantId);
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.free_credits.failed", tenantId, err: errorMessage(err) },
+        "Could not grant the free plan's credits; the account is held activating and the minute's retry completes it without granting twice",
+      );
+    }
+  }
+
+  /** Is the account on the free plan, with its one-time credits not yet granted? */
+  async function freePlanCreditsOwed(account: {
+    tenantId: string;
+    chargebeeSubscriptionId: string | null;
+    chargebeeItemPriceId?: string | null;
+  }): Promise<boolean> {
+    if (!onFreePlanCredits(account)) return false;
+    const record = await topUps.findByInvoice(account.tenantId, FREE_PLAN_GRANT);
+    return record?.status !== TOPUP.APPLIED;
+  }
+
+  function onFreePlanCredits(account: { chargebeeSubscriptionId: string | null; chargebeeItemPriceId?: string | null }): boolean {
+    return (
+      !!deps.freePlanCredits &&
+      !!deps.freeItemPriceId &&
+      account.chargebeeSubscriptionId != null &&
+      account.chargebeeItemPriceId === deps.freeItemPriceId
+    );
+  }
+
+  /** FREE_PLAN_CREDITS_YEARS from now, to the second, as allocate takes it. */
+  function freePlanCreditsExpiry(): Date {
+    const at = new Date(Math.floor(clock() / 1000) * 1000);
+    at.setUTCFullYear(at.getUTCFullYear() + FREE_PLAN_CREDITS_YEARS);
+    return at;
+  }
+
   /** The gateway ceiling has to move too, or the customer has credits they cannot spend. */
   async function afterTopUp(tenantId: string, subscriptionId: string, applied: number, credits: string) {
     log.log?.({ metric: "billing.topup.applied", tenantId, invoices: applied, credits }, "Top-up credits allocated in Chargebee");
@@ -1346,6 +1580,16 @@ export type AccountService = ReturnType<typeof createAccountService>;
 
 /** A paid pack whose Chargebee grant block has not appeared yet (applyPaidTopUps `chargebeeGrants`). */
 const GRANT_NOT_VISIBLE = Symbol("grant-not-visible");
+
+/**
+ * The `chargebee-idempotency-key` a guard row's allocate is first sent under;
+ * a re-issue appends `:<n>`. Keys are site-wide, so the free plan's names the
+ * tenant (and is not `free-plan:<tenant>`, the free-plan subscribe's key); an
+ * invoice id is already unique on the site.
+ */
+function allocationKey(record: { tenantId: string; invoiceId: string }): string {
+  return record.invoiceId === FREE_PLAN_GRANT ? `free-plan-credits:${record.tenantId}` : `invoice:${record.invoiceId}`;
+}
 
 /**
  * The grant blocks Chargebee issued for THIS invoice's pack line — the pack's

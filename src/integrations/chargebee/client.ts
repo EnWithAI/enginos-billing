@@ -608,12 +608,10 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   /**
    * Ledger operations on a subscription, newest first — one page.
    *
-   * NOT a top-up guard any more. It used to be scanned for an allocation
-   * carrying `metadata.invoice_id`, but Chargebee never returns operation
-   * metadata, and one page of a ledger that gains a capture a minute holds
-   * under two hours of history. The guard is a local record now
-   * (topup-grant.repository.ts), plus grantBlocks() for packs Chargebee grants
-   * itself.
+   * Read only by scripts/e2e-prepaid.ts, to see the captures the worker sent.
+   * NOT a top-up guard: Chargebee never returns operation metadata, and one page
+   * of a ledger that gains a capture a minute holds under two hours of history.
+   * The guard is a local record (topup-grant.repository.ts).
    *
    * Filtered by subscription client-side as well as in the query: the list
    * endpoint's filters are not uniformly honoured (it ignores `id[is]`, which
@@ -999,27 +997,18 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   }
 
   /**
-   * The customer's payments, newest first.
+   * One page of the customer's payments, newest first, and the cursor for the
+   * next.
    *
    * Transactions rather than invoices, because this answers "did my money
    * move", and only a transaction can say no. An invoice that was never paid
    * looks the same as one whose payment is still in flight; the transaction
-   * that failed carries the reason.
+   * that failed carries the reason. Sorted by Chargebee (`sort_by[desc]=date`),
+   * so the newest payment is never below the fold. Refunds are included
+   * deliberately: a customer who was refunded and does not see it here will
+   * conclude the refund never happened.
    *
-   * Sorted by Chargebee rather than by us: `sort_by[desc]=date` is documented,
-   * and sorting a truncated page client-side would put the newest payment below
-   * the fold exactly when the customer is looking for it.
-   *
-   * Refunds are included deliberately. A customer who was refunded and does not
-   * see it here will conclude the refund never happened.
-   */
-  async function transactionsFor(customerId: string, limit = 20): Promise<Transaction[]> {
-    return (await transactionsPage(customerId, { limit })).transactions;
-  }
-
-  /**
-   * One page of the customer's payments, newest first, and the cursor for the
-   * next. Chargebee pages a list by an opaque `next_offset`, not by number, so
+   * Chargebee pages a list by an opaque `next_offset`, not by number, so
    * the page after this one is reached only through it; null once nothing
    * older is left. The cursor says WHERE in the list, never whose — the
    * customer filter is sent again with every page.
@@ -1254,7 +1243,6 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     paidInvoicesFor,
     unpaidInvoicesFor,
     unpaidTopUpCredits,
-    transactionsFor,
     transactionsPage,
     paymentSource,
     invoice,

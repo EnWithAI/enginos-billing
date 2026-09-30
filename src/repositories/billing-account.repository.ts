@@ -39,6 +39,15 @@ export function createBillingAccountRepository(prisma: PrismaClient = defaultPri
       return prisma.billingAccount.findUnique({ where: { routingSlug } });
     },
 
+    /** The tenant whose CURRENT subscription this is; null for any other (an ended one, or no org's). */
+    async findTenantIdBySubscriptionId(chargebeeSubscriptionId: string): Promise<string | null> {
+      const account = await prisma.billingAccount.findFirst({
+        where: { chargebeeSubscriptionId },
+        select: { tenantId: true },
+      });
+      return account?.tenantId ?? null;
+    },
+
     async findTenantIdByCustomerId(chargebeeCustomerId: string): Promise<string | null> {
       const account = await prisma.billingAccount.findUnique({
         where: { chargebeeCustomerId },
@@ -110,6 +119,19 @@ export function createBillingAccountRepository(prisma: PrismaClient = defaultPri
       const account = await prisma.billingAccount.findUnique({ where: { tenantId } });
       if (!account) throw new Error(`No billing account for tenant ${tenantId}`);
       return { changed: count === 1, account };
+    },
+
+    /**
+     * Record the credit unit of a wallet billing itself created (the free
+     * plan's first allocate) — only on the subscription it was made on, and
+     * only while the account has none: a unit already linked is never moved.
+     */
+    async adoptLedgerUnit(tenantId: string, chargebeeSubscriptionId: string, ledgerUnitId: string): Promise<boolean> {
+      const { count } = await prisma.billingAccount.updateMany({
+        where: { tenantId, chargebeeSubscriptionId, ledgerUnitId: null },
+        data: { ledgerUnitId },
+      });
+      return count === 1;
     },
 
     /** Turn the free plan on or off for one org. Its subscription is not touched. */

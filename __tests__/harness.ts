@@ -288,6 +288,10 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
       async findMany({ where }: { where?: Record<string, any> } = {}) {
         return [...accounts.values()].filter((row) => matches(row, where ?? {})).map((r) => ({ ...r }));
       },
+      async findFirst({ where }: { where?: Record<string, any> } = {}) {
+        const row = [...accounts.values()].find((r) => matches(r, where ?? {}));
+        return row ? { ...row } : null;
+      },
       async upsert({ where, create, update }: { where: { tenantId: string }; create: Record<string, any>; update: Record<string, any> }) {
         const existing = accounts.get(where.tenantId);
         if (existing) {

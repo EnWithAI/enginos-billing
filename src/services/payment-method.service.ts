@@ -32,5 +32,3 @@ export function createPaymentMethodService(deps: {
 
   return { manage };
 }
-
-export type PaymentMethodService = ReturnType<typeof createPaymentMethodService>;

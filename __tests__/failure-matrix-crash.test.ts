@@ -18,7 +18,7 @@
  *   C02  failures › "a crash while reading leaves nothing to reconcile" (asserts no next tick)
  *   C03  none directly (compound-flows' multi-window crash dies AFTER a capture)
  *   C04  failures › "a crash after the capture is recovered on the next tick, charging once"
- *   C05  compound-flows › "BILLING_WINDOW_MS changed…" rewinds the cursor by hand after SUCCESS
+ *   C05  compound-flows › "a settled row of a different length…" rewinds the cursor by hand after SUCCESS
  *   C06  usage-sync › "two workers on one tenant" (simultaneous start only); compound-flows ›
  *        "the cron and the manual sync route running together" (simultaneous start only)
  *   C07  compound-flows › "a crash part-way through draining a backlog" (one crash, one restart)
@@ -521,7 +521,7 @@ describe("C07 — worker restarts repeatedly", () => {
 
     const finalAt = 7 + crashes.length * LEASE;
     r.at(finalAt);
-    const final = await r.build({ hatchetRunId: "restart-final", maxWindowsPerTick: 100 }).runTenant(SLUG);
+    const final = await r.build({ hatchetRunId: "restart-final" }).runTenant(SLUG);
 
     expect(final.outcome).toBe(OUTCOME.SYNCED);
     expect(r.chargebee.appliedCount).toBe(5);
@@ -1239,7 +1239,7 @@ describe("C33 — billing server restarts", () => {
 // ── C55 ───────────────────────────────────────────────────────────────────
 
 describe("C55 — worker version changes", () => {
-  it("C55 old and new worker (same BILLING_WINDOW_MS) overlapping on one batch: money once, log contiguous", async () => {
+  it("C55 two workers reading the same cursor, overlapping on one batch: money once, log contiguous", async () => {
     const r = rig();
     backlog(r, 2);
     r.at(3);
@@ -1282,7 +1282,7 @@ describe("C55 — worker version changes", () => {
   });
 
   /**
-   * The deploy changes BILLING_WINDOW_MS. The worker with the LONGER window has
+   * Two workers read the same cursor a moment apart. The one with the LONGER range has
    * read the cursor and its ClickHouse window, then stalls; the one with the
    * shorter window passes an empty minute (no row), then bills the next one.
    */
@@ -1292,23 +1292,23 @@ describe("C55 — worker version changes", () => {
     r.at(3);
     const gate = new Gate();
     const slow = r
-      .build({ windowMs: slowMs, usage: stallAfterRead(r.usage, gate), hatchetRunId: `window-${slowMs / 1000}s` })
+      .build({ maxRangeMs: slowMs, usage: stallAfterRead(r.usage, gate), hatchetRunId: `window-${slowMs / 1000}s` })
       .runTenant(SLUG);
     await gate.reached;
-    await r.build({ windowMs: fastMs, hatchetRunId: `window-${fastMs / 1000}s` }).runTenant(SLUG);
+    await r.build({ maxRangeMs: fastMs, hatchetRunId: `window-${fastMs / 1000}s` }).runTenant(SLUG);
     gate.open();
     await slow;
     return r;
   }
 
   // FIXED (was DEFECT — a DOUBLE CHARGE): an empty window advanced the cursor with no
-  // row, and the window end is cursor + THIS worker's windowMs, so a 120s row (0,2min]
+  // row, and the window end is cursor + THIS worker's maxRangeMs, so a 120s row (0,2min]
   // and a 60s row (1min,2min] had different `from` and BOTH inserted and captured.
   // A window is now written only while the cursor still sits at its start
   // (openWindow), and an empty window is passed only while no row owns it
   // (advancePastEmptyWindow) — both under the account row's lock. Here the 120s
   // worker finds the cursor already at 2min and writes nothing.
-  it("C55 a deploy that changes BILLING_WINDOW_MS 60s→120s while the old worker runs: usage in the overlap is charged once", async () => {
+  it("C55 two workers whose ranges from one cursor differ (60s vs 120s): usage in the overlap is charged once", async () => {
     const r = await windowSizeDeploy(2 * MINUTE, MINUTE);
     console.log(
       `[C55] 120s worker stalled after its read: rows=${JSON.stringify(r.rows())} ` +
@@ -1329,14 +1329,14 @@ describe("C55 — worker version changes", () => {
     // The 60s worker has found nothing held and read an empty first minute…
     const narrowRead = new Gate();
     const narrow = r
-      .build({ windowMs: MINUTE, usage: stallAfterRead(r.usage, narrowRead), hatchetRunId: "window-60s" })
+      .build({ maxRangeMs: MINUTE, usage: stallAfterRead(r.usage, narrowRead), hatchetRunId: "window-60s" })
       .runTenant(SLUG);
     await narrowRead.reached;
 
     // …when the 120s worker opens (0,2min] and puts its capture on the wire.
     const wideSend = new Gate();
     const wide = r
-      .build({ windowMs: 2 * MINUTE, chargebee: slowChargebee(r.chargebee, wideSend, { phase: "request" }), hatchetRunId: "window-120s" })
+      .build({ maxRangeMs: 2 * MINUTE, chargebee: slowChargebee(r.chargebee, wideSend, { phase: "request" }), hatchetRunId: "window-120s" })
       .runTenant(SLUG);
     await wideSend.reached;
     expect(r.rows()).toEqual([[0, 2, SYNC.PROCESSING]]);
@@ -1360,11 +1360,11 @@ describe("C55 — worker version changes", () => {
     r.at(3);
     // The 120s worker bills (0,2min] and dies before moving the cursor.
     const { prisma } = faultyPrisma(r.prisma, [{ model: "billingAccount", method: "updateMany", when: isCursorCas, mode: "before" }]);
-    await expect(r.build({ prisma, windowMs: 2 * MINUTE }).runTenant(SLUG)).rejects.toThrow();
+    await expect(r.build({ prisma, maxRangeMs: 2 * MINUTE }).runTenant(SLUG)).rejects.toThrow();
     expect(r.rows()).toEqual([[0, 2, SYNC.SUCCESS]]);
     expect(r.prisma._cursor).toBe(T0);
 
-    await r.build({ windowMs: MINUTE }).runTenant(SLUG);
+    await r.build({ maxRangeMs: MINUTE }).runTenant(SLUG);
 
     expect(r.metrics()).toContain("billing.sync.cursor_repaired");
     expect(r.cursorMin()).toBe(2);
@@ -1376,7 +1376,7 @@ describe("C55 — worker version changes", () => {
   // one. The 120s worker read cursor 0 before the 60s worker's empty-minute move, then
   // billed (0,2min] while the 60s worker, stalled after reading (1min,2min], billed that
   // minute again. Now the 120s worker's window is refused (the cursor is no longer 0).
-  it("C55 a deploy that changes BILLING_WINDOW_MS, the 60s worker stalled mid-tick: usage in the overlap is charged once", async () => {
+  it("C55 two workers whose ranges from one cursor differ, the 60s one stalled mid-tick: usage in the overlap is charged once", async () => {
     const r = rig();
     r.usage.add("t1:s1", T0 + 90_000, 0.002); // one call, in (1min, 2min]
     r.at(3);
@@ -1384,7 +1384,7 @@ describe("C55 — worker version changes", () => {
     const wideHasReadCursor = new Gate();
     const wide = r
       .build({
-        windowMs: 2 * MINUTE,
+        maxRangeMs: 2 * MINUTE,
         hatchetRunId: "window-120s",
         usage: {
           now: async () => {
@@ -1399,7 +1399,7 @@ describe("C55 — worker version changes", () => {
 
     const narrowStalled = new Gate();
     const narrow = r
-      .build({ windowMs: MINUTE, hatchetRunId: "window-60s", usage: stallAfterRead(r.usage, narrowStalled, 2) })
+      .build({ maxRangeMs: MINUTE, hatchetRunId: "window-60s", usage: stallAfterRead(r.usage, narrowStalled, 2) })
       .runTenant(SLUG);
     await narrowStalled.reached; // it has moved the cursor over (0,1min] and read (1min,2min]
 
@@ -1431,14 +1431,14 @@ describe("C55 — worker version changes", () => {
 
     const narrowLooked = new Gate();
     const narrow = r
-      .build({ windowMs: MINUTE, prisma: pauseAfterOwnerLookup(r.prisma, narrowLooked), hatchetRunId: "window-60s" })
+      .build({ maxRangeMs: MINUTE, prisma: pauseAfterOwnerLookup(r.prisma, narrowLooked), hatchetRunId: "window-60s" })
       .runTenant(SLUG);
     await narrowLooked.reached;
     expect(r.prisma._rowLocked()).toBe(true);
 
     const wideSend = new Gate();
     const wide = r
-      .build({ windowMs: 2 * MINUTE, chargebee: slowChargebee(r.chargebee, wideSend, { phase: "request" }), hatchetRunId: "window-120s" })
+      .build({ maxRangeMs: 2 * MINUTE, chargebee: slowChargebee(r.chargebee, wideSend, { phase: "request" }), hatchetRunId: "window-120s" })
       .runTenant(SLUG);
     await new Promise((resolve) => setTimeout(resolve, 20));
     // The 120s worker has read cursor 0 and a billable (0,2min], and is waiting on the row.

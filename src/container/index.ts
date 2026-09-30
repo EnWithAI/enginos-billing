@@ -45,6 +45,9 @@ export function createServices() {
     usdPerCredit: config.usdPerCredit,
     billingItemPriceIds: config.itemPriceIds,
     topUpItemPriceId: config.topUpItemPriceId,
+    freeItemPriceId: config.freeItemPriceId,
+    freePlanCredits: config.freePlanCredits,
+    freePlanCreditUnit: config.freePlanCreditUnit,
     ...budget,
   });
 
@@ -128,8 +131,7 @@ export function createServices() {
         syncs,
         usdPerCredit: config.usdPerCredit,
         lagMs: config.lagMs,
-        windowMs: config.windowMs,
-        maxWindowsPerTick: config.maxWindowsPerTick,
+        maxRangeMs: config.maxRangeMs,
         maxAttempts: config.maxAttempts,
         hatchetRunId,
         logger,
@@ -139,5 +141,3 @@ export function createServices() {
     },
   };
 }
-
-export type Services = ReturnType<typeof createServices>;

@@ -61,5 +61,3 @@ export function createPortalService(deps: {
 
   return { open };
 }
-
-export type PortalService = ReturnType<typeof createPortalService>;

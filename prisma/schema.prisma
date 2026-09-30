@@ -269,6 +269,7 @@ model TopUpGrant {
   account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Restrict)
 
   /// The paid Chargebee invoice. One row per (tenant, invoice), ever.
+  /// `free-plan-credits` for the free plan's one-time grant (FREE_PLAN_CREDITS).
   invoiceId String @map("invoice_id") @db.VarChar(100)
 
   /// Where the credits went — pinned when the row is claimed, so a retry

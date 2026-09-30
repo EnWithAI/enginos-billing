@@ -3,7 +3,7 @@
  *
  *   billing_account.last_processed_ingested_at            where the worker is
  *        │
- *   window = (cursor, cursor + windowMs]      once it fits inside now − lag
+ *   window = (cursor, min(now − lag, cursor + maxRange)]
  *        │
  *   SELECT count(), sum(cost) … GROUP BY TraceId:SpanId       the usage in it
  *        │
@@ -46,13 +46,19 @@
  *     so a caller that lost its claim can never turn a SUCCESS back into
  *     anything else. This is what makes the manual sync route, a second
  *     replica and an old worker mid-rollout safe beside the cron.
- *   - Events sharing an `ingested_at` are not skipped, and re-sent spans are
+ *   - Events sharing an end time are not skipped, and re-sent spans are
  *     not counted twice. The window boundary is a TIME, so it cannot fall
  *     inside a millisecond; identity is TraceId:SpanId and lives in the query.
  *     Two jobs, two mechanisms — see integrations/clickhouse/usage-source.ts.
  *
- * A tenant hours behind (worker down) catches up over several windows in one
- * tick, up to maxWindowsPerTick.
+ * The windows are on when each LLM call ended (`Timestamp + duration_ms`).
+ * The columns keep their `ingested_at` names (`last_processed_ingested_at`,
+ * `from_ingested_at`, `to_ingested_at`) from when they held ClickHouse's
+ * ingest time; they now hold call end times.
+ *
+ * A tenant hours behind (worker down) catches up in ranges of at most
+ * maxRange (an hour) — one Chargebee charge each — as many as the run's time
+ * budget allows; what a run does not reach, the next one does.
  */
 
 import { isUniqueViolation, type PrismaClient } from "../db/prisma";
@@ -86,15 +92,29 @@ import {
 import { errorMessage } from "../shared/errors";
 import type { Logger } from "../shared/logger";
 
-/** Two minutes: ClickHouse async inserts and the collector's batch settle well inside it. */
-const DEFAULT_LAG_MS = 2 * 60 * 1000;
+/** Sixty seconds: a span lands within ~45 s of its call's end (config.ts MIN_LAG_MS). */
+const DEFAULT_LAG_MS = 60 * 1000;
 
 /** Alert well before ClickHouse's 90-day TTL turns unbilled usage into lost usage. */
 const DEFAULT_BEHIND_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** One minute — the cron's own cadence, so the ordinary tick bills exactly one window. */
-const DEFAULT_WINDOW_MS = 60 * 1000;
-const DEFAULT_MAX_WINDOWS = 20;
+/**
+ * The longest range one charge covers: an hour. An ordinary tick bills the
+ * minute since the last one; this only bounds a catch-up. Chargebee refuses a
+ * capture larger than the balance WHOLE — it cannot bill part of one — so an
+ * org that ran out part-way through a long outage has at most this much held,
+ * not the whole outage.
+ */
+const DEFAULT_MAX_RANGE_MS = 60 * 60 * 1000;
+
+/**
+ * How long one pass may keep STARTING ranges. The sweep's executionTimeout is
+ * five minutes and the gate check runs after it; a run killed mid-capture
+ * leaves a PROCESSING row that waits out its lease. So a pass stops starting
+ * new ranges — and new tenants — past this, and the next minute's run goes on
+ * from each tenant's cursor. On an ordinary minute it is never reached.
+ */
+export const DEFAULT_RUN_BUDGET_MS = 3 * 60 * 1000;
 
 /** What one tenant's run did. Also the workflow's output shape. */
 export const OUTCOME = {
@@ -183,12 +203,8 @@ export interface UsageSyncDeps {
   usdPerCredit: string;
   /** Only usage ingested at least this long ago is read. */
   lagMs?: number;
-  /**
-   * How long one window is. FIXED, not "whatever is available": see the loop.
-   */
-  windowMs?: number;
-  /** How many windows one tick may process for one tenant, so a backlog drains without running forever. */
-  maxWindowsPerTick?: number;
+  /** The longest range one charge covers (BILLING_MAX_RANGE_MS). An ordinary tick bills far less. */
+  maxRangeMs?: number;
   /**
    * Unresolved syncs past this many attempts log as errors. The row STAYS
    * unresolved — counting attempts never turns an unknown into a failure.
@@ -210,13 +226,13 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
   const accounts = deps.accounts ?? createBillingAccountRepository(deps.prisma);
   const syncs = deps.syncs ?? createChargebeeSyncRepository(deps.prisma);
   const lagMs = deps.lagMs ?? DEFAULT_LAG_MS;
-  const windowMs = deps.windowMs ?? DEFAULT_WINDOW_MS;
-  const maxWindows = deps.maxWindowsPerTick ?? DEFAULT_MAX_WINDOWS;
+  const maxRangeMs = deps.maxRangeMs ?? DEFAULT_MAX_RANGE_MS;
   const maxAttempts = deps.maxAttempts ?? 10;
   const clock = deps.clock ?? (() => Date.now());
   const log = deps.logger ?? console;
 
-  async function runTenant(tenantSlug: string): Promise<TenantResult> {
+  /** `deadline` (this service's clock): no new range is started past it. */
+  async function runTenant(tenantSlug: string, deadline: number = Number.POSITIVE_INFINITY): Promise<TenantResult> {
     const account = await accounts.findBySlug(tenantSlug);
     if (!account) return { tenantSlug, outcome: OUTCOME.NOT_BILLABLE, reason: "no billing account" };
     if (!account.chargebeeSubscriptionId || !account.ledgerUnitId) {
@@ -275,7 +291,7 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
       return recovered ?? { tenantSlug, outcome: OUTCOME.NOT_BILLABLE, reason: "subscription cancelled" };
     }
 
-    return processWindows(current, recovered);
+    return processWindows(current, recovered, deadline);
   }
 
   /**
@@ -308,7 +324,11 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
    * `recovered` is a sync that resolved earlier this tick; it becomes the
    * reported outcome unless a fresh window is billed after it.
    */
-  async function processWindows(account: Account, recovered: TenantResult | null = null): Promise<TenantResult> {
+  async function processWindows(
+    account: Account,
+    recovered: TenantResult | null = null,
+    deadline: number = Number.POSITIVE_INFINITY,
+  ): Promise<TenantResult> {
     const tenantSlug = account.routingSlug;
 
     const started = await startingCursor(account, tenantSlug);
@@ -327,21 +347,23 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     let events = billed ? (recovered?.events ?? 0) : 0;
     let last: TenantResult | null = recovered;
 
-    for (let i = 0; i < maxWindows; i += 1) {
-      // A window is a FIXED span starting at the cursor, and it is processed
-      // only once it fits entirely inside the safe range. `to` is therefore a
-      // function of `from` alone.
+    for (let i = 0; ; i += 1) {
+      // Everything settled since the cursor, up to maxRange: the minute since
+      // the last tick, ordinarily; an hour at a time after an outage.
       //
-      // That is not a detail. If `to` were `min(cursor + max, until)`, two
-      // workers reading the same cursor a few milliseconds apart would compute
-      // DIFFERENT window ends, and the row index — which is on
-      // (tenant_id, from_ingested_at) — would not see them as the same window.
-      // One could then charge (from, toB] while the other advanced the cursor
-      // to toA, leaving the overlap to be billed a second time. With `to`
-      // derived from `from`, two workers either collide on the index or agree
-      // exactly, and there is no third case.
-      const to = cursor + windowMs;
-      if (to > until) break;
+      // Two workers reading the same cursor a moment apart compute DIFFERENT
+      // ends, and that is safe: a row is opened, and an empty range passed,
+      // only while the cursor still sits at its start, under the account row's
+      // lock (chargebee-sync.repository.ts openWindow, and
+      // billing-account.repository.ts advancePastEmptyWindow). So of two
+      // ranges from one start, exactly one is billed or passed; the other
+      // finds the cursor gone and backs off. A retry never recomputes a range:
+      // it re-sends the row it stored, under that row's id.
+      const to = Math.min(until, cursor + maxRangeMs);
+      if (to <= cursor) break;
+      // Past the run's budget, the range in hand is the last: the next run
+      // carries on from the cursor.
+      if (i > 0 && clock() >= deadline) break;
 
       const usage = await deps.usage.readWindow(tenantSlug, { fromMs: cursor, toMs: to });
 
@@ -362,13 +384,11 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
         // aggregate covered the whole range rather than a page of it, so the
         // cursor moves past it.
         //
-        // Safe without a row because the window is deterministic: any other
-        // worker reading this same `from` with the same window length reads
-        // this same range, and the lag guarantees it has settled. A worker with
-        // a DIFFERENT length (the old one, during a deploy that changed
-        // BILLING_WINDOW_MS) may have found usage further on and written a row
-        // at this same start — which is why the move is refused while a row
-        // owns the window. A settled one is stepped over, as syncWindow does.
+        // Safe without a row: the lag guarantees the range has settled, and a
+        // worker that read the same `from` with a LATER end may have found
+        // usage further on and written a row at this same start — which is
+        // why the move is refused while a row owns the window. A settled one
+        // is stepped over, as syncWindow does.
         const step = await accounts.advancePastEmptyWindow(account.tenantId, new Date(cursor), new Date(to));
         if (step.moved) {
           cursor = to;
@@ -386,9 +406,9 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
 
       // Follow the cursor the database COMMITTED, not the `to` we asked for.
       //
-      // They differ whenever the repair path fires: a settled row that is not
-      // `windowMs` long — which a change to BILLING_WINDOW_MS between deploys
-      // is enough to produce — moves the cursor to ITS end, not to ours.
+      // They differ whenever the repair path fires: a settled row written by
+      // another worker, which read a different end for the same start, moves
+      // the cursor to ITS end, not to ours.
       // Carrying on from `to` would leave the in-memory cursor permanently
       // ahead of the stored one, and every window after that would overlap a
       // range already billed. That is a double charge, and it is silent.
@@ -916,7 +936,8 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
    * counted, never allowed to abort the pass — one broken subscription must not
    * stop everyone else's billing.
    */
-  async function runOnce(slugs?: string[]) {
+  async function runOnce(slugs?: string[], { deadline }: { deadline?: number } = {}) {
+    const budgetEnds = deadline ?? clock() + DEFAULT_RUN_BUDGET_MS;
     // Plus any tenant holding an unresolved sync, whatever its account status
     // now: it must be resolved even after the account cancelled, or a charge
     // that landed never gets recorded and the tenant never moves again.
@@ -927,9 +948,15 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     const results: TenantResult[] = [];
     const errors: Array<{ tenantSlug: string; error: string }> = [];
 
+    let reached = 0;
     for (const account of visit) {
+      // Out of budget: the tenants not reached are billed from their cursors
+      // next minute. Nothing is skipped — a cursor only moves past a range
+      // that was billed.
+      if (clock() >= budgetEnds) break;
+      reached += 1;
       try {
-        results.push(await runTenant(account.routingSlug));
+        results.push(await runTenant(account.routingSlug, budgetEnds));
       } catch (err) {
         errors.push({ tenantSlug: account.routingSlug, error: errorMessage(err) });
         log.error?.(
@@ -940,8 +967,14 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     }
 
     const count = (outcome: Outcome) => results.filter((r) => r.outcome === outcome).length;
+    if (reached < visit.length) {
+      log.warn?.(
+        { metric: "billing.sync.budget_spent", reached, tenants: visit.length },
+        "The pass used its time budget; the tenants not reached are billed next minute, from their cursors",
+      );
+    }
     const summary = {
-      tenantsScanned: visit.length,
+      tenantsScanned: reached,
       synced: count(OUTCOME.SYNCED),
       replayed: count(OUTCOME.REPLAYED),
       idle: count(OUTCOME.IDLE),

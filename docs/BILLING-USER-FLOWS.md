@@ -19,7 +19,7 @@ Each section is one thing a person does. It shows what they do, what they see, w
 | [9. Download an invoice](#9-download-an-invoice) | Admin | The invoice PDF opens |
 | [10. Use AI features](#10-use-ai-features) | Anyone in the org | Credits taken every minute |
 | [11. Credits run out](#11-credits-run-out) | Automatic | AI requests stop until a top-up |
-| [12. Yearly renewal](#12-the-plan-renews-each-year) | Automatic | 1,000 more credits; unused ones roll over |
+| [12. Yearly renewal](#12-the-plan-renews-each-year) | Automatic | New dates; no new free credits, unused ones kept |
 
 ---
 
@@ -41,17 +41,21 @@ The whole sign-up, across every system, is in [SIGNUP-FLOW.md](SIGNUP-FLOW.md). 
    The org's own setting (`billing_account.free_plan`), or `FREE_PLAN_DEFAULT`, decides whether the free plan is for it. If not, billing stops here; steps 5–9 run only when it is.
 5. Billing checks the free plan really costs ₹0. `Chargebee GET /item_prices/{id}`
 6. Billing subscribes the org to the free plan — no card needed. `Chargebee POST /customers/{id}/subscription_for_items`
-7. Chargebee gives the org 1,000 credits for the year.
-8. Billing links the subscription and its credit balance, trying every second for up to 10 seconds. `Chargebee GET /subscriptions`, `GET /ledger_account_balances`
+
+   The plan itself gives no credits: its own credit grant is set to zero, because Chargebee would hand a plan's grant out again every year. So on its own the org would have no credit wallet in Chargebee at all.
+7. Billing links the subscription and gives the org its free credits — 1,000 in all (`FREE_PLAN_CREDITS`), **once per org, ever**. They go into the `token-test` credit unit (`FREE_PLAN_CREDIT_UNIT`), which creates the org's credit wallet, and they are kept for 10 years. If the plan already gave some (orgs from before the change), only the rest is added. `Chargebee GET /subscriptions`, `GET /grant_blocks`, `POST /ledger_operations/allocate`
+8. Billing records the new wallet as the org's, so usage is taken from it. If there is still no wallet, it repeats steps 7–8 every second for up to 10 seconds; normally once is enough. `Chargebee GET /ledger_account_balances`
 9. Billing sets the AI spending limit to today's spend + $20 (1,000 credits × $0.02). `LiteLLM POST /team/update`
 
 **Saved**
 
-- Billing: one `billing_account` row — the org, its Chargebee customer and subscription, its credit unit, the plan's dates, status *active*, and the point from which usage is billed.
+- Billing: one `billing_account` row — the org, its Chargebee customer and subscription, its credit unit, the plan's dates, status *active*, and the point from which usage is billed. One `topup_grant` row (`free-plan-credits`), so the free credits are never given twice.
 - Chargebee: the customer, the free-plan subscription and the 1,000 credits.
 - LiteLLM: the team's spending limit.
 
-**If something goes wrong.** Sign-up still finishes. The Billing page then shows *Setting up your free plan* with a **Check again** button, and opening the page runs steps 4–9 again.
+**If something goes wrong.** Sign-up still finishes. The Billing page then shows *Setting up your free plan* with a **Check again** button, and opening the page runs steps 4–9 again. If Chargebee refuses the free credits, the page shows *Activating*, AI requests wait, and billing tries again every minute — it can never give them twice.
+
+**Seen live (Sep 30, 2026).** An org created on the zero-credit plan (`org_aaa_com`) had no wallet and no credits. Once this was in place, billing added 1,000 credits, the wallet appeared, and the org used it.
 
 ---
 
@@ -242,23 +246,23 @@ Only one top-up can be unpaid at a time, so a retry never charges for several.
 
 **The user does.** Anyone in the org uses agents, chat or anything else that calls an AI model.
 
-**The user sees.** On the Billing page, *Used* goes up and *Last synced* updates — about 3 minutes after the call.
+**The user sees.** On the Billing page, *Used* goes up and *Last synced* updates — about 1–2 minutes after the call ends.
 
 **Behind the scenes**
 
 1. Every AI call goes through LiteLLM. Its gate refuses an org with no plan, or one billing has blocked because its credits are used up.
-2. The cost of each call is written to ClickHouse, in the org's own table (`tenant_<slug>.span_nodes`).
-3. Every minute, billing's background worker adds up each org's new cost, one minute at a time, 10 seconds behind the clock (`BILLING_LAG_MS`). A call reaches Chargebee about a minute after it is made. `ClickHouse SELECT … FROM tenant_<slug>.span_nodes`
+2. The cost of each call is written to ClickHouse, in the org's own table (`tenant_<slug>.span_nodes`), usually well under a minute after the call ends.
+3. Every minute, billing's background worker adds up the cost of each org's calls that **ended** since it last looked, up to 60 seconds ago (`BILLING_LAG_MS`; 45 seconds on a developer machine) — the wait lets every call's cost arrive first. A call counts by when it finished, not when it started. After an outage it catches up an hour at a time (`BILLING_MAX_RANGE_MS`). `ClickHouse SELECT … FROM tenant_<slug>.span_nodes`
 4. It turns dollars into credits: $1 = 50 credits.
-5. It takes those credits from the org's Chargebee balance. Each minute is sent with its own id, so it can never be taken twice. `Chargebee POST /ledger_operations/capture`
+5. It takes those credits from the org's Chargebee balance. Each stretch of time — normally a minute, at most an hour — is sent with its own id, so it can never be taken twice. `Chargebee POST /ledger_operations/capture`
 6. It moves its "billed up to here" marker forward.
 
 **Saved**
 
-- Billing: one `chargebee_sync` row for each minute that had usage — the dollars, the credits, the number of calls and whether Chargebee took them. The marker on `billing_account`.
+- Billing: one `chargebee_sync` row for each stretch that had usage — the dollars, the credits, the number of calls and whether Chargebee took them. The marker on `billing_account`.
 - Chargebee: the credits taken.
 
-**If something goes wrong.** Chargebee down or slow: the minute is retried until it goes through, and the marker waits — nothing is lost or billed twice. Problems that need a person are alerted in Sentry.
+**If something goes wrong.** Chargebee down or slow: the same stretch is retried until it goes through, and the marker waits — nothing is lost or billed twice. Problems that need a person are alerted in Sentry.
 
 ---
 
@@ -273,7 +277,7 @@ Only one top-up can be unpaid at a time, so a retry never charges for several.
 1. LiteLLM refuses new calls once the org's spend reaches its limit.
 2. Billing's next attempt to take credits fails: Chargebee says there is not enough balance. That minute is kept as *out of credits*.
 3. Billing marks the org *exhausted* and blocks its LiteLLM team. `LiteLLM POST /team/update {blocked: true}`
-4. After a top-up ([4](#4-buy-credits-with-a-saved-card) or [6](#6-pay-now)), billing unblocks the team, marks the org *active*, and bills the minutes that were waiting.
+4. After a top-up ([4](#4-buy-credits-with-a-saved-card) or [6](#6-pay-now)), billing unblocks the team, marks the org *active*, and bills the minutes that were waiting. Credits someone adds by hand in Chargebee's dashboard do the same within seconds: Chargebee tells billing credits were added (the *grant blocks created* message), and billing reads the org again. `Chargebee GET /subscriptions`, `GET /grant_blocks`; `LiteLLM POST /team/update`
 
 **Saved.** Billing: status *exhausted* on `billing_account`, and the waiting minute in `chargebee_sync`. LiteLLM: the team blocked, with the reason.
 
@@ -283,15 +287,16 @@ Only one top-up can be unpaid at a time, so a retry never charges for several.
 
 **The user does.** Nothing. It happens on the renewal date shown on the Billing page.
 
-**The user sees.** A new renewal date a year later, and 1,000 more credits. Unused credits carry over.
+**The user sees.** A new renewal date a year later. No new free credits: the free plan's 1,000 were given once, at sign-up. Credits not used yet are still there.
 
 **Behind the scenes**
 
-1. Chargebee renews the ₹0 plan and adds 1,000 credits. Unused credits roll over.
-2. Chargebee tells billing the plan renewed (the *subscription renewed* webhook). `POST /api/v1/webhooks/chargebee` → `POST /api/webhooks/chargebee`
+1. Chargebee renews the ₹0 plan. It adds no credits, because the plan's own credit grant is set to zero.
+2. Chargebee tells billing the plan renewed (the *subscription renewed* webhook). billing `POST /api/webhooks/chargebee`, directly
 3. Billing reads the subscription again and stores the new dates. `Chargebee GET /subscriptions`
-4. Billing resets the AI spending limit so it matches the credits left. `LiteLLM POST /team/update`
-5. Once a day, billing also re-reads every org's plan, in case a Chargebee message was missed.
+4. Billing does **not** give the free credits again — its `topup_grant` row says they were given.
+5. Billing resets the AI spending limit so it matches the credits left. `LiteLLM POST /team/update`
+6. Once a day, billing also re-reads every org's plan, in case a Chargebee message was missed.
 
 **Saved.** Billing: the new term dates on `billing_account`. LiteLLM: the new limit.
 
@@ -314,7 +319,7 @@ flowchart LR
 
     page --> platform --> api --> cb
     page -. "card page, by browser redirect" .-> cb
-    cb -. "webhooks, Basic auth" .-> platform
+    cb -. "webhooks, Basic auth (direct)" .-> api
     platform -- "creates team at sign-up" --> litellm
     api -- "accounts, sync rows" --> pg
     worker --> pg
@@ -327,6 +332,18 @@ flowchart LR
 
 The browser only ever talks to the platform — except for Chargebee's card page, which it visits directly. The platform checks the login and passes requests to billing, and only billing talks to Chargebee and sets the AI spending limit.
 
+**Chargebee's messages** (webhooks) go straight to billing — the one address of billing open to the internet, `https://app.enwithai.com/api/webhooks/chargebee`. Neither the app nor the platform is in between. Billing checks the username and password Chargebee sends with each one (set in billing's own settings, `CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD`); a wrong or missing pair is refused, and if billing has none set it refuses every message. Billing acts on these:
+
+| Message from Chargebee | What billing does |
+| --- | --- |
+| A plan was created, changed, renewed, cancelled… | Reads the org's plan again from Chargebee |
+| A payment went through | Adds a paid top-up's credits (only for top-up invoices) |
+| Credits were added (*grant blocks created*) | Reads the org again, so its AI spending limit rises within seconds — also for credits added by hand in Chargebee |
+| A payment failed | Notes it; Chargebee retries the card itself |
+| Chargebee's **Test Webhook** button | Answers OK and does nothing — it is sample data (a made-up customer, `cbdemo_tom`) |
+
+Any other message is answered OK and ignored. If billing fails on one, it says so, and Chargebee sends it again later.
+
 ---
 
 ## What is saved where
@@ -337,7 +354,7 @@ Billing keeps three small tables of ids and progress. Every amount of money and 
 | --- | --- | --- |
 | Billing — `billing_account` | One row per org: its Chargebee customer and plan, credit unit, plan dates, status, and "usage billed up to here" | 1, 10, 11, 12 |
 | Billing — `chargebee_sync` | One row per minute with AI usage: dollars, credits, calls, and whether Chargebee took them | 10, 11 |
-| Billing — `topup_grant` | One row per paid top-up, so its credits are never added twice | 4, 6 |
+| Billing — `topup_grant` | One row per paid top-up, and one for an org's free credits, so none are ever added twice | 1, 4, 6 |
 | Chargebee | The customer, the plan, invoices, payments, cards, and the credits | 1, 3–7, 10, 12 |
 | LiteLLM | Each org's spending limit, and whether it is blocked | 1, 4, 6, 11, 12 |
 | ClickHouse | The cost of every AI call, per org — billing only reads it | 10 |

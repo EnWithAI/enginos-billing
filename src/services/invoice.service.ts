@@ -76,5 +76,3 @@ export function createInvoiceService(deps: {
 
   return { downloadLink };
 }
-
-export type InvoiceService = ReturnType<typeof createInvoiceService>;

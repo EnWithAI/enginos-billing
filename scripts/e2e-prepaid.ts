@@ -291,8 +291,6 @@ async function main() {
   await sleep(2000);
   await llm(slug, repeated);
   const realCalls = 5; // W5 + 3 × U1 + the first of the repeated pair
-  const col = await clickhouse(`SELECT default_expression AS d FROM system.columns WHERE database = 'tenant_${slug}' AND table = 'span_nodes' AND name = 'ingested_at'`);
-  check("K0", "new tenant DB provisioned with span_nodes.ingested_at (migration 029)", /now64/.test(String(col[0]?.d ?? "")), `default=${col[0]?.d ?? "missing"}`);
   const spans = await waitFor("spans in tenant ClickHouse DB", async () => {
     const rows = await clickhouse(`SELECT count() AS n FROM tenant_${slug}.span_nodes FINAL WHERE SpanName = 'litellm_request' AND attrs['gen_ai.cost.total_cost'] != ''`);
     return Number(rows[0]?.n ?? 0) >= realCalls + 1 ? Number(rows[0]!.n) : null;
@@ -320,7 +318,7 @@ async function main() {
   // Chargebee and LiteLLM must run down at the same rate, or one runs out
   // first. This is also what proves the cache hit was not billed: LiteLLM
   // records spend 0 for it, so any drawdown for it would show up as a gap.
-  const lagMs = Number(process.env.BILLING_LAG_MS ?? 120_000);
+  const lagMs = Number(process.env.BILLING_LAG_MS ?? 60_000);
   await sleep(Math.max(lagMs, 30_000) + 90_000); // let the last span age past the lag and be swept
   await sleep(15_000); // LiteLLM flushes team spend in batches
   const usableAfterUsage = await usable(subscriptionId);
@@ -328,10 +326,12 @@ async function main() {
   const drawdownUsd = (usableBeforeUsage - usableAfterUsage) * RATE;
   check("U8", "Chargebee drawdown equals LiteLLM team spend — and no cache hit was billed", Math.abs(drawdownUsd - (litellmSpend - baseline)) < 1e-6, `Chargebee $${drawdownUsd} vs LiteLLM $${litellmSpend - baseline}`);
 
-  // The cursor must be at or past every costed span old enough to have been
-  // read, or the next read would charge that usage again — or never.
-  const maxIngested = await clickhouse(`SELECT max(toUnixTimestamp64Milli(ingested_at)) AS m FROM tenant_${slug}.span_nodes FINAL WHERE SpanName = 'litellm_request' AND attrs['gen_ai.cost.total_cost'] != '' AND JSONExtractString(attrs['hidden_params'], 'cache_key') = '' AND ingested_at <= now64(3) - INTERVAL ${Math.ceil(lagMs / 1000)} SECOND`);
-  const newest = Number(maxIngested[0]?.m ?? 0);
+  // The cursor must be at or past every costed call old enough to have been
+  // read (windows are on when each call ended), or the next read would charge
+  // that usage again — or never.
+  const ended = "addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0))";
+  const maxEnded = await clickhouse(`SELECT max(toUnixTimestamp64Milli(${ended})) AS m FROM tenant_${slug}.span_nodes FINAL WHERE SpanName = 'litellm_request' AND attrs['gen_ai.cost.total_cost'] != '' AND JSONExtractString(attrs['hidden_params'], 'cache_key') = '' AND ${ended} <= now64(3) - INTERVAL ${Math.ceil(lagMs / 1000)} SECOND`);
+  const newest = Number(maxEnded[0]?.m ?? 0);
   const cur = await cursorAt(tenantId);
   check("K1", "billing is at or past every span old enough to have been read", !!cur && !!newest && cur >= newest, `at ${cur ? new Date(cur).toISOString() : "none"} vs newest readable span ${new Date(newest).toISOString()}`);
   // The cursor is a TIME and is allowed to stand ahead of the newest span: an

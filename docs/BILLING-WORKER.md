@@ -4,8 +4,10 @@ How the billing cron works, end to end: what runs every minute, which orgs it
 visits, the exact ClickHouse query, how usage becomes a Chargebee charge, when
 Sentry is alerted, and what happens when the worker is down.
 
-Code: `worker/hatchet-worker.ts`, `worker/alerts.ts`,
+Code: `worker/hatchet-worker.ts`, `worker/passes.ts`, `worker/alerts.ts`,
 `src/services/usage-sync.service.ts`, `src/integrations/clickhouse/usage-source.ts`,
+`src/repositories/chargebee-sync.repository.ts`,
+`src/repositories/billing-account.repository.ts`,
 `src/integrations/chargebee/client.ts`, `src/models/sync-status.ts`.
 
 **Money in one line.** `CREDITS_PER_USD=50`: $1 of AI usage is 50 credits.
@@ -19,7 +21,7 @@ Code: `worker/hatchet-worker.ts`, `worker/alerts.ts`,
 3. [One tick](#3-one-tick)
 4. [Which orgs are visited](#4-which-orgs-are-visited)
 5. [One org's run](#5-one-orgs-run)
-6. [Windows and the cursor](#6-windows-and-the-cursor)
+6. [Ranges and the cursor](#6-ranges-and-the-cursor)
 7. [The ClickHouse query](#7-the-clickhouse-query)
 8. [Charging Chargebee](#8-charging-chargebee)
 9. [Sentry — the four alerts](#9-sentry--the-four-alerts)
@@ -34,22 +36,28 @@ Code: `worker/hatchet-worker.ts`, `worker/alerts.ts`,
 
 1. A separate process, the **billing worker**, connects to **Hatchet**, which
    fires its cron **every minute**.
-2. Each tick visits every org with a subscription. For each one it takes the
-   next **one-minute window** of usage after the org's **cursor**, but only
-   once that window ended at least `BILLING_LAG_MS` ago — **10 s**. Usage reaches Chargebee **about a minute** after
-   the call: ~15 s at best, ~2 min 20 s at worst (measured: 92 s).
-3. It asks **ClickHouse** what the org's LLM calls in that window cost, in USD.
+2. Each tick visits every org with a subscription. For each one it bills the
+   **range** from the org's **cursor** up to `now − BILLING_LAG_MS`: every LLM
+   call that **ended** after the cursor and at least **60 s** ago (the local
+   `.env`: 45 s). Ordinarily that is the minute since the last tick; after an
+   outage, **at most an hour** per charge. Usage reaches Chargebee **about 1–2
+   minutes** after the call ended — the lag plus up to a minute to the next
+   tick (measured: 52 s, with a 45 s lag).
+3. It asks **ClickHouse** what the org's LLM calls that ended in that range
+   cost, in USD.
 4. It converts that to credits, writes a **`chargebee_sync` row first**, then
    **captures** the credits from the org's Chargebee balance.
-5. Only when Chargebee confirms does the **cursor move** past the window. If
+5. Only when Chargebee confirms does the **cursor move** to the range's end. If
    Chargebee refuses for lack of balance, the org is marked **`exhausted`**, its
    LiteLLM team is **blocked**, and it is held until a top-up.
 6. Four kinds of failure raise a **Sentry** alert: Postgres down, Postgres
    refusing a write, Chargebee down, Chargebee refusing usage. Running out of
    credits never does.
 7. If the worker is down, **nothing is lost** — the usage waits in ClickHouse
-   behind the cursor and is billed when it comes back — but **nothing is
-   enforced** either, and **no alert fires**.
+   ahead of the cursor and is billed, an hour per charge, when it comes back —
+   but the Chargebee balance **stands still**, running out of credits is **not
+   detected**, and **no alert fires**. LiteLLM still enforces each team's
+   budget in real time.
 
 ---
 
@@ -71,7 +79,7 @@ declared but never registered simply does not exist, and nothing complains.
 
 | Workflow | Cron | Task | Timeout | Retries | Concurrency |
 | --- | --- | --- | --- | --- | --- |
-| `billing-usage-sync` | `* * * * *` — every minute | `sweep` | 5 min | 0 — the next tick is the retry | 1 run at a time; a tick that fires while one is still running is **cancelled** (`CANCEL_NEWEST`), so a run mid-capture always finishes. With `BILLING_SWEEP_INTERVAL_MS` under a minute, one run makes several passes (§3) |
+| `billing-usage-sync` | `* * * * *` — every minute | `sweep` | 5 min | 0 — the next tick is the retry | 1 run at a time; a tick that fires while one is still running is **cancelled** (`CANCEL_NEWEST`), so a run mid-capture always finishes. No new range is started after 3 minutes (§3). With `BILLING_SWEEP_INTERVAL_MS` under a minute, one run makes several passes (§3) |
 | `billing-subscription-reconcile` | `11 2 * * *` — daily | `resync` | 15 min | 0 | — |
 
 ### Configuration
@@ -82,15 +90,17 @@ declared but never registered simply does not exist, and nothing complains.
 | `HATCHET_CLIENT_HOST_PORT` | SDK default | Hatchet engine address |
 | `HATCHET_CLIENT_TLS_STRATEGY` | `none` locally | The local engine serves plaintext gRPC |
 | `HATCHET_WORKER_SLOTS` | `5` | Tasks one worker runs at once |
-| `BILLING_LAG_MS` | `10000` (10 s) | Only usage ingested at least this long ago is read. Below 10 s is refused unless `BILLING_ALLOW_SHORT_LAG=true` (tests). 10 s is safe — see §6 (it was 2 minutes before that was measured) |
-| `BILLING_WINDOW_MS` | `60000` (1 min); `.env`: `60000` | Window length. **Fixed** — see §6 |
-| `BILLING_MAX_WINDOWS_PER_TICK` | `20` | Windows one org may bill in one pass |
-| `BILLING_SWEEP_INTERVAL_MS` | `60000`; `.env`: `60000` | Time between passes: one a minute. Under a minute, each run makes several passes — an option, not used (§3) |
+| `BILLING_LAG_MS` | `60000` (60 s); `.env`: `45000` | Only LLM calls that **ended** at least this long ago, by ClickHouse's clock, are read. Below 30 s (`MIN_LAG_MS`) is refused at start — 0 included — unless `BILLING_ALLOW_SHORT_LAG=true` (tests only). A span landing later than the lag is never billed — see §6 |
+| `BILLING_MAX_RANGE_MS` | `3600000` (1 h) | Longest range one charge covers — bounds a catch-up, and so the most an org that ran out mid-outage can have held; an ordinary pass bills the minute since the last |
+| `BILLING_SWEEP_INTERVAL_MS` | `60000`; `.env`: `60000` | Time between passes: one a minute. Under a minute, each run makes several passes (none after 45 s) — an option, not used (§3). Above a minute behaves as a minute |
 | `BILLING_MAX_ATTEMPTS` | `10` | Past this, an unknown outcome logs as `stuck` |
 | `CLICKHOUSE_URL` / `_USER` / `_PASSWORD` | `http://localhost:8123`, `default` | ClickHouse |
 | `CLICKHOUSE_TIMEOUT_MS` | `20000` | Also the query's `max_execution_time` |
 | `CREDITS_PER_USD` | `1000` (`.env`: `50`) | USD → credits |
 | `SENTRY_DSN` | empty = no alerts | Sentry project (set in the local `.env`) |
+
+There is no fixed window: `BILLING_WINDOW_MS` and
+`BILLING_MAX_WINDOWS_PER_TICK` no longer exist, and are ignored if still set.
 
 ---
 
@@ -101,8 +111,8 @@ The `sweep` task, every minute:
 ```mermaid
 flowchart TD
     T([Hatchet fires billing-usage-sync]) --> A
-    A["1 · activatePending()<br/>retry every account held 'activating'<br/>(paid, LiteLLM budget not set yet)"] --> S
-    S["2 · usageSync.runOnce()<br/>bill every org's usage — §4 to §8"] --> G
+    A["1 · activatePending()<br/>retry every account held 'activating'<br/>(LiteLLM budget not set yet, or free-plan<br/>credits owed) — grant owed credits, then open it"] --> S
+    S["2 · usageSync.runOnce()<br/>bill every org's usage — §4 to §8<br/>no new range after 3 min"] --> G
     G["3 · reopenBlockedActive()<br/>re-open any 'active' account whose team a<br/>racing block closed — stops at 4 min"] --> R
     R([return the sweep summary to Hatchet])
 ```
@@ -113,14 +123,25 @@ Step 2 runs **once** per minute (`BILLING_SWEEP_INTERVAL_MS=60000`).
 passes inside the one run — with `10000`, at 0, 10, 20, 30 and 40 s
 (`worker/passes.ts`). No pass starts after 45 s and the gate check stops at
 55 s, so the run ends before the next minute's tick, which Hatchet would
-otherwise cancel (`CANCEL_NEWEST`). It only speeds billing up together with a
-shorter `BILLING_WINDOW_MS`, and every extra window with usage is an extra
-Chargebee capture.
+otherwise cancel (`CANCEL_NEWEST`). Each pass bills up to `now − lag`, so usage
+reaches Chargebee sooner — the lag plus up to one interval after the call
+ended — but every pass that finds usage is an extra Chargebee capture per org.
+An interval above a minute changes nothing: the cron still fires every minute,
+one pass each.
 
-The order matters. Held accounts are retried **first**, so one that activates
-is billed in the same tick. The gate check is **last** — one LiteLLM read per
+The order matters. Held accounts are retried **first** — one held for the free
+plan's credits is granted them before it is opened — so one that activates is
+billed in the same tick. The gate check is **last** — one LiteLLM read per
 active account — so a hung LiteLLM cannot spend the tick's 5 minutes before a
 single capture is sent.
+
+**The time budget.** The usage sync stops **starting** new ranges, and new
+orgs, 3 minutes into the run (`SYNC_DEADLINE_MS`; 45 s, `LAST_PASS_START_MS`,
+with several passes); a range already started finishes. The gate check stops
+starting accounts at 4 minutes (`GATE_CHECK_DEADLINE_MS`; 55 s with several
+passes), and the task times out at 5. Only a catch-up comes near it: the orgs a
+pass did not reach carry on next minute from their cursors, logged as the
+warning `billing.sync.budget_spent`.
 
 The summary is what the Hatchet dashboard shows for the run (locally
 `http://localhost:8088`):
@@ -130,14 +151,14 @@ The summary is what the Hatchet dashboard shows for the run (locally
 | `passes` | Usage-sync passes in this run |
 | `activating`, `activated` | Accounts held, and how many opened this tick |
 | `reopened` | Active accounts found with a blocked team — should be 0 |
-| `tenantsScanned` | Orgs visited |
-| `synced`, `replayed` | Windows charged; charges whose lost answer turned out to have landed |
+| `tenantsScanned` | Orgs visited before the time budget ran out |
+| `synced`, `replayed` | Orgs charged; orgs whose lost answer turned out to have landed |
 | `idle` | Orgs with no usage |
-| `unknown`, `rateLimited`, `invalid` | Orgs held on an unresolved window |
+| `unknown`, `rateLimited`, `invalid` | Orgs held on an unresolved range |
 | `outOfCredits` | Orgs refused for lack of balance **this tick** |
 | `exhausted` | Orgs held because their credits are used up |
-| `holding`, `locked` | Waiting out a backoff; another worker had the window |
-| `writtenOff` | Refused windows on an ended subscription, given up |
+| `holding`, `locked` | Waiting out a backoff; another worker had the range |
+| `writtenOff` | Refused ranges on an ended subscription, given up |
 | `erroredTenants` | Orgs whose run threw; the rest carried on |
 
 ---
@@ -152,8 +173,12 @@ The summary is what the Hatchet dashboard shows for the run (locally
   now — a charge that may have landed must be resolved even after the org
   cancelled.
 
-Orgs are run **one after another**. One org's failure is caught, logged as
-`billing.sync.tenant_error`, and counted; it never stops the others.
+Orgs are run **one after another**, in the order `listBillable` returns them
+(there is no `ORDER BY`). One org's failure is caught, logged as
+`billing.sync.tenant_error`, and counted; it never stops the others. A pass
+stops starting new orgs past its time budget (§3): during a big catch-up the
+orgs at the end of that order start later — next minute, from their cursors —
+and nothing is lost.
 
 ---
 
@@ -164,71 +189,121 @@ Orgs are run **one after another**. One org's failure is caught, logged as
 | # | Check | Outcome |
 | --- | --- | --- |
 | 1 | No billing account, no subscription, or no credit unit yet | `not_billable` — skipped |
-| 2 | **`exhausted`** | Held whole: re-assert the LiteLLM block (a read when it is already there), send **nothing** to Chargebee, read **nothing** from ClickHouse. A refused window on a subscription that has since ended is written off |
+| 2 | **`exhausted`** | Held whole: re-assert the LiteLLM block (a read when it is already there), send **nothing** to Chargebee, read **nothing** from ClickHouse. A refused range on a subscription that has since ended is written off |
 | 3 | An **unresolved** `chargebee_sync` row | Resolve it **before reading anything new** (§8.4). Still unresolved → stop here: the cursor cannot pass it |
 | 4 | **`cancelled`** | Stop — usage after a cancellation is not charged |
-| 5 | Otherwise | Bill forward, window by window (§6) |
+| 5 | Otherwise | Bill forward from the cursor, range by range (§6) |
 
 ---
 
-## 6. Windows and the cursor
+## 6. Ranges and the cursor
 
-**The cursor** is `billing_account.last_processed_ingested_at`: the
-`ingested_at` up to which the org is fully billed. It is set to **now** when the
-subscription is first linked — never to zero, or the first tick would bill 90
-days of old spans. It moves **only** when the window in front of it is
-resolved, and only by compare-and-set.
+**The cursor** is `billing_account.last_processed_ingested_at`: the time up to
+which the org is fully billed — a call **end** time. The name is kept from when
+it held ClickHouse's ingest time, as are `chargebee_sync.from_ingested_at` and
+`to_ingested_at`, which hold a range's end-time bounds. The cursor is set to
+**now** when the subscription is first linked — never to zero, or the first
+tick would bill 90 days of old spans. It moves **only** when the range in front
+of it is resolved, and only by compare-and-set.
 
-**A window** is `(cursor, cursor + BILLING_WINDOW_MS]` — a fixed length from
-the cursor. It is processed only once it ends at least `BILLING_LAG_MS` before
-ClickHouse's own clock, so every span stamped inside it has become visible. Up
-to 20 windows per org per pass.
+**A call is billed by when it ended**: `Timestamp + duration_ms`. `Timestamp`
+is when the call **started** (MEASURED on 2026-09-30: equal to LiteLLM's own
+`startTime` within 0.1 s), and `duration_ms` is `Duration / 1e6` from platform
+tenant migration 004's view; a missing or non-finite duration counts as 0. Both
+are read from `span_nodes` as they are — billing adds no ClickHouse column and
+no migration.
+
+**A range** is `(cursor, min(now − BILLING_LAG_MS, cursor + BILLING_MAX_RANGE_MS)]`,
+with `now` from ClickHouse's own clock. Its length is not fixed: an ordinary
+pass bills the minute since the last one, a partial range is fine, and nothing
+is read while the cursor is at or past `now − lag`. All times are full UTC
+timestamps; midnight and month end are not special.
 
 ```
-ClickHouse now = 12:10:05      lag 10 s → safe up to 12:09:55
+ClickHouse now = 12:10:05      lag 60 s → safe up to 12:09:05
 
-cursor 12:07:00
-  (12:07:00, 12:08:00]  ✓ read
-  (12:08:00, 12:09:00]  ✓ read
-  (12:09:00, 12:10:00]  ✗ ends after 12:09:55 — next tick
+cursor 12:08:05                (where the last pass ended)
+  (12:08:05, 12:09:05]  ✓ read — the minute since the last pass
+cursor 12:09:05                nothing more until the next pass
 ```
 
-**Why a 10 s lag is enough.** ClickHouse stamps `ingested_at` when it writes the
-span into the org's `span_nodes` (the column's `DEFAULT now64(3)`), and the
-span is visible once that write commits. MEASURED on 2026-09-29 over 7 days of
-`system.query_views_log`: 10,058 writes, slowest **389 ms**, 99% under
-**19 ms**. The collector's batching happens before the stamp, so it does not
-count. A span visible only after the cursor had passed its stamp would never be
-billed — which is what the lag is for, with 25× margin here.
+**One range, in order:** read ClickHouse → nothing in it: move the cursor to
+the range's end, write no row → otherwise write the `chargebee_sync` row
+(`PENDING`, its id the Chargebee operation id) → capture → `SUCCESS` → the
+cursor moves to the range's end. The cursor moves only after Chargebee
+confirms (§8).
 
-**How late the balance is.** A span reaches ClickHouse a few seconds after its
-call — the OTel collector sends in 5-second batches (measured: 7 s) — and is
-stamped then. Its window can be read 10 s after the window ends, at the first
-tick after that:
+**Catch-up.** A pass bills as many ranges per org as it needs, one capture per
+range with usage, until the org is caught up or the pass's time budget (§3)
+runs out:
 
-| | Delay from the call to Chargebee |
+```
+ClickHouse now = 12:01:00      lag 60 s → safe up to 12:00:00      max range 1 h
+
+cursor 09:00:00                (the worker stopped at 09:00)
+  (09:00:00, 10:00:00]  ✓ one charge
+  (10:00:00, 11:00:00]  ✓ one charge
+  (11:00:00, 12:00:00]  ✓ one charge
+cursor 12:00:00                caught up — back to a minute a pass
+```
+
+Why an hour at most: Chargebee refuses a capture larger than the balance
+**whole**, so an org that ran out mid-outage has at most an hour of usage held,
+not the whole outage. Longer outages are in §11.
+
+**Why the lag is 60 s.** A span reaches ClickHouse well after its call ends.
+LiteLLM exports spans in background batches (OTel `BatchSpanProcessor`, 5 s by
+default), the collector batches them again (timeout 5 s), and then comes the
+ClickHouse insert and its views — with retries on a failure. MEASURED on
+2026-09-30 over 421 local spans: a span landed **23 s** (p50) and **44 s**
+(p99) after its call ended; 3 of the 421 took over 45 s, 1 over 60 s. A span
+that lands after its range was read is behind the cursor and is **never
+billed** — which is what the lag is for. So `BILLING_LAG_MS` is 60 s by
+default, and anything under 30 s (`MIN_LAG_MS`) stops the worker at start;
+`BILLING_ALLOW_SHORT_LAG=true` lifts that floor, for tests only. The local
+`.env` runs at 45 s: billed sooner, at the measured cost of 3 spans in 421.
+
+**A re-sent span** carries the same `Timestamp` and duration as the first
+copy, so it falls in the same range and is billed once: inside a range not yet
+billed the `GROUP BY` counts it once, and once the range is billed it is behind
+the cursor and never read again.
+
+**How late the balance is.** A call is billed at the first pass whose
+`now − lag` is past its end — the lag plus up to one interval after the call
+ended:
+
+| | Delay from the call's end to Chargebee |
 | --- | --- |
-| Best — stamped at the window's end, a tick just 10 s later | **~15 s** |
-| Average — ~7 s to ClickHouse + half a window + 10 s lag + half a minute to the tick | **~75 s** |
-| Worst — stamped at the window's start, a tick just missed | **~2 min 20 s** |
+| Best — the call's end passes `now − lag` just as a tick starts | **~lag** — 60 s (45 s locally) and a second to read and capture |
+| Average — half a minute to the tick | **~lag + 30 s** — ~90 s |
+| Worst — the call's end passes `now − lag` just after a tick | **~lag + 1 min** — ~2 min |
 
-MEASURED on 2026-09-29 with one call for `org_ee_com`: in ClickHouse 7 s after
-the call, captured in Chargebee **92 s** after it.
+MEASURED live on 2026-09-30 (lag 45 s): a call that ended at 09:53:09.489 UTC
+was billed in the range 09:52:12 → 09:53:12, captured at 09:54:01 — **~52 s**
+after it ended — and the Chargebee balance matched exactly.
 
-Why a **fixed** length and not "up to now": two workers reading the same cursor
-a few milliseconds apart would compute different ends. The row index is on
-`(tenant_id, from_ingested_at)`, so it would not see them as the same window,
-and one could charge a range the other then charges again. With the end derived
-from the start, two workers either collide on the index or agree exactly.
+**Two workers, one cursor.** Two workers reading the same cursor a moment
+apart compute **different** ends. The unique index on
+`(tenant_id, from_ingested_at)` alone would not stop that: one could pass an
+empty first minute and bill the second, while the other, which read the cursor
+before, billed both minutes under another id. So a row is written only while
+the cursor still sits at the range's start — `openWindow` compare-and-sets the
+cursor onto itself, which checks it and locks the account row until the insert
+commits — and an empty range is passed only under the same lock, and only if no
+row owns its start (`advancePastEmptyWindow`). Exactly one of the two bills or
+passes it; the other finds the cursor gone and backs off (`locked`). A retry
+never recomputes a range: the stored row is re-sent under its own id, through
+`captureIdempotent()`, which asks Chargebee before re-sending.
 
-**An empty window** writes no row: the cursor simply moves past it (refused if
-some other worker's row owns that start).
+**An empty range** writes no row: the cursor simply moves past it (refused if
+some other worker's row owns that start; a settled one is stepped over to its
+end).
 
 ---
 
 ## 7. The ClickHouse query
 
-One query per window, against the org's own database
+One query per range, against the org's own database
 `tenant_<routing slug>` (e.g. `tenant_org_ee_com`). The slug is checked against
 `^[a-zA-Z0-9_]+$` before it becomes part of the table name.
 
@@ -244,32 +319,42 @@ FROM (
   WHERE SpanName = {span:String}                          -- 'litellm_request'
     AND attrs['gen_ai.cost.total_cost'] != ''
     AND JSONExtractString(attrs['hidden_params'], 'cache_key') = ''
-    AND ingested_at >  {from:DateTime64(3)}               -- the cursor
-    AND ingested_at <= {to:DateTime64(3)}                 -- cursor + 60 s
+    AND Timestamp >  {from:DateTime64(3)} - INTERVAL 1 HOUR   -- day-partition pruning
+    AND Timestamp <= {to:DateTime64(3)}
+    AND addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0))
+          >  {from:DateTime64(3)}                         -- the cursor
+    AND addMilliseconds(Timestamp, if(isFinite(duration_ms) AND duration_ms > 0, toInt64(duration_ms), 0))
+          <= {to:DateTime64(3)}                           -- min(now − lag, cursor + 1 h)
   GROUP BY event_key
 )
-SETTINGS use_skip_indexes_if_final = 1, use_skip_indexes_if_final_exact_mode = 1
 ```
 
-It returns one row — `event_count` and `billed_usd` — even for an empty window.
-The window's end is also compared with ClickHouse's own clock
-(`SELECT toUnixTimestamp64Milli(now64(3))`), because ClickHouse stamps
-`ingested_at`.
+It returns one row — `event_count` and `billed_usd` — even for an empty range.
+The range's end is set from ClickHouse's own clock
+(`SELECT toUnixTimestamp64Milli(now64(3))`), not the worker's, so the lag is
+measured where the spans land.
+
+Billing needs no ClickHouse change. The tenant migrations once planned for it —
+029 (`span_nodes.ingested_at`) and 030 (first copy wins) — are withdrawn, and
+`ingested_at` is not read.
 
 | Part | Why |
 | --- | --- |
-| `span_nodes FINAL` | Only the tenant's table, never merged with `otel_landing` (that would count every span twice). `span_nodes` is a ReplacingMergeTree keyed on `(TraceId, SpanId)`, and since tenant migration 030 a re-sent span keeps its **first** copy: `FINAL` returns each span once, at its earliest `ingested_at`, so a re-send landing in a later window is never billed again |
+| `span_nodes FINAL` | Only the tenant's table, never merged with `otel_landing` (that would count every span twice). `span_nodes` is a ReplacingMergeTree keyed on `(TraceId, SpanId)`, so `FINAL` collapses a re-sent span to one row — and the `GROUP BY` counts it once without relying on that |
 | `SpanName = 'litellm_request'` | The span LiteLLM emits for each call, carrying model, tokens and cost |
 | `total_cost != ''` | A failed attempt carries no cost. A fallback that succeeded on a second model **is** billed — it made a second provider call |
 | `cache_key = ''` | A reply served from LiteLLM's Redis cache still carries a cost, but LiteLLM spent nothing on it: cache hits are not billed |
-| `ingested_at`, not `Timestamp` | The worker polls for usage that has **arrived**, not usage that happened. A span can land long after its call; a cursor on call time would skip it for good |
-| `> from`, `<= to` | Half-open on **times**: every millisecond belongs to exactly one window, so windows neither overlap nor leave gaps |
-| `GROUP BY TraceId:SpanId`, then `count`/`sum` | Counts each call once inside the window, and sums cost over the de-duplicated calls, never over raw rows |
+| `Timestamp + duration_ms` — when the call **ended** | A span is written once its call ends, so the end is the earliest a range can be complete. A range on the start would have to wait out the longest call (LiteLLM's 600 s `request_timeout`). A missing or non-finite duration counts as 0 |
+| `Timestamp` between `from − 1 h` and `to` | `span_nodes` is partitioned by day of `Timestamp`. A call that ended in the range started at most an hour before it (the gateway gives up after 600 s, retries included), so the read prunes to one or two day partitions |
+| `> from`, `<= to` | Half-open on **times**: every millisecond belongs to exactly one range, so ranges neither overlap nor leave gaps |
+| `GROUP BY TraceId:SpanId`, then `count`/`sum` | Counts each call once inside the range, and sums cost over the de-duplicated calls, never over raw rows |
 | `any()` on the cost | Copies of one span carry the same cost; `max()` would be a quiet upward bias |
-| `…_exact_mode = 1` | Part of the exactly-once guarantee: without it the skip index can drop the granules holding the first copy, and `FINAL` would see only the re-send. Keep the `ingested_at` filter in `WHERE`, never `PREWHERE`, for the same reason |
+
+There is no `SETTINGS` clause; the client sets only `max_execution_time`, from
+`CLICKHOUSE_TIMEOUT_MS`.
 
 **From dollars to credits.** `amount = billed_usd × CREDITS_PER_USD`, at
-Chargebee's precision (10 decimal places). A window costing **$0.10** is
+Chargebee's precision (10 decimal places). A range costing **$0.10** is
 **5 credits**.
 
 ---
@@ -280,12 +365,12 @@ Chargebee's precision (10 decimal places). A window costing **$0.10** is
 
 | # | Step | Writes / calls |
 | --- | --- | --- |
-| 1 | **Open the window**: insert a `chargebee_sync` row, status `PENDING`, with the range, `event_count`, `billed_usd`, `amount`, and the subscription and credit unit **pinned**. Its `id` is also the Chargebee operation id. The unique index `(tenant_id, from_ingested_at)` lets only one row own a window | Postgres |
+| 1 | **Open the range**: insert a `chargebee_sync` row, status `PENDING`, with the range, `event_count`, `billed_usd`, `amount`, and the subscription and credit unit **pinned** — only while the cursor still sits at the range's start, under the account row's lock (`openWindow`). Its `id` is also the Chargebee operation id. The unique index `(tenant_id, from_ingested_at)` lets only one row own a start | Postgres |
 | 2 | Zero credits (e.g. free models)? The row is written `SUCCESS` and the cursor moves — Chargebee refuses a zero amount | Postgres |
 | 3 | **Claim** it: `PENDING → PROCESSING`, compare-and-set on status and attempt count. Two callers that read the same row — exactly one sends | Postgres |
 | 4 | **Capture** | Chargebee `POST /ledger_operations/capture` |
 | 5 | Record the answer — only if the claim is still ours | Postgres |
-| 6 | `SUCCESS` → **move the cursor** to the window's end (compare-and-set) | Postgres |
+| 6 | `SUCCESS` → **move the cursor** to the range's end (compare-and-set) | Postgres |
 | 7 | The balance left is 0, or the capture was refused for lack of balance → **`exhausted`**, LiteLLM team **blocked** (`/team/update`, reason `exhausted`) | Postgres, LiteLLM |
 
 The capture request:
@@ -298,6 +383,7 @@ POST /api/v2/ledger_operations/capture
   amount                      = <credits>
   ledger_operation_timestamp  = now          (Chargebee refuses anything older than 10 minutes)
   metadata[json]              = {tenant_slug, ingested_from, ingested_to, event_count, billed_usd}
+                                (ingested_from/_to: the range's call end-time bounds; the names are kept)
 ```
 
 Each Chargebee request has a **20 s** timeout and at most **3** attempts
@@ -321,14 +407,16 @@ tick asks Chargebee first.
 
 ### 8.3 Why nothing is charged twice or skipped
 
-- **Nothing skipped:** an unresolved window holds the cursor, so the same usage
+- **Nothing skipped:** an unresolved range holds the cursor, so the same usage
   is offered again next tick. No requeue step exists because nothing was ever
   taken off a queue.
 - **Nothing charged twice:** the row id *is* the Chargebee operation id,
   written before the send. After a lost answer the next tick asks
-  `GET /ledger_operations/{id}` instead of guessing.
-- **No second row for a window:** the unique index, and cursor moves by
-  compare-and-set.
+  `GET /ledger_operations/{id}` instead of guessing — and re-sends the stored
+  row, never a recomputed range.
+- **No second row for a range:** the unique index, a row written only while
+  the cursor still sits at its start (under the account row's lock), and
+  cursor moves by compare-and-set.
 - **No second sender:** the claim, and a 5-minute `PROCESSING` lease — longer
   than any one send can take.
 
@@ -375,6 +463,7 @@ minute is **one** Sentry issue with a growing event count, tagged with the
 | `billing.sync.rate_limited` | Backs off and heals |
 | `billing.sync.tenant_error` | Any other failure; a database one is already raised from the client |
 | `billing.sync.behind` | Logged at `error`, but **not** mapped to Sentry |
+| `billing.sync.budget_spent` | A warning: a pass used its time budget, and the orgs it did not reach carry on next minute |
 | `billing.budget.block_failed`, `.push_failed` | Logged; retried every tick |
 
 ---
@@ -406,9 +495,10 @@ the run, remembers where billing is.
 
 | | While the worker is down |
 | --- | --- |
-| Usage billing | Stops. Every org's cursor stays where it was |
-| Running out of credits | **Not detected.** Exhaustion is only noticed when Chargebee refuses a capture, and there are no captures. Agent-core calls LiteLLM with the master key, whose spend is not counted against the team, so LiteLLM's own budget does not stop the org either. **Orgs can spend past their credits for as long as the worker is down** |
-| Paid, held `activating` | Not retried — the customer stays blocked |
+| Usage billing | Stops. Every org's cursor stays where it was, and no capture is sent |
+| The Chargebee balance | **Frozen** at the last capture — the billing page shows credits the org may already have spent |
+| Running out of credits | **Not detected by billing.** Exhaustion is only noticed when Chargebee refuses a capture, and there are no captures. LiteLLM still stops a team at its budget in real time, but only on calls made with the team's key: agent-core calls LiteLLM with the master key, whose spend is not counted against the team. **Through agent-core, orgs can spend past their credits for as long as the worker is down** |
+| Held `activating` | Not retried — neither the budget push nor owed free-plan credits — so the customer stays blocked |
 | Active orgs with a stray block | Not reopened |
 | Daily resync | Does not run — a missed webhook is not repaired |
 | Sentry | **Silent.** The worker is what raises the alerts; no alert says it is gone |
@@ -420,27 +510,31 @@ the run, remembers where billing is.
 | Usage data | Safe in ClickHouse — up to its **90-day** retention |
 | The billing page, checkout, top-ups | The API process, not the worker |
 | Webhooks | Handled by the API: subscriptions link, top-ups are granted |
-| Enforcement already in place | Blocked teams stay blocked; the gateway gate still refuses orgs with no plan or a block |
+| Enforcement already in place | LiteLLM enforces each team's budget in real time; blocked teams stay blocked; the gateway gate still refuses orgs with no plan or a block |
 
 ### Coming back
 
 1. **A row a dead worker left `PROCESSING`** waits out its 5-minute lease, then
    is looked up in Chargebee and settled — sent only if Chargebee has never
    seen it.
-2. **The backlog drains in order**, 20 windows (20 minutes of usage) per org per
-   tick — about 20× real time:
+2. **The backlog drains in order**, from each org's cursor, in ranges of at
+   most an hour (`BILLING_MAX_RANGE_MS`) — one Chargebee capture per range with
+   usage, several per org in one pass:
 
-   | Down for | Caught up in |
+   | Down for | First run after restart |
    | --- | --- |
-   | 1 hour | ~3 ticks |
-   | 1 day | ~75 ticks (~1¼ h) |
+   | 09:00 → 12:00 | Three one-hour charges per busy org |
+   | 1 day | 24 charges per busy org — ~25 s per busy org at ~1 s per Chargebee call; ~2 s for an idle org |
 
-   Each tick is still bounded by its 5-minute timeout, so many busy orgs slow it
-   down further.
-3. **Overspend lands.** The first window that costs more than the balance left
+   A pass stops starting new ranges and new orgs after 3 minutes (§3). The orgs
+   it did not reach — the ones at the end of `listBillable`'s order — start in
+   the next minute's run, from their cursors, logged as
+   `billing.sync.budget_spent`. Nothing is lost; they are only billed later.
+3. **Overspend lands.** The first range that costs more than the balance left
    is refused **whole**: the org becomes `exhausted` and is blocked, and every
-   window after it waits. The customer must top up enough to cover it before
-   the rest is billed.
+   range after it waits. Since a range is at most an hour, that is at most an
+   hour of usage held; the customer must top up enough to cover it before the
+   rest is billed.
 4. **`billing.sync.behind`** is logged for any org whose cursor is more than
    **7 days** old — well before ClickHouse's 90-day retention turns unbilled
    usage into lost usage.
@@ -449,18 +543,20 @@ the run, remembers where billing is.
 
 | Crash point | Left behind | Next tick |
 | --- | --- | --- |
-| Before the row is written | Nothing | Reads the window again |
+| Before the row is written | Nothing | Reads again from the same cursor (the range may now end later) |
 | Row `PENDING`, never sent | The row | Sends it — safe, the id was never on the wire |
 | Row `PROCESSING`, request out | The row | After the 5-min lease: lookup, then send or settle |
 | Charged, answer not recorded | The row | Lookup finds it: `SUCCESS` (replayed) |
-| Recorded, cursor not moved | A settled row ahead of the cursor | Steps the cursor over the settled row |
+| Recorded, cursor not moved | A settled row ahead of the cursor | Steps the cursor over the settled row, to that row's end |
 
 ### Two workers at once
 
 Safe — during a rollout, or with the manual route below running beside the
-cron. The window index, the claim, the `PROCESSING` lease and the
-compare-and-set cursor hold across processes; Hatchet's one-run-at-a-time rule
-is not what correctness rests on.
+cron. Two workers reading one cursor compute different ends, and exactly one
+bills or passes the range (§6): the range index and the cursor check under the
+account row's lock, the claim, the `PROCESSING` lease and the compare-and-set
+cursor hold across processes. Hatchet's one-run-at-a-time rule is not what
+correctness rests on.
 
 ---
 
@@ -478,8 +574,9 @@ curl -X POST http://localhost:4300/api/internal/sync -H 'content-type: applicati
   -d '{"slugs":["org_ee_com"]}'
 ```
 
-It answers with the same summary as a tick. It runs only the usage sync — not
-`activatePending` or the gate check.
+It answers with the usage sync's own summary — the tick's usage counts, plus
+each org's result — and, like a pass, starts no new range after 3 minutes. It
+runs only the usage sync — not `activatePending` or the gate check.
 
 ---
 
@@ -489,16 +586,20 @@ It answers with the same summary as a tick. It runs only the usage sync — not
    worker. Add a heartbeat: a Sentry cron monitor (check-in at the start and
    end of each tick) or a Hatchet alert on missing runs.
 
-2. **Overspend while the worker is down is unbounded.** Because agent-core's
-   calls are not counted in LiteLLM team spend, the gateway cannot stop an org
-   on its own. Per-org virtual keys in agent-core would let LiteLLM enforce the
-   budget in real time.
+2. **Overspend while the worker is down is unbounded.** LiteLLM enforces team
+   budgets in real time, but agent-core's calls are not counted in LiteLLM
+   team spend, so the gateway cannot stop an org on its own. Per-org virtual
+   keys in agent-core would let LiteLLM enforce the budget in real time.
 
-3. **Exhaustion is noticed about a minute late** even when the worker is up
-   (~2 min 20 s at worst): the window, the 10 s lag and the next tick. The
-   gateway does not count the org's calls itself, so until the capture is
-   refused the org keeps spending. The overspend is held and billed after a
-   top-up.
+3. **Exhaustion is noticed 1–2 minutes late** even when the worker is up: the
+   60 s lag plus up to a minute to the next tick. The gateway does not count
+   agent-core's calls against the team, so until the capture is refused those
+   keep spending. The overspend is held and billed after a top-up.
 
 4. **`billing.sync.behind` is only a log line**, not a Sentry alert, although it
    is the one signal that usage is getting close to ClickHouse's retention.
+
+5. **A span that lands later than the lag is never billed.** Its range was
+   read without it, and it is behind the cursor. Measured: 1 span in 421 at
+   the default 60 s, 3 in 421 at the local 45 s. A longer lag loses fewer and
+   bills later.

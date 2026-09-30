@@ -6,7 +6,7 @@
  * "Invalid api key", which gives no hint that the value was never filled in.
  */
 
-import { divide, isPositive } from "../models/decimal";
+import { decimal, divide, isPositive } from "../models/decimal";
 import { assertRate } from "../models/rate";
 
 function required(name: string): string {
@@ -53,6 +53,46 @@ function readRate(): string {
 }
 
 /**
+ * FREE_PLAN_CREDITS: the credits billing grants an org ONCE, when it is first
+ * linked to the free plan. Empty turns it off, and the plan's own Credit Grant
+ * is all an org gets. Anything set must be a decimal greater than zero — a
+ * typo here would otherwise be sent to Chargebee as every new org's grant.
+ */
+function freePlanCredits(): string {
+  const raw = optional("FREE_PLAN_CREDITS", "").trim();
+  if (raw === "") return "";
+  let positive: boolean;
+  try {
+    positive = isPositive(raw);
+  } catch {
+    positive = false;
+  }
+  if (!positive) throw new RangeError(`FREE_PLAN_CREDITS must be a number greater than zero, got ${raw}`);
+  return decimal(raw);
+}
+
+/**
+ * FREE_PLAN_CREDIT_UNIT: the Chargebee credit unit the free plan's credits go
+ * into (`token-test` on the test site). REQUIRED with FREE_PLAN_CREDITS.
+ *
+ * MEASURED 2026-09-30: a plan whose Credit Grant is zero gets NO credit wallet
+ * (ledger account) from Chargebee — no grant block, no balance, no unit — so
+ * there is no unit on the subscription to read. An allocate into this unit is
+ * what creates the wallet. Without it an org would be put on the free plan
+ * and granted nothing, silently.
+ */
+function freePlanCreditUnit(credits: string): string {
+  const unit = optional("FREE_PLAN_CREDIT_UNIT", "").trim();
+  if (credits !== "" && unit === "") {
+    throw new Error(
+      "FREE_PLAN_CREDIT_UNIT is not set. With FREE_PLAN_CREDITS on, it names the credit unit the free credits " +
+        "go into (e.g. token-test): a free plan that grants zero gets no credit wallet from Chargebee to read one from.",
+    );
+  }
+  return unit;
+}
+
+/**
  * The plan allowlist: ITEM_PRICE_IDS, with the free plan always on it. A site
  * whose only plan is the free one needs no ITEM_PRICE_IDS at all, and one that
  * lists others cannot leave the free plan off by accident — which would stop
@@ -86,36 +126,35 @@ function nonNegativeInteger(name: string, fallback: number): number {
 /**
  * The shortest `BILLING_LAG_MS` accepted without `BILLING_ALLOW_SHORT_LAG=true`.
  *
- * The lag is in MILLISECONDS, and the mistake it guards against is real: the
- * live .env carried `BILLING_LAG_MS=120` — 0.12 s, meant as 120 s — so the
- * worker read up to the present instant and raced ClickHouse's own inserts
- * (the collector's batch, async-insert flushes). A row that landed a few
- * seconds late in a window already billed was silently never charged (C11).
- * Ten seconds is well under any lag that makes sense and well over any
- * seconds-for-milliseconds typo, so a value below it stops the process at
- * start instead of losing usage quietly.
+ * Windows are on when each LLM call ENDED (`Timestamp + duration_ms`), and its
+ * span reaches ClickHouse after that: MEASURED 2026-09-30 over 421 spans, p50
+ * 23 s and p99 44 s. A window read sooner than its spans land is billed
+ * without them, and they are then behind the cursor and never billed. Thirty
+ * seconds is under what the measurement allows and well over any
+ * seconds-for-milliseconds typo — the live .env once carried
+ * `BILLING_LAG_MS=120` (meant as 120 s), and once `0` — so a value below it
+ * stops the process at start instead of losing usage quietly.
  */
-export const MIN_LAG_MS = 10_000;
+export const MIN_LAG_MS = 30_000;
 
 /**
- * `BILLING_LAG_MS`, refusing an obviously wrong value. 10 s unless set.
- *
- * Why 10 s is enough: ClickHouse stamps `ingested_at` when it writes the span
- * into the org's span_nodes, and the span is visible once that write commits.
- * MEASURED 2026-09-29 over 7 days of system.query_views_log: 10,058 writes,
- * slowest 389 ms, p99 19 ms. The default was two minutes before that was known.
+ * `BILLING_LAG_MS`, refusing an obviously wrong value. 60 s unless set: past
+ * every span but one in the measurement above. Shorter bills sooner and loses
+ * more — at 45 s, 3 of those 421 spans. Enforcement is the gateway's real-time
+ * budget, so this delays only when usage reaches Chargebee.
  *
  * `BILLING_ALLOW_SHORT_LAG=true` lifts the floor. It exists for tests that
  * drive the worker against a local ClickHouse on a short clock, and must never
  * be set anywhere real.
  */
 function lagMs(): number {
-  const value = integer("BILLING_LAG_MS", 10 * 1000);
+  const value = integer("BILLING_LAG_MS", 60_000);
   if (value < MIN_LAG_MS && process.env.BILLING_ALLOW_SHORT_LAG !== "true") {
     throw new Error(
       `BILLING_LAG_MS is ${value} ms — below the ${MIN_LAG_MS} ms floor. It is in MILLISECONDS: ` +
-        `two minutes is 120000, not 120. A lag this short reads rows ClickHouse is still inserting and ` +
-        `silently leaves them unbilled. (BILLING_ALLOW_SHORT_LAG=true lifts the floor, for tests only.)`,
+        `sixty seconds is 60000. A call's span reaches ClickHouse up to ~45 s after the call ends; a shorter ` +
+        `lag bills a window before its spans land and silently leaves them unbilled. ` +
+        `(BILLING_ALLOW_SHORT_LAG=true lifts the floor, for tests only.)`,
     );
   }
   return value;
@@ -153,41 +192,31 @@ export function resetConfig(): void {
 }
 
 function buildConfig() {
+  const freeCredits = freePlanCredits();
   return {
     /** Charged per credit, in USD. */
     usdPerCredit: readRate(),
 
     /**
-     * Only usage ingested into ClickHouse at least this long ago is read
+     * Only LLM calls that ended at least this long ago are read
      * (safe_until = now − lag). Milliseconds; below MIN_LAG_MS is refused.
      */
     lagMs: lagMs(),
 
     /**
-     * How long one billing window is — and it is FIXED, not "however much is
-     * available".
-     *
-     * A window runs from the cursor for exactly this long, and is processed only
-     * once it fits entirely inside `now − lag`. That makes the window's end a
-     * function of its start, which is what lets two workers reading the same
-     * cursor agree on which window they are looking at. A window sized to
-     * whatever happened to be available would give them different ends for the
-     * same start, and the uniqueness index could not tell they were competing.
-     *
-     * It also bounds a catch-up scan: after an outage a tenant drains in
-     * minute-sized pieces, up to BILLING_MAX_WINDOWS_PER_TICK per tick, each
-     * succeeding or failing on its own.
+     * The longest range one Chargebee charge covers. Each pass bills every
+     * tenant from its cursor to `now − lag` — ordinarily the minute since the
+     * last pass — and a catch-up after an outage goes an hour at a time.
+     * Chargebee refuses a capture larger than the balance WHOLE, so this is
+     * also the most an org that ran out mid-outage can have held at once.
      */
-    windowMs: integer("BILLING_WINDOW_MS", 60 * 1000),
-
-    /** How many windows one tick may process for one tenant, so a backlog cannot run past the task timeout. */
-    maxWindowsPerTick: integer("BILLING_MAX_WINDOWS_PER_TICK", 20),
+    maxRangeMs: integer("BILLING_MAX_RANGE_MS", 60 * 60_000),
 
     /**
      * How often the usage sync passes over every org. Hatchet's cron fires once
      * a minute at most, so a shorter interval runs several passes inside each
-     * minute's run (worker/hatchet-worker.ts). With BILLING_LAG_MS and
-     * BILLING_WINDOW_MS at 10 s, usage reaches Chargebee 15–30 s after the call.
+     * minute's run (worker/hatchet-worker.ts). Usage reaches Chargebee about
+     * BILLING_LAG_MS plus one interval after the call ended.
      * 60 s or more: one pass per minute.
      */
     sweepIntervalMs: integer("BILLING_SWEEP_INTERVAL_MS", 60 * 1000),
@@ -205,6 +234,17 @@ function buildConfig() {
     chargebee: {
       site: required("CHARGEBEE_SITE"),
       apiKey: required("CHARGEBEE_API_KEY"),
+    },
+
+    /**
+     * HTTP Basic credentials set on Chargebee's webhook endpoint, checked by
+     * POST /api/webhooks/chargebee. Chargebee does not sign webhooks, so these
+     * are the whole of its authentication. Empty means unset, and unset
+     * refuses every delivery — never accepts it.
+     */
+    chargebeeWebhook: {
+      user: optional("CHARGEBEE_WEBHOOK_USER", ""),
+      password: optional("CHARGEBEE_WEBHOOK_PASSWORD", ""),
     },
 
     clickhouse: {
@@ -257,6 +297,17 @@ function buildConfig() {
      * the free plan on for it (POST /api/internal/free-plan).
      */
     freePlanDefault: optional("FREE_PLAN_DEFAULT", "false") === "true",
+
+    /**
+     * Credits granted ONCE per org on the free plan, by billing's own allocate
+     * — for a free plan whose Credit Grant is set to zero in the catalogue, so
+     * a renewal grants nothing. Empty: off. See account.service.ts
+     * grantFreePlanCredits.
+     */
+    freePlanCredits: freeCredits,
+
+    /** The credit unit those credits go into; required with them (see freePlanCreditUnit). */
+    freePlanCreditUnit: freePlanCreditUnit(freeCredits),
 
     /**
      * The app's origin, where Chargebee returns the browser after the portal

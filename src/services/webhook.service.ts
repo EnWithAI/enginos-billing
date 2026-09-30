@@ -2,10 +2,11 @@
  * What each Chargebee webhook event does to a tenant's billing.
  *
  * Chargebee does NOT sign webhooks. It authenticates by sending HTTP Basic
- * credentials configured alongside the endpoint URL, and enginos-platform —
- * which receives the delivery and forwards it here — is what checks them.
- * Those credentials are the only thing standing between the internet and an
- * endpoint that grants credits; this service checks no caller at all.
+ * credentials configured alongside the endpoint URL. Chargebee calls billing
+ * directly, and the webhook route checks them before anything reaches this
+ * file (controllers/webhook.controller.ts, http/webhook-auth.ts). Those
+ * credentials are the only thing standing between the internet and an
+ * endpoint that grants credits.
  *
  * THERE IS NO LOCAL REPLAY GUARD. `processed_billing_event` used to claim each
  * event id before any work, and it is gone. What replaces it is that a
@@ -64,6 +65,8 @@ export interface ChargebeeEvent {
       id?: string;
       line_items?: Array<{ entity_id?: string }>;
     };
+    /** `grant_blocks_created`: the blocks, each naming its subscription — and no customer. */
+    grant_blocks?: Array<{ subscription_id?: string }>;
   };
 }
 
@@ -81,6 +84,20 @@ export function createWebhookService(deps: {
     const subscription = event.content?.subscription;
 
     const customerId = subscription?.customer_id ?? event.content?.customer?.id;
+
+    // Chargebee's "Test Webhook" button sends SAMPLE data: a demo customer
+    // (`cbdemo_tom`) that is no org's. Acknowledged and left alone, so the
+    // button reports whether delivery and credentials work — an unknown REAL
+    // customer still fails below (500), so Chargebee retries it. Ours never
+    // collide: billing creates every customer with the tenant id as its id.
+    if (customerId && isChargebeeSample(customerId)) {
+      log.log?.(
+        { metric: "billing.webhook.sample_event", eventId: event.id, eventType: event.event_type, customerId },
+        "Chargebee sample event (Test Webhook); acknowledged, nothing done",
+      );
+      return;
+    }
+
     const tenantId = customerId ? await resolveTenant(customerId) : null;
 
     /**
@@ -137,6 +154,35 @@ export function createWebhookService(deps: {
 
       // Dunning is Chargebee's job, and revoking credits already granted is a
       // business decision, not a webhook handler's. Record and move on.
+      // Credits were added to a subscription — ANY credits: a top-up pack's
+      // grant, a charge or a grant made by hand in the Chargebee dashboard, a
+      // plan's grant at a renewal, billing's own allocate. Re-read the org, so
+      // its LiteLLM limit rises (and an exhausted team reopens) within
+      // seconds, where a grant made by hand used to wait for the daily
+      // resync. The same re-read as a subscription event: idempotent, and a
+      // declined top-up's credits stay held back from the limit there.
+      //
+      // The event names subscriptions, not a customer. One that is no org's
+      // CURRENT subscription (an ended one, Chargebee's sample data) has no
+      // limit to move: acknowledged and logged, never retried.
+      case "grant_blocks_created": {
+        const subscriptionIds = [
+          ...new Set((event.content?.grant_blocks ?? []).map((b) => b?.subscription_id).filter((id): id is string => !!id)),
+        ];
+        for (const subscriptionId of subscriptionIds) {
+          const owner = isChargebeeSample(subscriptionId) ? null : await deps.accounts.findTenantIdBySubscriptionId(subscriptionId);
+          if (!owner) {
+            log.warn?.(
+              { metric: "billing.webhook.grant_unlinked_subscription", eventId: event.id, subscriptionId },
+              "Credits granted on a subscription that is no org's current one; nothing to move",
+            );
+            continue;
+          }
+          await accounts.syncFromChargebee(owner);
+        }
+        return;
+      }
+
       case "payment_failed":
       case "alert_status_changed":
         if (customerId) mapped();
@@ -170,5 +216,8 @@ export function createWebhookService(deps: {
   return { handle };
 }
 
-export type WebhookService = ReturnType<typeof createWebhookService>;
+/** Chargebee's own demo data — what its "Test Webhook" button sends — is under ids prefixed `cbdemo_` (customers and subscriptions alike). */
+export function isChargebeeSample(id: string): boolean {
+  return id.startsWith("cbdemo_");
+}
 

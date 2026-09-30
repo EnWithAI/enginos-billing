@@ -87,11 +87,11 @@ export function createChargebeeSyncRepository(prisma: PrismaClient = defaultPris
      *
      * The window index alone does not cover this. It is on `from_ingested_at`,
      * so it catches two workers opening the SAME window, but not two windows of
-     * different lengths — which is what a change to BILLING_WINDOW_MS between
-     * deploys produces while the old worker and the new one overlap. A 60s
-     * worker could move the cursor over an empty first minute and bill the
-     * second, while a 120s worker that had read the cursor before that went on
-     * to bill both minutes under another id: the second minute, twice.
+     * different lengths — which is what two workers reading the same cursor a
+     * moment apart produce, since a range runs to `now − lag`. One could move
+     * the cursor over an empty first minute and bill the second, while the
+     * other, which read the cursor before that, went on to bill both minutes
+     * under another id: the second minute, twice.
      *
      * The first statement is a compare-and-set of the cursor onto itself, which
      * both checks it and LOCKS the account row until the insert commits. The

@@ -452,5 +452,3 @@ const subscriptionCancelled = () =>
 function isPaymentFailure(err: ChargebeeError): boolean {
   return err.apiErrorCode === "payment" || err.status === 402 || (err.apiErrorCode ?? "").startsWith("payment_");
 }
-
-export type CheckoutService = ReturnType<typeof createCheckoutService>;
