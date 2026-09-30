@@ -53,6 +53,20 @@ export function createServices() {
 
   const billingPage = `${config.appUrl.replace(/\/+$/, "")}/organization/billing`;
 
+  // One description of the top-up for the page AND for the charge: the limits
+  // the page offers are the ones checkout enforces.
+  const topUpOffer = () =>
+    describeTopUp(
+      {
+        itemPriceId: config.topUpItemPriceId,
+        presetAmounts: config.topUpAmounts,
+        minAmount: config.topUpMinAmount,
+        maxAmount: config.topUpMaxAmount,
+      },
+      chargebee,
+      { ttlMs: config.planCacheTtlMs },
+    );
+
   const checkout = createCheckoutService({
     chargebee,
     accountService,
@@ -66,7 +80,7 @@ export function createServices() {
     checkoutRedirectUrl: `${billingPage}?from=checkout`,
     topUpItemPriceId: config.topUpItemPriceId,
     topUpCredits: config.topUpCredits,
-    topUpMaxQuantity: config.topUpMaxQuantity,
+    topUpOffer,
     topUpChargebeeGrants: config.topUpChargebeeGrants,
   });
 
@@ -81,16 +95,7 @@ export function createServices() {
       accounts,
       syncs,
       plansOffered: () => describePlans(config.itemPriceIds, chargebee, { ttlMs: config.planCacheTtlMs }),
-      topUpOffer: () =>
-        describeTopUp(
-          {
-            itemPriceId: config.topUpItemPriceId,
-            creditsPerUnit: config.topUpCredits,
-            maxQuantity: config.topUpMaxQuantity,
-          },
-          chargebee,
-          { ttlMs: config.planCacheTtlMs },
-        ),
+      topUpOffer,
       autoSubscribe: config.freeItemPriceId ? (tenantId) => checkout.provisionFreePlan(tenantId) : undefined,
       freeItemPriceId: config.freeItemPriceId,
       freePlanDefault: config.freePlanDefault,

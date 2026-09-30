@@ -24,6 +24,7 @@ import type { BillingAccount, BillingAccountRepository } from "../repositories/b
 import { conflict, invalid, notFound, upstream } from "../shared/errors";
 import type { Logger } from "../shared/logger";
 import type { AccountService } from "./account.service";
+import { currencyDigits, type TopUpOffer } from "./plan-catalog.service";
 
 export function createCheckoutService(deps: {
   chargebee: ChargebeeClient;
@@ -41,15 +42,18 @@ export function createCheckoutService(deps: {
   topUpItemPriceId: string;
   /** Credits ONE unit of the top-up charge grants. */
   topUpCredits: string;
-  /** Most units one top-up checkout may sell. */
-  topUpMaxQuantity?: number;
+  /**
+   * The top-up as the page is offered it (plan-catalog.service describeTopUp):
+   * its fewest and most units — TOPUP_MIN_AMOUNT / TOPUP_MAX_AMOUNT in this
+   * charge's price. Absent: at least one unit, and no maximum.
+   */
+  topUpOffer?: () => Promise<TopUpOffer>;
   /** The pack's charge carries its own Credit Grant: Chargebee grants, billing only records. */
   topUpChargebeeGrants?: boolean;
   logger?: Logger;
   sleep?: (ms: number) => Promise<void>;
 }) {
   const log = deps.logger ?? console;
-  const maxQuantity = deps.topUpMaxQuantity ?? DEFAULT_TOPUP_MAX_QUANTITY;
   const chargebeeGrants = deps.topUpChargebeeGrants ?? false;
   const freePlanDefault = deps.freePlanDefault ?? false;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -265,8 +269,14 @@ export function createCheckoutService(deps: {
    * the page does not call a declined card an outage.
    */
   async function startTopUp(tenantId: string, quantity: number = 1) {
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > maxQuantity) {
-      throw invalid(`Choose a whole number of units from 1 to ${maxQuantity}`, "topup-quantity-invalid");
+    // The same limits the page was offered — never only the page's word for
+    // them. describeTopUp never throws (a Chargebee outage leaves one unit).
+    // No maximum while TOPUP_MAX_AMOUNT is unset.
+    const offer = deps.topUpOffer ? await deps.topUpOffer() : null;
+    const fewest = offer?.minQuantity ?? 1;
+    const most = offer?.maxQuantity ?? null;
+    if (!Number.isInteger(quantity) || quantity < fewest || (most != null && quantity > most)) {
+      throw invalid(topUpRangeMessage(offer, fewest, most), "topup-quantity-invalid");
     }
     const account = await subscribedAccount(tenantId);
 
@@ -423,8 +433,22 @@ export function createCheckoutService(deps: {
   return { startSubscription, provisionFreePlan, setFreePlan, startTopUp, payUnpaidTopUps, applyTopUps };
 }
 
-/** Matches config's TOPUP_MAX_QUANTITY default, for callers that do not pass one. */
-const DEFAULT_TOPUP_MAX_QUANTITY = 100;
+/**
+ * "Choose an amount from 50 to 10000 INR" — or "of at least 50 INR" with no
+ * maximum — in the charge's own money when its unit price is known.
+ */
+function topUpRangeMessage(offer: TopUpOffer | null, fewest: number, most: number | null): string {
+  if (offer?.unitPriceMinor && offer.currencyCode) {
+    const scale = 10 ** currencyDigits(offer.currencyCode);
+    const money = (units: number) => `${(units * offer.unitPriceMinor!) / scale}`;
+    return most == null
+      ? `Choose an amount of at least ${money(fewest)} ${offer.currencyCode}`
+      : `Choose an amount from ${money(fewest)} to ${money(most)} ${offer.currencyCode}`;
+  }
+  return most == null
+    ? `Choose a whole number of units, at least ${fewest}`
+    : `Choose a whole number of units from ${fewest} to ${most}`;
+}
 
 /** MEASURED: a new subscription's credit ledger appeared three seconds after it. */
 const LEDGER_WAIT_ATTEMPTS = 10;

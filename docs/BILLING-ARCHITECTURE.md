@@ -987,9 +987,12 @@ is Chargebee's dunning setting, not billing's.
 - **A span that lands more than `BILLING_LAG_MS` after its call ended is never
   billed**: its range was read and the cursor moved on (§3). Measured: 1 of 421
   local spans at the 60 s default, 3 at 45 s.
-- `TOPUP_CREDITS` is a **single global env var**, so exactly one pack size is
-  supported. With `TOPUP_CHARGEBEE_GRANTS=true` it only sets the figure the page
-  quotes — what is granted is the charge's Credit Grant — so the two must match.
+- **The page quotes amounts, never credits.** What a pack grants is the
+  charge's Credit Grant in Chargebee, which its API does not expose before a
+  purchase; the credits are read back from the grant block once paid.
+  `TOPUP_CREDITS` is read only when billing allocates packs itself
+  (`TOPUP_CHARGEBEE_GRANTS=false`); unset there, a paid pack is held and logged
+  (`billing.topup.credits_per_unit_unset`), never granted a guessed amount.
 
 ---
 
@@ -1010,8 +1013,9 @@ is Chargebee's dunning setting, not billing's.
 | `BILLING_PLAN_CACHE_TTL_MS` | `600000` | Plan catalogue cache; 0 disables |
 | `TOPUP_ITEM_PRICE_ID` | `token-pack-5m-INR` | The top-up charge — an **item price** id (`api_token-INR`), not the item id |
 | `TOPUP_CHARGEBEE_GRANTS` | `false` | `true` when the charge carries its own Credit Grant: Chargebee grants, billing only records (§10 #4). `false` with a grant would grant twice |
-| `TOPUP_CREDITS` | `1000` | Credits per unit. With Chargebee granting, only the page's quote — must match the grant |
-| `TOPUP_MAX_QUANTITY` | `100` | Most units one top-up may buy — a typo guard |
+| `TOPUP_CREDITS` | empty | Credits per unit — only when billing allocates packs (`TOPUP_CHARGEBEE_GRANTS=false`); unset there, a paid pack is held and logged. Not shown on the page |
+| `TOPUP_AMOUNTS` | `50,100` | One-click top-up amounts on the page, in the charge's currency (major unit); Custom is always offered. An amount that is not a whole number of units or is outside the limits is not shown |
+| `TOPUP_MIN_AMOUNT` / `TOPUP_MAX_AMOUNT` | empty | Smallest / largest top-up, in the charge's currency — turned into units of its price and **enforced by `startTopUp`** (400 `topup-quantity-invalid`), not only shown. Unset: one unit / no maximum. With no unit price (flat fee, tiered, Chargebee unreachable) a top-up is one unit |
 | `ITEM_PRICE_IDS` | empty | Plans besides the free one an org may be on. The free plan is **always** included. An org's current subscription is kept whatever this says |
 | `APP_URL` | `http://localhost:4200` | Where Chargebee sends the browser back to. Chargebee accepts port 80, 443, 8080 or 8443 only, so locally the HTTPS dev origin |
 | `CHARGEBEE_PORTAL_ENABLED` | `false` | The self-serve portal route answers 409 `portal-off` unless this is exactly `true`. Customers must not be able to cancel; set it only after "Allow customers to cancel subscriptions" is off in the site's Self-Serve Portal settings |

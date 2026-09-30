@@ -1010,6 +1010,17 @@ export function createAccountService(deps: AccountDeps) {
       return GRANT_NOT_VISIBLE;
     }
 
+    // Billing allocates this pack itself, and needs its credits per unit for
+    // that. Unset, nothing is granted — never a guessed amount — and the pack
+    // is looked at again on every apply, so it completes once it is set.
+    if (creditsPerUnit === "") {
+      log.error?.(
+        { metric: "billing.topup.credits_per_unit_unset", tenantId, invoiceId, itemPriceId },
+        "Paid top-up not granted: TOPUP_CREDITS is not set, and billing allocates packs (TOPUP_CHARGEBEE_GRANTS=false). Set TOPUP_CREDITS, or give the pack a Credit Grant in Chargebee and set TOPUP_CHARGEBEE_GRANTS=true",
+      );
+      return null;
+    }
+
     // What was PAID FOR, read off the invoice — never the quantity the request
     // that opened the checkout asked for. Decided once, here, and stored on the
     // claim below: every retry re-sends the stored amount.

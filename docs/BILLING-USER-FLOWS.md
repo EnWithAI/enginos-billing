@@ -84,7 +84,7 @@ The whole sign-up, across every system, is in [SIGNUP-FLOW.md](SIGNUP-FLOW.md). 
 
 ## 3. Buy credits for the first time
 
-**The user does.** Picks an amount — ₹50, ₹100 or Custom. With no card saved, the button reads **Add card to pay ₹50.00**. They click it, enter the card on Chargebee's secure page, and come back. A confirm box is already open: *Charge ₹50.00 to Visa card ending 1111 for 2,500 credits? It is charged immediately.* They click **Confirm payment**.
+**The user does.** Picks an amount — one of the amounts billing offers (₹50 and ₹100 by default, set by `TOPUP_AMOUNTS`) or Custom, between the smallest and largest top-up allowed (`TOPUP_MIN_AMOUNT` / `TOPUP_MAX_AMOUNT`). The page shows amounts only, not how many credits they buy. With no card saved, the button reads **Add card to pay ₹50.00**. They click it, enter the card on Chargebee's secure page, and come back. A confirm box is already open: *Charge ₹50.00 to Visa card ending 1111? It is charged immediately. It is charged immediately.* They click **Confirm payment**.
 
 **The user sees.** *Payment received — your credits have been added.* The balance goes up by 2,500.
 
@@ -105,7 +105,7 @@ The whole sign-up, across every system, is in [SIGNUP-FLOW.md](SIGNUP-FLOW.md). 
 
 ## 4. Buy credits with a saved card
 
-**The user does.** Picks ₹50, ₹100 or Custom, clicks **Pay ₹50.00**, then **Confirm payment** in the box that asks *Charge ₹50.00 to Visa card ending 1111 for 2,500 credits?*
+**The user does.** Picks an amount (₹50, ₹100 or Custom by default), clicks **Pay ₹50.00**, then **Confirm payment** in the box that asks *Charge ₹50.00 to Visa card ending 1111? It is charged immediately.*
 
 **The user sees.** *Payment received — your credits have been added.* The balance goes up, and the payment appears in the history.
 

@@ -102,7 +102,6 @@ function rig(
     defaultItemPriceId: "plan",
     topUpItemPriceId: "pack",
     topUpCredits: "50",
-    topUpMaxQuantity: 100000,
     topUpChargebeeGrants: grants,
     logger,
     sleep: async () => {},

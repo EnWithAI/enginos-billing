@@ -110,7 +110,9 @@ chargebee_sync.status                        WHAT CHARGEBEE SAID
   paid plans (`ITEM_PRICE_IDS`) and subscribes through Chargebee's hosted
   checkout, which returns it to the billing page.
 - **Top-ups** are charged to the card on file once the customer confirms an
-  amount (₹50, ₹100 or a custom figure): `POST /invoices/create_for_charge_items_and_charges`,
+  amount — one of `TOPUP_AMOUNTS` (₹50 and ₹100 by default) or a custom figure,
+  within `TOPUP_MIN_AMOUNT`..`TOPUP_MAX_AMOUNT`, which billing enforces. The page
+  quotes the amount, never the credits: `POST /invoices/create_for_charge_items_and_charges`,
   the API form of the admin UI's *Add Charge*. The `api_token` charge carries its
   own Credit Grant, so Chargebee grants the credits and billing records the
   grant and moves the LiteLLM cap. The `payment_succeeded` webhook does the same

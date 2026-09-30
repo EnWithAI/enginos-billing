@@ -193,6 +193,11 @@ export function resetConfig(): void {
 
 function buildConfig() {
   const freeCredits = freePlanCredits();
+  const minTopUp = optionalAmount("TOPUP_MIN_AMOUNT");
+  const maxTopUp = optionalAmount("TOPUP_MAX_AMOUNT");
+  if (minTopUp != null && maxTopUp != null && minTopUp > maxTopUp) {
+    throw new RangeError(`TOPUP_MIN_AMOUNT (${minTopUp}) is larger than TOPUP_MAX_AMOUNT (${maxTopUp})`);
+  }
   return {
     /** Charged per credit, in USD. */
     usdPerCredit: readRate(),
@@ -344,21 +349,74 @@ function buildConfig() {
     // checkout failed with "No currency for item price test-top-up" (C57c).
     topUpItemPriceId: optional("TOPUP_ITEM_PRICE_ID", "token-pack-5m-INR"),
     /**
-     * Credits ONE UNIT of the top-up charge grants. The customer picks a
-     * quantity; a paid invoice for N units grants N × this. Before quantities
-     * every top-up was one unit, so an existing value keeps meaning what it did.
+     * Credits ONE UNIT of the top-up charge grants — read only when BILLING
+     * allocates the pack (TOPUP_CHARGEBEE_GRANTS=false), and required then.
+     * With Chargebee granting it (the pack's own Credit Grant) the credits are
+     * Chargebee's, read back from the grant block, and this is not needed: the
+     * page quotes an amount, not credits.
      */
-    topUpCredits: optional("TOPUP_CREDITS", "1000"),
-    /** The most units one top-up checkout may sell — a typo guard, not a limit on spend. */
-    topUpMaxQuantity: integer("TOPUP_MAX_QUANTITY", 100),
+    topUpCredits: topUpCredits(),
+    /**
+     * The one-click top-up amounts, in the charge's MAJOR currency unit
+     * (`50,100` is ₹50 and ₹100 on an INR charge). The page shows those it can
+     * sell whole within the limits, and Custom beside them.
+     */
+    topUpAmounts: amountList("TOPUP_AMOUNTS", "50,100"),
+    /**
+     * The smallest and largest top-up, in the charge's MAJOR currency unit.
+     * Unset: the smallest is one unit, and there is no largest.
+     * Enforced by billing (checkout.startTopUp), not only shown by the page.
+     */
+    topUpMinAmount: minTopUp,
+    topUpMaxAmount: maxTopUp,
     /**
      * The top-up charge carries its own Credit Grant in the Chargebee catalogue,
      * so Chargebee grants each paid pack and billing only records it — and never
-     * allocates, which would grant twice. TOPUP_CREDITS must then equal what that
-     * grant gives per unit: it is only the figure the page quotes.
+     * allocates, which would grant twice.
      */
     topUpChargebeeGrants: optional("TOPUP_CHARGEBEE_GRANTS", "false") === "true",
   } as const;
+}
+
+/**
+ * TOPUP_CREDITS, or "" when unset. Needed only when billing allocates a paid
+ * pack itself (TOPUP_CHARGEBEE_GRANTS=false); a pack it would have to allocate
+ * without it is held and said out loud (account.service.ts firstTopUp) —
+ * never granted a guessed amount.
+ */
+function topUpCredits(): string {
+  const raw = optional("TOPUP_CREDITS", "").trim();
+  if (raw === "") return "";
+  if (!isPositiveDecimal(raw)) throw new RangeError(`TOPUP_CREDITS must be a number greater than zero, got ${raw}`);
+  return decimal(raw);
+}
+
+/** A comma-separated list of amounts greater than zero; an empty setting is an empty list. */
+function amountList(name: string, fallback: string): number[] {
+  const raw = process.env[name] ?? fallback;
+  const amounts = raw.split(",").map((a) => a.trim()).filter(Boolean);
+  return amounts.map((a) => {
+    const n = Number(a);
+    if (!Number.isFinite(n) || n <= 0) throw new RangeError(`${name} must list amounts greater than zero, got ${JSON.stringify(a)}`);
+    return n;
+  });
+}
+
+/** An amount greater than zero, or null when unset. */
+function optionalAmount(name: string): number | null {
+  const raw = (process.env[name] ?? "").trim();
+  if (raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new RangeError(`${name} must be an amount greater than zero, got ${raw}`);
+  return n;
+}
+
+function isPositiveDecimal(value: string): boolean {
+  try {
+    return isPositive(value);
+  } catch {
+    return false;
+  }
 }
 
 export type Config = ReturnType<typeof buildConfig>;
