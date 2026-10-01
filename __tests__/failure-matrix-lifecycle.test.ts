@@ -540,7 +540,14 @@ describe("C42 webhook arrives twice", () => {
     // The table the matrix names is gone by design (migration
     // 20260922150000_drop_processed_billing_event); what replaces it is a property.
     // TopUpGrant is the top-up guard (C57a, migration 20260924190000) — not a webhook table.
-    expect(schema.match(/^model \w+/gm)).toEqual(["model BillingAccount", "model ChargebeeSync", "model TopUpGrant"]);
+    // CurrencySwitch is the record of a currency switch's captures (migration
+    // 20261001120000) — not a webhook table either.
+    expect(schema.match(/^model \w+/gm)).toEqual([
+      "model BillingAccount",
+      "model ChargebeeSync",
+      "model TopUpGrant",
+      "model CurrencySwitch",
+    ]);
     expect(schema).not.toMatch(/@@map\("processed_billing_event"\)/);
 
     const r = lifecycleRig();

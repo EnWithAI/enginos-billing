@@ -34,32 +34,72 @@ card was charged — a second send could charge it twice.
 
 **The idempotency header is used sparingly.** `chargebee-idempotency-key` is sent
 on two calls — `/ledger_operations/allocate` (`invoice:<id>` for a pack,
-`free-plan-credits:<tenant>` for the free plan's credits) and the free-plan
-subscribe (`free-plan:<tenant>`) — because its replay window is 30 minutes:
-fine for a repeat seconds later, useless for a capture stuck behind an
-hours-long outage. Capture uses a client-supplied `id` instead.
+`free-plan-credits:<tenant>` for the free plan's credits,
+`carry:<switch id>:<block id>` for a currency switch's copy of a grant block)
+and `subscription_for_items` (`free-plan:<tenant>:<currency>` for the free
+plan, `currency-switch:<switch id>` for a switch's new subscription) — because
+its replay window is 30 minutes: fine for a repeat seconds later, useless for a
+capture stuck behind an hours-long outage. Capture uses a client-supplied `id`
+instead, and so does a switch's new subscription (`id=cs_<switch id>`, below).
+
+**Chargebee caches a 5xx under an idempotency key** for the key's 30 minutes —
+its documentation: *"These errors are cached… the same response will be
+returned"*; not measured. A retry under the same key gets the same 5xx, and
+learns nothing. Where that matters — the switch's new subscription — the
+request also carries an id of ours, and a 5xx is followed by a read of that id.
 
 ---
 
 # The free plan — no checkout, no card
 
 An org the free plan is for — `billing_account.free_plan`, or
-`FREE_PLAN_DEFAULT` (off) when that is empty — is put on
-`FREE_PLAN_ITEM_PRICE_ID` (`pre-paid-test-v1-INR-Yearly`, ₹0 a year, its own
-Credit Grant cut to zero) by `checkout.provisionFreePlan`: enginos-platform calls
+`FREE_PLAN_DEFAULT` (off) when that is empty — is put on the free plan **of its
+billing currency**, `FREE_PLAN_ITEM_PRICE_ID_<CUR>`
+(`pre-paid-test-v1-USD-Yearly`, $0 a year; `pre-paid-test-v1-INR-Yearly`, ₹0 a
+year; each with its own Credit Grant cut to a single credit), by
+`checkout.provisionFreePlan`: enginos-platform calls
 `POST /api/internal/provision` once the org's LiteLLM team exists, and the
-billing page calls it again for such an org with no subscription. It creates
-the customer (§1 below) for **every** org, with the admin's email; for an org
-the free plan is not for it stops there (`not-eligible`). Otherwise it checks
-the plan's `price` is `0` (§2), then:
+billing page calls it again for such an org with no subscription. The currency
+is the saved billing country's (India → INR, elsewhere → USD) — **USD at
+sign-up**, which sends no address. It creates the customer (§1 below) for
+**every** org, with the admin's email; for an org the free plan is not for it
+stops there (`not-eligible`). Otherwise it checks the plan's `price` is `0`
+**and** its `currency_code` is the org's currency (§2), then:
 
 ```http
 POST /api/v2/customers/<tenant uuid>/subscription_for_items
-chargebee-idempotency-key: free-plan:<tenant uuid>
+chargebee-idempotency-key: free-plan:<tenant uuid>:USD
 
-subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Yearly
+subscription_items[item_price_id][0]=pre-paid-test-v1-USD-Yearly
 &subscription_items[quantity][0]=1
 ```
+
+The key names the currency: Chargebee refuses a key re-sent with another body,
+and an org whose address moved it to INR inside the key's 30 minutes must not
+meet the key its USD create used.
+
+**Each free plan grants one credit on creation.** MEASURED 2026-10-01: a new
+subscription on `pre-paid-test-v1-USD-Yearly`, and on
+`pre-paid-test-v1-INR-Yearly`, gets a grant block of 1.0 `token-test` from the
+plan itself (`grant_source: "subscription_created"`, `expires_at` 5680261800)
+about a second after it is created. (INR free-plan subscriptions made earlier on
+the site carry no such block.) `FREE_PLAN_CREDITS` counts it: billing allocates
+the total less what the plan gave — on **every** currency's free plan. A
+currency switch nets it out of the new subscription (`own_grant`, below).
+
+Once the subscription's currency is decided, the customer is told to prefer it
+— best effort, a failure logged as `billing.customer.preferred_currency_failed`:
+
+```http
+POST /api/v2/customers/<tenant uuid>
+
+preferred_currency_code=USD
+```
+
+MEASURED: every customer on the test site preferred INR, the site's first
+currency, and Chargebee routes a payment through the gateway of the customer's
+preferred currency. Unlike `update_billing_info`, this call leaves every field it
+is not sent alone.
 
 MEASURED 2026-09-28 with a customer that has **no card**: the subscription came
 back `active` and its ₹0 invoice `paid`, and — while the plan still carried a
@@ -101,6 +141,10 @@ subscription_id=<subscription>
   one).
 - **A failed allocate** holds the account `activating`, its team blocked, and
   `activatePending` retries it every minute.
+- **`FREE_PLAN_CREDITS` empty or `0`** turns this off. A free plan that grants
+  nothing then has no wallet at all, and the account is linked to
+  `FREE_PLAN_CREDIT_UNIT` with 0 credits — the unit a top-up's grant lands in —
+  rather than to no unit.
 
 MEASURED 2026-09-30: `org_aaa_com`, created on the zero-grant plan, had no
 wallet and got nothing before this; after it, billing allocated 1,000
@@ -184,7 +228,17 @@ customer[id]=5f0335de-d45e-411b-80da-1c1fc8d3ace1
 &subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Monthly
 &subscription_items[quantity][0]=1
 &redirect_url=https://dev.127.0.0.1.nip.io/organization/billing?from=checkout
+&billing_address[line1]=…&billing_address[city]=…&billing_address[country]=IN
 ```
+
+**Only in the saved billing country's currency.** No checkout before the org
+has saved a billing address (409 `billing-address-required`), and a plan whose
+`currency_code` (§2) is not that country's currency is `plan-not-offered`.
+The page is **pre-filled with the saved address** (`billing_address[...]`,
+from `GET /customers/{id}`; the country alone when the address on file is in
+another country): a hosted page writes the address it collects back onto the
+customer (MEASURED), and one left to ask could write a country other than the
+one the currency was chosen by.
 
 ```json
 { "hosted_page": { "id": "…", "url": "https://enwithai-test.chargebee.com/pages/v3/…",
@@ -328,7 +382,7 @@ granted`, and the team's own cumulative spend is what consumes it.
 ## 8. Local effects — no Chargebee calls
 
 ```
-billing_account   subscription id, unit, item price, term, status
+billing_account   subscription id, unit, item price, term, currency (currency_code), status
 billing_account   last_processed_ingested_at = now()  ← billing starts here, never earlier
 topup_grant       free-plan-credits (free plan only)  ← the one-time allocate's guard; ledger_unit_id adopted
 LiteLLM /team/update  max_budget = baseline + USD(live grant blocks), budget_duration = null
@@ -411,9 +465,10 @@ The match is strict: same id, `type` containing `capture`, and the same
 subscription. A grant is not a charge, and matching one would suppress a real
 capture forever.
 
-## `POST /ledger_operations/allocate` — a grant-free top-up, and the free credits
+## `POST /ledger_operations/allocate` — a grant-free top-up, the free credits, a switch's copies
 
-Uses `chargebee-idempotency-key` (`invoice:<id>`, or `free-plan-credits:<tenant>`),
+Uses `chargebee-idempotency-key` (`invoice:<id>`, `free-plan-credits:<tenant>`,
+or `carry:<switch id>:<block id>`),
 because Chargebee accepts no client-supplied id here. Requires a mandatory
 `expires_at`.
 
@@ -432,8 +487,10 @@ the original grant); past it, the subscription's `grant_blocks` are searched for
 the allocation before anything is sent again. See BILLING-ARCHITECTURE.md §10.
 
 Allocate is the path for a pack whose charge carries **no** Credit Grant
-(`TOPUP_CHARGEBEE_GRANTS=false`), and for the free plan's one-time credits (a
-`topup_grant` row under `free-plan-credits`, above). A pack whose charge carries
+(`TOPUP_CHARGEBEE_GRANTS=false`), for the free plan's one-time credits (a
+`topup_grant` row under `free-plan-credits`, above), and for a currency
+switch's copy of each grant block onto the new subscription (a row under
+`carry:<switch id>:<block id>`; see **The currency switch**). A pack whose charge carries
 its **own** grant is granted by Chargebee, and billing records that grant and
 allocates nothing — see **Top-up** below.
 
@@ -449,8 +506,19 @@ the grant blocks — the grant configuration is not readable over the API, see �
 **A top-up is always in the subscription's currency.** MEASURED 2026-09-30: a
 charge in a different currency from the subscription is refused —
 `currency_mismatched`, *"currency of the item(s) is different from the expected
-value 'INR'"*. Everything on the site is INR today; `api_token-USD` exists but
-nothing uses it.
+value 'INR'"*. So the pack is configured per currency
+(`TOPUP_ITEM_PRICE_ID_INR=api_token-INR`, `TOPUP_ITEM_PRICE_ID_USD=api_token-USD`),
+and `startTopUp` charges the one of the subscription's own `currency_code` —
+never a choice the request makes. `api_token-USD`'s Credit Grant (unit, credits
+per unit) is **not measured**: `GET /item_prices/api_token-USD` shows no grant
+fields, as for INR, and no USD payment has been taken on the site. Measure it
+before trusting `TOPUP_CHARGEBEE_GRANTS_USD=true`.
+
+**A top-up is charged under a lease.** `billing_account.topup_charging_until`
+is set to now + 2 minutes in the same transaction that checks no currency switch
+is open, and cleared once the charge is recorded; a switch does not start while
+it is live. So a pack is never charged onto a subscription a switch is about to
+empty.
 
 ## `POST /invoices/create_for_charge_items_and_charges` — charge the pack
 
@@ -641,6 +709,220 @@ origin locally and the real domain elsewhere. The page lives five days
 
 ---
 
+# The billing address — Chargebee's own form, read back by billing
+
+The org's billing address decides the currency it is billed in (India → INR,
+everywhere else → USD; `BILLING_COUNTRY_CURRENCIES`, `BILLING_DEFAULT_CURRENCY`).
+It is entered in **Chargebee's own form**, opened over the billing page by
+Chargebee.js, and Chargebee keeps it on the customer. Billing never writes an
+address: when the form closes, it reads the address back and keeps only its
+country (`billing_account.billing_country`).
+
+## `POST /portal_sessions` — the session the form opens on
+
+`portalSession()`, from `POST /api/internal/portal` (the page's
+`POST /enginos-api/billing/portal` → platform `POST /api/v1/billing/portal`).
+Chargebee.js asks for it itself, through the page, when the admin clicks *Add
+billing address*. The customer is the tenant's own, never one the request
+names; one onboarding never made is created first (`POST /customers`).
+
+```http
+POST /api/v2/portal_sessions
+
+customer[id]=5f0335de-d45e-411b-80da-1c1fc8d3ace1
+&redirect_url=https://dev.127.0.0.1.nip.io
+```
+
+Billing answers `{ portalSession }` with Chargebee's `portal_session` object
+**unchanged**, and the platform passes it on unreshaped: Chargebee.js reads it as
+Chargebee issued it, token and all. The page then calls
+`Chargebee.init({ site })`, `instance.setPortalSession(…)` and
+`instance.createChargebeePortal().openSection({ sectionType:
+Chargebee.getPortalSections().ADDRESS }, { close })` — the portal's address
+card and nothing else of it; and `instance.logout()` on close, so the next open
+asks billing for a fresh session. `EDIT_BILLING_ADDRESS` cannot be opened on its
+own (the live script throws *"section type portal_edit_billing_address cannot be
+opened separately"*).
+
+**Three switches must be on**, or the form never opens:
+
+| Where | Setting | Otherwise |
+|---|---|---|
+| billing | `CHARGEBEE_PORTAL_ENABLED=true` | 409 `portal-off`, nothing sent to Chargebee |
+| Chargebee | *Settings → Configure Chargebee → Customer Portal*: portal access through the API enabled | MEASURED: Chargebee refuses the session — *"Customer portal access via API is disabled."*, `error_code` `portal_access_disabled_for_api` (`api_error_code` `configuration_incompatible`). Billing answers 409 `portal-disabled` and logs `billing.portal.disabled` |
+| Chargebee | Self-Serve Portal: *Allow customers to cancel subscriptions* **off** | The session is a portal session: a customer must not be able to reach a cancellation from it. Nothing can check this setting over the API, which is why `CHARGEBEE_PORTAL_ENABLED` is off by default |
+
+## `GET /customers/{id}` — the address, read back
+
+`customer()`. Called by the address sync (`POST /api/internal/billing-address/sync`
+when the form closes, and the `customer_changed` webhook), by the billing page
+(the address card), and by a paid checkout (its pre-fill).
+
+```http
+GET /api/v2/customers/5f0335de-d45e-411b-80da-1c1fc8d3ace1
+```
+
+Read from the answer: `billing_address.first_name`, `last_name`, `company`,
+`line1`, `line2`, `city`, `state`, `state_code`, `zip`, `country` (and `email`,
+`phone`, `line3`, which the page is never shown), `preferred_currency_code`, and
+the tax fields `vat_number`, `vat_number_prefix`, `registered_for_gst`,
+`business_customer_without_vat_number`. A definite 404 `resource_not_found` is
+"no customer".
+
+The sync keeps **only** `billing_address.country`, trimmed and upper-cased,
+and only when it is two letters. No address, or one with no country (the admin
+closed the form without saving), keeps nothing — a country kept before stays —
+and answers `{ synced: false, reason: "no-country" }`. The country is never
+taken from the request or the webhook body: the sync route takes no body, and
+the browser never gets to say what the address is.
+
+## `POST /customers/{id}/update_billing_info` — no longer called
+
+Billing does not call it any more: no route writes an address. The client keeps
+`updateBillingInfo()` for a caller that must set one, with what it learned:
+
+**It REPLACES.** Chargebee's documentation: *"if you do not include a parameter
+in the request, Chargebee removes the corresponding attribute from the customer
+object"* — MEASURED on the test site, including `vat_number`,
+`vat_number_prefix`, `registered_for_gst`, `business_customer_without_vat_number`
+and `billing_address[email]`, `[phone]` and `[line3]`. So the client reads the
+customer first and sends those back as they were — the four tax fields only
+while the country stays the same (a GSTIN means nothing for a US address), and
+it logs `billing.address.tax_registration_cleared` when they go.
+
+---
+
+# The currency switch
+
+An org on a **free** plan whose saved country wants another currency is moved to
+a new subscription in it: Chargebee never changes a subscription's currency
+(*"cancel it and create a new one with the required currency"*), and keys the
+credit ledger per subscription. A paid plan keeps its currency. The state
+machine is [`currency-switch.service.ts`](../src/services/currency-switch.service.ts);
+each switch is one `currency_switch` row (SCHEMA.md), and every capture of it is
+stored there, with its id, before it is sent. A, below, is the old
+subscription; B the new one.
+
+Run inline by the address sync for up to `BILLING_SWITCH_INLINE_MS` (6 s from
+the request's start), on a client bounded by the time left (`timeoutMs` =
+remaining, one attempt per call; no step started with under 1.5 s left), and by
+the worker every minute after that, for up to 20 s before the usage sync. The
+billing page never advances one: it reads only the database while the account
+is `switching`, because it polls then and a site allows 150 calls a minute.
+
+| State | Step | Chargebee |
+|---|---|---|
+| REQUESTED | The target plan costs nothing in the target currency, else abandoned `misconfigured` | `GET /item_prices/{FREE_PLAN_ITEM_PRICE_ID_<CUR>}` |
+| | Make B, under our own id (below) | `POST /customers/{id}/subscription_for_items` → `GET /subscriptions/cs_…` |
+| | Wait while a top-up is owed or on its way | `GET /invoices` (`payment_due`, `not_paid`, `voided`, `pending`); the paid-pack apply: `GET /invoices`, `GET /grant_blocks` |
+| | START — no call. In one transaction: the account `switching`, the switch MOVING | — |
+| MOVING | CARRY: every live block of A in the unit, oldest first, onto B — same amount, the block's own expiry. Blocks of unsettled top-ups are held back | `GET /grant_blocks` (A), `GET /invoices`, `POST /ledger_operations/allocate` (B) per block |
+| | DRAIN A to zero | `GET /ledger_account_balances` (A), `GET /ledger_operations/{id}`, `POST /ledger_operations/capture` (A) |
+| | RESCAN A; carry and drain what landed meanwhile | `GET /grant_blocks` (A) |
+| | MIRROR A's consumption onto B, 10 s or more after B was made | `GET /grant_blocks` (B), `GET /ledger_operations/{id}`, `POST /ledger_operations/capture` (B) |
+| | B's usable must equal what A displayed, else wait for a person | `GET /ledger_account_balances` (B) |
+| | LINK the account to B; then the customer's preferred currency | `GET /subscriptions/{B}`, `POST /customers/{id}` |
+| LINKED | Move the LiteLLM cap onto B, unchanged | `GET /ledger_account_balances`, `GET /grant_blocks`, `GET /invoices` (B); LiteLLM `GET /team/info`, `POST /team/update` |
+| | CANCEL A | `POST /subscriptions/{A}/cancel_for_items` |
+| | Final check: credits that reached A, a late plan grant on B | `GET /ledger_account_balances` (A), `GET /grant_blocks` (B) |
+
+## `POST /customers/{id}/subscription_for_items` — B, under an id of ours
+
+```http
+POST /api/v2/customers/5f0335de-d45e-411b-80da-1c1fc8d3ace1/subscription_for_items
+chargebee-idempotency-key: currency-switch:<switch id>
+
+id=cs_<switch id without dashes>
+&subscription_items[item_price_id][0]=pre-paid-test-v1-INR-Yearly
+&subscription_items[quantity][0]=1
+```
+
+The `id` (`cs_` + 32 hex characters, within Chargebee's 50) makes "was it
+created?" a question with an answer. A refusal of the id as a duplicate
+(`duplicate_entry` / `resource_already_exists`), or a 5xx — which Chargebee
+caches under the key, so a retry cannot learn more — is followed by
+`GET /subscriptions/cs_…`, and that subscription, **only that id**, is adopted.
+Any other definite refusal abandons the switch (`chargebee_refused`); B is made
+while REQUESTED, before anything else has changed. A switch abandoned after
+that cancels B, best effort.
+
+**B's own grant.** MEASURED: a new free-plan subscription is granted 1 credit
+by the plan itself, about a second after it is created. The mirror waits 10 s
+after B was made (`B_GRANT_SETTLE_MS`), reads B's blocks, records what B holds
+beyond the copies as `own_grant`, and nets it out — so switching back and forth
+mints nothing (logged `billing.currency_switch.target_plan_grants`).
+
+## The drain and the mirror — `POST /ledger_operations/capture`
+
+The same call as usage capture, with our id stored in the switch row first and
+`GET /ledger_operations/{id}` before every send:
+
+```http
+POST /api/v2/ledger_operations/capture
+
+id=<currency_switch.drain_operation_id>
+&subscription_id=<A>
+&unit_id=token-test
+&amount=<A's usable balance>
+&ledger_operation_timestamp=<now>
+&metadata[json]={"reason":"currency_switch","switch_id":"…","to_subscription_id":"<B>"}
+```
+
+The mirror is the same on B (`mirror_operation_id`; metadata
+`reason: currency_switch_mirror`, `from_subscription_id`), for
+`Σ live granted on B − max(drained − held_back, 0)` — so B's granted, consumed
+and usable read exactly as A's did, B's own grant included. A drain refused for
+`ERROR_INSUFFICIENT_BALANCE` is checked by `GET /ledger_operations/{id}`:
+found, it settled; 404, it is dropped and A read again. A mirror Chargebee
+refuses waits for a person; it is never clamped.
+
+**What a person sees in Chargebee.** The drain is consumption on A; the copies
+are granted credits on B (allocations), and the mirror consumption on B. Paid
+top-up credits therefore sit on B as allocated grants, not as a top-up's
+grant — which matters to anyone reading revenue off Chargebee. Each switch also
+leaves a new subscription with its ₹0 / $0 invoice, and a cancelled (or
+`non_renewing`) old one.
+
+## `POST /subscriptions/{id}/cancel_for_items` — A, once billing has left it
+
+`cancelSubscription()`. Used for A only, once billing is linked to B and A is
+empty; everything Chargebee would otherwise take from the site's settings is
+said:
+
+```http
+POST /api/v2/subscriptions/<A>/cancel_for_items
+
+end_of_term=false
+&credit_option_for_current_term_charges=none
+&unbilled_charges_option=delete
+&account_receivables_handling=no_action
+&refundable_credits_handling=no_action
+```
+
+`end_of_term=false` because a `non_renewing` subscription still counts as
+active; no credit note, because one in INR cannot pay a USD invoice; an unpaid
+top-up on A stays owed and collectable. A definite refusal is followed by
+`GET /subscriptions/{id}`: already `cancelled` (or `non_renewing`) is success,
+and a 404 is as good as cancelled.
+
+**A plan with a Credit Grant cannot be cancelled mid-term.** MEASURED
+2026-10-01 on the USD free plan: *"You cannot cancel a subscription with items
+having credit unit grants immediately or mid-term. You can schedule the updates
+during renewal."* Billing then cancels it at its term end instead
+(`billing.subscription.cancel_scheduled`, a warning):
+
+```http
+POST /api/v2/subscriptions/<A>/cancel_for_items
+
+end_of_term=true
+```
+
+A sits `non_renewing` until then. That is safe: billing is already on B, A is
+empty, and the subscription choice keeps the account on the one it is linked
+to. A refusal of this too throws the first refusal.
+
+---
+
 # Error classification
 
 Errors are classified, not just thrown ([`classify()`](../src/integrations/chargebee/errors.ts)),
@@ -675,8 +957,13 @@ every tenant at once and a person fixes it.
 
 | Call | Endpoint | Purpose |
 |---|---|---|
-| `portalSession()` | `POST /portal_sessions` | Self-serve portal. **Built but never rendered in the UI, and refused (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`** — customers must not be able to cancel, and the portal offers cancellation unless it is switched off in the site's Self-Serve Portal settings. |
-| `customer()` | `GET /customers/{id}` | Tells a deleted subscription (customer still there) from a wrong site or key (nothing there) before a missing subscription cancels an account. |
+| `portalSession()` | `POST /portal_sessions` | The session Chargebee.js opens the **billing-address form** on. Refused (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`. See **The billing address**. |
+| `customer()` | `GET /customers/{id}` | The billing address the customer holds — the address sync, the billing page, the checkout's pre-fill — and telling a deleted subscription (customer still there) from a wrong site or key (nothing there). See **The billing address**. |
+| `setPreferredCurrency()` | `POST /customers/{id}` (`preferred_currency_code`) | The currency Chargebee routes the customer's payments in, set when billing decides the subscription's currency. Best effort. |
+| `updateBillingInfo()` | `POST /customers/{id}/update_billing_info` | **Not called by billing** — the address is entered in Chargebee's own form. Kept, with what it must re-send; see **The billing address**. |
+| `cancelSubscription()` | `POST /subscriptions/{id}/cancel_for_items` | The currency switch's old subscription, only. See **The currency switch**. |
+| `ledgerUnits()` | `GET /ledger_account_balances?subscription_id[is]=…&limit=100` | Every unit a subscription holds a wallet in — how a switch tells "no wallet, nothing to drain" from "unreadable". |
+| `unsettledTopUpInvoices()` | `GET /invoices` (`payment_due`, `not_paid`, `voided`, `pending`) | Top-up invoices a currency switch must wait for, or must not carry the credits of. |
 | `subscriptionIdsOf()` | `GET /subscriptions?customer_id[is]=…` | Every subscription the customer has had, so the top-up guard sees a pack Chargebee granted to an earlier one. |
 | `chargeItem()` | `POST /invoices/create_for_charge_items_and_charges` | Top-up pack, charged to the card on file; **never retried**. See **Top-up**. |
 | `collectInvoice()` | `POST /invoices/{id}/collect_payment` | Pay now, for a top-up whose card declined; **never retried**. See **Unpaid top-ups**. |
@@ -721,6 +1008,7 @@ Handled:
 | `subscription_created`, `_activated`, `_changed`, `_renewed`, `_reactivated`, `_resumed`, `_cancelled`, `_deleted` | A trigger only: the customer's subscriptions are re-read from Chargebee and applied (`syncFromChargebee`). |
 | `payment_succeeded` | For an invoice with a line for the top-up item price only: applies paid packs (`applyPaidTopUps`), exactly as the page's own apply does — what grants a pack whose buyer closed the tab. While a grant-carrying pack's block is not visible yet it answers **500 on purpose**, so Chargebee redelivers once the block is there. Any other payment is ignored. |
 | `grant_blocks_created` | Credits were added to a subscription — any credits: a pack's grant, a charge or grant made **by hand in the Chargebee dashboard**, a renewal's grant, billing's own allocate. The org whose **current** subscription it names is re-read (`syncFromChargebee`): its LiteLLM limit rises, and an exhausted team reopens, within seconds instead of at the daily resync. A declined pack's credits stay held back there. A subscription that is no org's current one (an ended one, a `cbdemo_` one) is logged `billing.webhook.grant_unlinked_subscription` and answered 200 — never retried. |
+| `customer_changed` | The customer was edited — its billing address in Chargebee's form or the dashboard, or billing's own `preferred_currency_code`. For an org that has saved a billing address on its billing page, the billing address sync runs (`syncBillingAddress`, not inline): the address is read back with `GET /customers/{id}` — never from the body — its country kept, and a currency switch asked for if the country needs one; the worker runs it. An org that has saved none: logged `billing.address.changed_unconfirmed`, nothing done. |
 | `payment_failed`, `alert_status_changed` | Logged only. |
 | Any event for a `cbdemo_` customer | Chargebee's sample data (the **Test Webhook** button, e.g. `subscription_created` for `cbdemo_tom`): 200, logged `billing.webhook.sample_event`, nothing done. |
 

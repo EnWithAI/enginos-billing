@@ -68,6 +68,29 @@ export function grantBlockInvoiceRefs(block: Record<string, any>): GrantBlockOri
   };
 }
 
+/**
+ * Was this grant block issued for a top-up whose invoice is NOT settled —
+ * owed, abandoned by dunning, voided or pending (`unsettledInvoiceIds`)?
+ *
+ * Chargebee grants a pack with its INVOICE, paid or not (MEASURED
+ * 2026-09-28), so such a block's credits are not the customer's. The ONE rule
+ * for it: unpaidTopUpCredits holds these back from the balance and the cap,
+ * and a currency switch leaves them on the old subscription rather than carry
+ * them across as paid credits. Takes a raw block's grantBlockInvoiceRefs() and
+ * a mapped GrantBlock alike — both carry the item price and the invoices.
+ */
+export function isUnsettledTopUpGrant(
+  block: { itemPriceId: string | null; invoices: Array<{ invoiceId: string | null }> },
+  unsettledInvoiceIds: ReadonlySet<string>,
+  topUpItemPriceIds: readonly string[],
+): boolean {
+  return (
+    block.itemPriceId != null &&
+    topUpItemPriceIds.includes(block.itemPriceId) &&
+    block.invoices.some((ref) => ref.invoiceId != null && unsettledInvoiceIds.has(ref.invoiceId))
+  );
+}
+
 function parseJsonObject(value: unknown): Record<string, any> {
   if (value != null && typeof value === "object") return value as Record<string, any>;
   if (typeof value !== "string" || value === "") return {};

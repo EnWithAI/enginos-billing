@@ -13,7 +13,7 @@ make dev         # all three in one terminal, lines tagged [api] [worker] [studi
                  # Ctrl-C stops all three. Refuses while :4300 or :5555 is taken.
 make dev-api     # only the API on :4300 (webhooks + internal routes) — npm run dev
 make dev-worker  # only the Hatchet worker (the cron sweep)       — npm run worker
-make db-studio   # only Prisma Studio on :5555 — billing's three tables
+make db-studio   # only Prisma Studio on :5555 — billing's four tables
 make test        # vitest, no external services needed          — npm test
 make help        # everything else (setup, db-migrate, check, …)
 ```
@@ -26,8 +26,8 @@ no database, and no Sentry, so it can raise no alerts.
 
 ## The database
 
-Billing has no database of its own. Its three tables — `billing_account`,
-`chargebee_sync`, `topup_grant` — live in the **shared master database,
+Billing has no database of its own. Its four tables — `billing_account`,
+`chargebee_sync`, `topup_grant`, `currency_switch` — live in the **shared master database,
 `enginos_master`**, beside the platform's (`tenants`, `org_llm_gateways`, …).
 Two connections, both in `.env`:
 
@@ -36,7 +36,7 @@ Two connections, both in `.env`:
 | `DATABASE_URL` | PgBouncer `localhost:6432` → `enginos_master` (`?pgbouncer=true&connection_limit=1`) | `enginos_app` | the API, the worker, **Prisma Studio** |
 | `DATABASE_DIRECT_URL` | Postgres `localhost:5432` → `enginos_master` (session mode) | `enginos_owner` | **migrations only** (`make db-migrate` = `prisma migrate deploy`) — the app role cannot create tables |
 
-**Prisma Studio shows only billing's three tables**: it shows the models in
+**Prisma Studio shows only billing's four tables**: it shows the models in
 `prisma/schema.prisma`, and billing's schema models only those, although the
 database holds the platform's tables too. For the platform's, run Studio in
 `enginos-platform` instead.
@@ -76,6 +76,11 @@ invoice, so a pack is granted exactly once. Chargebee keeps nothing that ties an
 allocation to its invoice (the metadata sent with it is never returned), so
 this one fact has to live here — docs/BILLING-ARCHITECTURE.md §10.
 
+A fourth, `currency_switch`, is the same kind of record for the one other time
+billing moves credits itself: an org whose billing address moved it to another
+currency, carried from its old subscription to a new one. Each capture of a
+switch is stored there, with its id, before it is sent (docs/SCHEMA.md).
+
 Those are two separate questions and they are deliberately two separate columns:
 
 ```
@@ -85,10 +90,58 @@ chargebee_sync.status                        WHAT CHARGEBEE SAID
 
 ## Plans, top-ups and cards
 
+- **The billing currency follows the billing address.** India is billed in
+  INR and everywhere else in USD (`BILLING_COUNTRY_CURRENCIES=IN:INR`,
+  `BILLING_DEFAULT_CURRENCY=USD`); an org with no address yet is billed in USD.
+  Chargebee fixes a subscription's currency and refuses a charge in any other
+  (MEASURED: `currency_mismatched`), so what billing sells is configured once
+  per currency, suffixed with its code — `FREE_PLAN_ITEM_PRICE_ID_<CUR>`,
+  `TOPUP_ITEM_PRICE_ID_<CUR>`, `TOPUP_AMOUNTS_<CUR>`,
+  `TOPUP_MIN_AMOUNT_<CUR>` / `TOPUP_MAX_AMOUNT_<CUR>`, `TOPUP_CREDITS_<CUR>` and
+  `TOPUP_CHARGEBEE_GRANTS_<CUR>` (else `TOPUP_CHARGEBEE_GRANTS`). The free
+  plan and the top-up are each set for **every** billing currency or for none.
+  The old unsuffixed names (`FREE_PLAN_ITEM_PRICE_ID`, `TOPUP_ITEM_PRICE_ID`,
+  `TOPUP_AMOUNTS`, `TOPUP_MIN_AMOUNT`, `TOPUP_MAX_AMOUNT`, `TOPUP_CREDITS`)
+  stop the process at start, naming the replacements.
+- **The address is entered in Chargebee's own form.** The billing page's
+  *Add billing address* opens the ADDRESS section of Chargebee's portal with
+  Chargebee.js, on a session from `POST /api/internal/portal`
+  (`POST /portal_sessions`). When it closes, the page calls
+  `POST /api/internal/billing-address/sync`: billing reads the address back
+  (`GET /customers/{id}`) and keeps its country in
+  `billing_account.billing_country` — never the address, which stays in
+  Chargebee. Billing never writes an address. `customer_changed` runs the same
+  sync for an org that has saved one. Needs `CHARGEBEE_PORTAL_ENABLED=true`,
+  and on the Chargebee site: portal access through the API switched on
+  (otherwise Chargebee answers *"Customer portal access via API is
+  disabled."*, and billing 409 `portal-disabled`) and *Allow customers to
+  cancel subscriptions* switched off.
+- **Nothing priced is sold before there is a country.** No top-up, and no paid
+  plan (409 `billing-address-required`); then only in that currency — the
+  top-up always in the subscription's own currency, one offer.
+- **A free plan follows the country; a paid plan keeps its currency.** A
+  saved country in the other currency moves a free-plan org to a new
+  subscription in it — the **currency switch**
+  (`services/currency-switch.service.ts`): it creates `cs_<switch id>` on that
+  currency's free plan, copies every live grant block across (allocate),
+  empties the old subscription (capture), captures the old one's consumption
+  on the new one so it shows the same granted, used and left, relinks billing,
+  moves the LiteLLM cap without changing it, and cancels the old subscription
+  (at its term end when Chargebee refuses mid-term). The address sync runs it
+  for up to `BILLING_SWITCH_INLINE_MS` (6 s); the worker finishes it every
+  minute, requests one for a free org whose currency drifted from its country's,
+  and alerts on one open over 30 minutes. The customer is never told: the page
+  shows *Billed in INR* and *Loading top-up options…* until it is done. Off
+  unless `BILLING_CURRENCY_SWITCH_ENABLED=true` — a rollout gate, turned on only
+  once every API replica and the worker run this code with both currency
+  migrations applied. See docs/BILLING-USER-FLOWS.md §3–4.
 - **The free plan, automatically — for the orgs it is for.** When
   enginos-platform creates an org it calls `POST /api/internal/provision`, and
-  billing subscribes the org's Chargebee customer to `FREE_PLAN_ITEM_PRICE_ID`
-  — no checkout, no card, and only ever a plan the catalogue prices at zero. It
+  billing subscribes the org's Chargebee customer to its currency's
+  `FREE_PLAN_ITEM_PRICE_ID_<CUR>` — USD at sign-up, since there is no address
+  yet — with no checkout, no card, and only ever a plan the catalogue prices at
+  zero in that currency. It tells Chargebee the customer prefers that currency
+  (`preferred_currency_code`), and it
   waits for Chargebee's credit ledger (about three seconds) before calling the
   org set up. The billing page does the same for any org it finds with no
   subscription.
@@ -103,15 +156,20 @@ chargebee_sync.status                        WHAT CHARGEBEE SAID
   allocate into `FREE_PLAN_CREDIT_UNIT` (required with `FREE_PLAN_CREDITS`)
   creates it, and the account adopts that unit. Until the credits land the org
   is held `activating` and the minute's cron retries. An org the plan already
-  gave at least that much is recorded and allocated nothing.
+  gave at least that much is recorded and allocated nothing. MEASURED: a new
+  subscription on either free plan (USD or INR) is granted 1 credit by the plan
+  itself. `FREE_PLAN_CREDITS` empty or `0` means no free credits; a free plan
+  that grants nothing is then still linked, to `FREE_PLAN_CREDIT_UNIT`, with 0
+  credits.
 - **Who gets it** is per org: `billing_account.free_plan`, or
   `FREE_PLAN_DEFAULT` (off) when an operator has not set one with
   `POST /api/internal/free-plan {tenantId, enabled}`. Every other org sees the
   paid plans (`ITEM_PRICE_IDS`) and subscribes through Chargebee's hosted
   checkout, which returns it to the billing page.
 - **Top-ups** are charged to the card on file once the customer confirms an
-  amount — one of `TOPUP_AMOUNTS` (₹50 and ₹100 by default) or a custom figure,
-  within `TOPUP_MIN_AMOUNT`..`TOPUP_MAX_AMOUNT`, which billing enforces. The page
+  amount — one of `TOPUP_AMOUNTS_<CUR>` (50 and 100 by default) or a custom
+  figure, within `TOPUP_MIN_AMOUNT_<CUR>`..`TOPUP_MAX_AMOUNT_<CUR>`, which
+  billing enforces — always in the subscription's own currency. The page
   quotes the amount, never the credits: `POST /invoices/create_for_charge_items_and_charges`,
   the API form of the admin UI's *Add Charge*. The `api_token` charge carries its
   own Credit Grant, so Chargebee grants the credits and billing records the
@@ -168,6 +226,7 @@ What the webhook acts on (everything else is acknowledged and ignored):
 | `subscription_created` `_activated` `_changed` `_renewed` `_reactivated` `_resumed` `_cancelled` `_deleted` | Re-reads the org from Chargebee (the body is only a trigger): link, term, free credits owed, LiteLLM cap; cancels an ended subscription |
 | `payment_succeeded` (invoice with a top-up line) | Records the paid pack once and moves the cap; 500 while its grant block is not visible yet, so Chargebee redelivers |
 | `grant_blocks_created` | Finds the org by its CURRENT subscription (the event names no customer) and re-reads it — credits added by hand reach the cap in seconds |
+| `customer_changed` | For an org that has saved a billing address: the billing address sync (the country is read back from Chargebee, never the body), asking for a currency switch the worker runs. An org that has saved none: logged only |
 | `payment_failed`, `alert_status_changed` | Logged only |
 | anything for a `cbdemo_` customer or subscription | Chargebee's **Test Webhook** sample data: 200, nothing done |
 
@@ -198,8 +257,10 @@ is exactly one pricing system and it is the gateway's.
 on subscription creation, and the top-up charge's own Credit Grant when a pack
 is paid (`TOPUP_CHARGEBEE_GRANTS=true`) — billing records that grant and
 allocates nothing. `/ledger_operations/allocate` is used only for a top-up
-charge that carries no grant of its own (`TOPUP_CHARGEBEE_GRANTS=false`), and
-for the free plan's one-time credits (`FREE_PLAN_CREDITS`).
+charge that carries no grant of its own (`TOPUP_CHARGEBEE_GRANTS=false`), for
+the free plan's one-time credits (`FREE_PLAN_CREDITS`), and for a currency
+switch's copy of grant blocks Chargebee already issued on the old subscription
+(each guarded by a `topup_grant` row `carry:<switch id>:<block id>`).
 
 **It does not block LLM requests.** Enforcement is the LiteLLM team's
 `max_budget`, set from Chargebee's live grant blocks at subscription time and
@@ -344,12 +405,20 @@ costs nothing operationally — enforcement is the gateway's real-time budget.
 
 ## Migrations
 
-Two of the older migrations carry partial unique indexes, which Prisma's schema
-language cannot express. `prisma migrate dev` reconciles against
-`schema.prisma`, sees objects it did not model as drift, and drops them. Apply
-with `prisma migrate deploy`, never `migrate dev`.
+Two of the older migrations carry partial unique indexes, and so does
+`20261001120000_billing_currency` (`currency_switch_open_uq`: one open currency
+switch per tenant) — Prisma's schema language cannot express them. `prisma
+migrate dev` reconciles against `schema.prisma`, sees objects it did not model
+as drift, and drops them. Apply with `prisma migrate deploy`, never
+`migrate dev`.
 
-`20260922130000_billing_cursor_and_sync` is the current head. It adds the cursor
+The newest two, `20261001120000_billing_currency` and
+`20261001130000_currency_switch_carry`, are additive: `billing_account` gains
+`billing_country`, `currency`, `topup_charging_until` and the `switching`
+status, and `currency_switch` is created (docs/SCHEMA.md). Both must be applied
+before `BILLING_CURRENCY_SWITCH_ENABLED` is turned on.
+
+`20260922130000_billing_cursor_and_sync` was the cutover. It adds the cursor
 column, creates `chargebee_sync`, seeds both from `chargebee_capture`, and only
 then drops it. Unlike the earlier cutovers it **preserves continuity**: each
 tenant's cursor comes from its furthest settled capture, and unresolved captures
@@ -377,10 +446,12 @@ src/services/             business logic
   gateway-budget.service.ts the LiteLLM team cap, from Chargebee's grant blocks
   billing-overview.service  the billing page's reads, each degrading on its own
   checkout.service.ts       the free plan (provisionFreePlan) and top-ups
+  billing-address.service   the address sync: the country, and the currency it decides
+  currency-switch.service   moving a free org's credits to a subscription in another currency
   payment-method / portal / invoice / webhook / plan-catalog
 src/repositories/         every database query; platform.repository reads the platform's tables
 src/views/                response payloads, in the shapes crewpe-ui reads
-src/models/               pure rules: decimal money, the credit rate, statuses, subscription choice
+src/models/               pure rules: decimal money, the credit rate, statuses, subscription choice, currency
 src/integrations/         Chargebee, LiteLLM and ClickHouse clients
 src/container/            composition root — the only place config and concrete clients meet
 docs/REFACTOR-PLAN.md     six billing tables → two: what moved where, and why

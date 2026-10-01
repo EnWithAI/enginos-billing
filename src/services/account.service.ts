@@ -26,6 +26,7 @@ import { isBillable } from "../models/rate";
 import { realmToRoutingSlug } from "../models/routing-slug";
 import { chooseBillingSubscription, itemPriceIdOf } from "../models/subscription";
 import { createBillingAccountRepository, type BillingAccountRepository } from "../repositories/billing-account.repository";
+import { isCarryInvoiceId } from "../repositories/currency-switch.repository";
 import { createPlatformRepository, type PlatformRepository } from "../repositories/platform.repository";
 import {
   FREE_PLAN_GRANT,
@@ -102,24 +103,27 @@ export interface AccountDeps {
    */
   pushBudget?: (
     tenantId: string,
-    opts?: { unblock?: boolean; termStart?: Date | null; usableCredits?: string | null },
+    opts?: { unblock?: boolean; termStart?: Date | null; usableCredits?: string | null; switchAdjustCredits?: string },
   ) => Promise<void>;
   /** Blocks the tenant's LiteLLM team outright: a failed push, or Chargebee credits used up. */
   blockBudget?: (tenantId: string, reason?: BlockReason) => Promise<void>;
   /** Hands the tenant's LiteLLM team back to its plan budget when the subscription ends. */
   releaseBudget?: (tenantId: string) => Promise<void>;
   /**
-   * The top-up charge. Its credits count only once its invoice is paid, so a
-   * declined top-up's — which Chargebee grants with the invoice — are held
-   * back from the usable balance. Absent: nothing is held back.
+   * Every currency's top-up charge (`TOPUP_ITEM_PRICE_ID_<CUR>`). A pack's
+   * credits count only once its invoice is paid, so a declined top-up's —
+   * which Chargebee grants with the invoice — are held back from the usable
+   * balance, whatever currency it was bought in. Absent or empty: nothing is
+   * held back.
    */
-  topUpItemPriceId?: string;
+  topUpItemPriceIds?: string[];
   /**
-   * The free plan (`FREE_PLAN_ITEM_PRICE_ID`) and the credits billing grants
-   * an org on it once (`FREE_PLAN_CREDITS`). Both are needed; either absent,
-   * the plan's own Credit Grant is all an org on it gets.
+   * Every currency's free plan (`FREE_PLAN_ITEM_PRICE_ID_<CUR>`) and the
+   * credits billing grants an org on any of them once (`FREE_PLAN_CREDITS`).
+   * Both are needed; either absent, the plan's own Credit Grant is all an org
+   * on it gets.
    */
-  freeItemPriceId?: string;
+  freeItemPriceIds?: string[];
   freePlanCredits?: string;
   /**
    * The unit those credits go into when the subscription has no wallet yet
@@ -139,6 +143,8 @@ export function createAccountService(deps: AccountDeps) {
   const topUps = deps.topUps ?? createTopUpGrantRepository(deps.prisma);
   const clock = deps.clock ?? (() => Date.now());
   const log = deps.logger ?? console;
+  const topUpItemPriceIds = deps.topUpItemPriceIds ?? [];
+  const freeItemPriceIds = deps.freeItemPriceIds ?? [];
 
   /**
    * Create the billing_account row for a tenant that has never been billed.
@@ -270,6 +276,17 @@ export function createAccountService(deps: AccountDeps) {
    * That used to require an idempotency key on a grant entry, because a second
    * run would otherwise write a second grant. With no grant to write, there is
    * nothing to key.
+   *
+   * THE LINK IS A COMPARE-AND-SET on `expectedSubscriptionId`: the subscription
+   * the account was linked to when the caller CHOSE this one — syncFromChargebee
+   * passes its own read, which the chooser decided from; a direct caller
+   * leaves it out and the read below stands in. A sync is several round trips
+   * to Chargebee long, and one held up in them can arrive after another
+   * writer has moved the account on — a second sync that saw the old
+   * subscription cancelled, or a currency switch. Its link then matches
+   * nothing, and it does NOTHING else: no cursor, no free credits, no
+   * activation, only `billing.subscription.link_raced`. The account is
+   * returned as it now stands.
    */
   async function syncSubscription(args: {
     tenantId: string;
@@ -277,9 +294,14 @@ export function createAccountService(deps: AccountDeps) {
     itemPriceId?: string | null;
     termStart?: Date | null;
     termEnd?: Date | null;
+    /** The subscription's `currency_code`. Absent keeps the currency stored. */
+    currency?: string | null;
     status?: string;
+    /** What the account was linked to when this subscription was chosen; absent: as read here. */
+    expectedSubscriptionId?: string | null;
   }) {
     const before = await accounts.findByTenantId(args.tenantId);
+    const expected = args.expectedSubscriptionId !== undefined ? args.expectedSubscriptionId : (before?.chargebeeSubscriptionId ?? null);
 
     // The unit usage is captured from. KEPT whenever the account is already
     // linked to this subscription: a second unit appearing on it — a top-up
@@ -292,7 +314,22 @@ export function createAccountService(deps: AccountDeps) {
     const keptUnit = before?.chargebeeSubscriptionId === args.subscriptionId ? before.ledgerUnitId : null;
     const balance = await deps.chargebee.balance(args.subscriptionId, keptUnit);
     if (keptUnit && !balance) await reportMissingUnit(args.tenantId, args.subscriptionId, keptUnit);
-    const ledgerUnitId = keptUnit ?? balance?.unitId ?? null;
+    // A free plan that grants nothing, with no free credits configured
+    // (FREE_PLAN_CREDITS empty or 0), has no wallet at all: nothing ever
+    // allocates into it. The org is still on the plan, with 0 credits in
+    // FREE_PLAN_CREDIT_UNIT — the unit a top-up's grant then lands in — rather
+    // than linked to no unit, which the usage sync and the page treat as "no
+    // credits set up". A unit the subscription does hold always wins. With
+    // free credits ON the account stays unlinked until their allocate creates
+    // the wallet (grantFreePlanCredits adopts it): a unit linked before then
+    // would let activate() open the team on nothing when that allocate fails.
+    const zeroCreditFreePlan =
+      !balance &&
+      !deps.freePlanCredits &&
+      !!deps.freePlanCreditUnit &&
+      args.itemPriceId != null &&
+      freeItemPriceIds.includes(args.itemPriceId);
+    const ledgerUnitId = keptUnit ?? balance?.unitId ?? (zeroCreditFreePlan ? deps.freePlanCreditUnit! : null);
     if (!keptUnit && balance && (balance.unitCount ?? 1) > 1) {
       log.warn?.(
         {
@@ -319,9 +356,12 @@ export function createAccountService(deps: AccountDeps) {
     // the account still reads cancelled, so no sync can bill from the old
     // cursor in between. A sync row still owed from before the cancellation is
     // untouched: it is recovered as ever, against the subscription pinned on it.
+    // Only while the account still reads as the chooser saw it (see
+    // restartCursorAt): a sync that has already lost the link race below must
+    // not move a cursor another one is billing from.
     if (before?.status === ACCOUNT.CANCELLED) {
       const at = new Date(clock());
-      if (await accounts.restartCursorAt(args.tenantId, at)) {
+      if (await accounts.restartCursorAt(args.tenantId, at, expected)) {
         log.warn?.(
           {
             metric: "billing.cursor.restarted",
@@ -334,15 +374,32 @@ export function createAccountService(deps: AccountDeps) {
       }
     }
 
-    const account = await accounts.linkSubscription(args.tenantId, {
-        chargebeeSubscriptionId: args.subscriptionId,
-        chargebeeItemPriceId: args.itemPriceId ?? undefined,
-        ledgerUnitId,
-        currentTermStart: args.termStart ?? undefined,
-        currentTermEnd: args.termEnd ?? undefined,
-        // Not active until the gateway holds the budget — see activate().
-        status: deps.pushBudget ? ACCOUNT.ACTIVATING : (args.status ?? ACCOUNT.ACTIVE),
+    const link = await accounts.linkSubscription(args.tenantId, expected, {
+      chargebeeSubscriptionId: args.subscriptionId,
+      chargebeeItemPriceId: args.itemPriceId ?? undefined,
+      ledgerUnitId,
+      currentTermStart: args.termStart ?? undefined,
+      currentTermEnd: args.termEnd ?? undefined,
+      currency: args.currency ?? undefined,
+      // Not active until the gateway holds the budget — see activate().
+      status: deps.pushBudget ? ACCOUNT.ACTIVATING : (args.status ?? ACCOUNT.ACTIVE),
     });
+    if (!link.account) throw new Error(`No billing account for tenant ${args.tenantId}`);
+    if (!link.linked) {
+      log.warn?.(
+        {
+          metric: "billing.subscription.link_raced",
+          tenantId: args.tenantId,
+          subscriptionId: args.subscriptionId,
+          expected,
+          linkedNow: link.account.chargebeeSubscriptionId,
+          status: link.account.status,
+        },
+        "The account changed while this sync was choosing its subscription (another sync, or a currency switch); nothing written — the writer that moved it decides",
+      );
+      return link.account;
+    }
+    const account = link.account;
 
     // Before activate(), so the tenant cannot become billable without a cursor.
     await ensureBillingCursor(account.tenantId);
@@ -403,11 +460,37 @@ export function createAccountService(deps: AccountDeps) {
    * gateway write is followed by a look at the status: if a cancellation got in
    * meanwhile, the team is handed back again. cancel() writes its status BEFORE
    * its own release, so whichever of the two runs last sees the other.
+   *
+   * Nor over a currency switch. A `switching` account is the switch's alone,
+   * so an activation that finds one returns it untouched — no push, no
+   * status, no block — and every status write refuses `switching` besides
+   * (billing-account.repository.ts setStatusUnlessCancelled), for one that
+   * read the account just before the switch started. Refused for THAT
+   * reason, the account is returned as it is — never handed back: a
+   * switching org keeps its team, and its cap, while its credits move.
+   *
+   * `fromSwitching` is the switch itself ending it: its writes may replace
+   * `switching`. Alone (a switch abandoned before it moved anything, or an
+   * account a crash left `switching` with no switch), the account is
+   * activated on the subscription it is still linked to, exactly as any
+   * other. With `switchAdjustCredits` (activateAfterSwitch) it is the push
+   * that moves the cap onto the new subscription, which must not be rebased
+   * (gateway-budget.service.ts): a push that fails or will not guess then
+   * leaves the account `switching` — never `activating`, which would hand the
+   * first push of the new term to the minute's retry and its renewal rebase —
+   * and the switch tries again.
    */
-  async function activate(tenantId: string, target: string = ACCOUNT.ACTIVE) {
+  async function activate(
+    tenantId: string,
+    target: string = ACCOUNT.ACTIVE,
+    opts: { fromSwitching?: boolean; switchAdjustCredits?: string } = {},
+  ) {
     const account = await accounts.findByTenantId(tenantId);
     if (!account) throw new Error(`No billing account for tenant ${tenantId}`);
     if (account.status === ACCOUNT.CANCELLED) return account;
+    if (account.status === ACCOUNT.SWITCHING && !opts.fromSwitching) return account;
+    const overSwitching = opts.fromSwitching === true;
+    const switchPush = opts.switchAdjustCredits !== undefined;
 
     const usable = await usableCredits(account);
     const exhausted = usable != null && !isBillable(usable);
@@ -418,10 +501,13 @@ export function createAccountService(deps: AccountDeps) {
     // another caller has on the wire. Held as `activating`, not left exhausted
     // or open on nothing: the minute's activatePending grants them and opens
     // the team, where nothing else would look at the account again until a
-    // top-up or the daily resync.
+    // top-up or the daily resync. Not the switch's own push: a switch never
+    // starts while they are owed, and it waits rather than hand its new term
+    // to activatePending.
     if ((exhausted || !account.ledgerUnitId) && (await freePlanCreditsOwed(account))) {
-      const held = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.ACTIVATING);
-      if (!held.changed) return handBack(tenantId, held.account);
+      if (switchPush) return stillSwitching(tenantId, account, "free plan credits still owed");
+      const held = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.ACTIVATING, { overSwitching });
+      if (!held.changed) return refusedStatus(tenantId, held.account);
       await block(tenantId, "activating");
       return (await handBackIfCancelled(tenantId)) ?? held.account;
     }
@@ -433,22 +519,24 @@ export function createAccountService(deps: AccountDeps) {
           unblock: !exhausted,
           termStart: account.currentTermStart ?? null,
           usableCredits: usable,
+          ...(switchPush ? { switchAdjustCredits: opts.switchAdjustCredits } : {}),
         });
       }
     } catch (err) {
+      if (switchPush) return stillSwitching(tenantId, account, errorMessage(err));
       log.error?.(
         { metric: "billing.budget.push_failed", tenantId, err: errorMessage(err) },
         "Could not set the LiteLLM budget; account held as activating and its team blocked until a retry lands",
       );
-      const held = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.ACTIVATING);
-      if (!held.changed) return handBack(tenantId, held.account);
+      const held = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.ACTIVATING, { overSwitching });
+      if (!held.changed) return refusedStatus(tenantId, held.account);
       await block(tenantId, "activating");
       return (await handBackIfCancelled(tenantId)) ?? held.account;
     }
 
     if (exhausted) {
-      const marked = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.EXHAUSTED);
-      if (!marked.changed) return handBack(tenantId, marked.account);
+      const marked = await accounts.setStatusUnlessCancelled(tenantId, ACCOUNT.EXHAUSTED, { overSwitching });
+      if (!marked.changed) return refusedStatus(tenantId, marked.account);
       await block(tenantId, "exhausted");
       return (await handBackIfCancelled(tenantId)) ?? marked.account;
     }
@@ -456,10 +544,48 @@ export function createAccountService(deps: AccountDeps) {
     // Nothing to requeue: usage the last capture could not pay for is still in
     // ClickHouse, in front of a cursor that never moved past it, and the next
     // tick offers it again.
-    const opened = await accounts.setStatusUnlessCancelled(tenantId, target);
-    // Refused only because a cancellation got in — and the push above may
-    // have re-managed the team it had just handed back.
-    return opened.changed ? opened.account : handBack(tenantId, opened.account);
+    const opened = await accounts.setStatusUnlessCancelled(tenantId, target, { overSwitching });
+    // Refused because a cancellation got in — and the push above may have
+    // re-managed the team it had just handed back — or a currency switch did,
+    // and the team stays as the switch left it.
+    return opened.changed ? opened.account : refusedStatus(tenantId, opened.account);
+  }
+
+  /**
+   * The cap moves onto a currency switch's new subscription, and the account
+   * leaves `switching` — active, or exhausted when what was carried is used
+   * up. The switch calls this once it has linked the account to the new
+   * subscription (LINKED), with what that subscription's own plan granted
+   * (`own_grant`), which the push nets out so the cap stays exactly where it
+   * was (gateway-budget.service.ts, A17).
+   *
+   * Still `switching` on return means the cap did not move — the gateway was
+   * unreachable, or would not guess — and the switch waits and calls again.
+   * Safe to call again after it worked (a crash before the switch recorded
+   * it): the push finds the new term already adopted and moves nothing twice.
+   */
+  async function activateAfterSwitch(tenantId: string, { ownGrant = "0" }: { ownGrant?: string } = {}) {
+    return activate(tenantId, ACCOUNT.ACTIVE, { fromSwitching: true, switchAdjustCredits: ownGrant });
+  }
+
+  /** The switch's push did not land: the account stays `switching`, its team keeps the cap it had, and the switch tries again. */
+  function stillSwitching<T>(tenantId: string, account: T, reason: string): T {
+    log.warn?.(
+      { metric: "billing.currency_switch.activation_waiting", tenantId, reason },
+      "The currency switch could not move the LiteLLM cap onto the new subscription yet; the account stays switching and the switch tries again",
+    );
+    return account;
+  }
+
+  /**
+   * A status write was refused (setStatusUnlessCancelled). Over a
+   * cancellation, the team is handed back: a write that lost that race must
+   * not leave a cancelled customer billing-managed or blocked. Over a currency
+   * switch — the only other refusal — the account is returned untouched: the
+   * switch owns it, and its team keeps the cap it had.
+   */
+  async function refusedStatus<T extends { status: string }>(tenantId: string, account: T): Promise<T> {
+    return account.status === ACCOUNT.CANCELLED ? handBack(tenantId, account) : account;
   }
 
   /** Best effort: a failed block is logged, and the next grant or retry tries again. */
@@ -530,13 +656,14 @@ export function createAccountService(deps: AccountDeps) {
       // exhausted accounts on exactly that (C57b).
       const balance = await deps.chargebee.balance(account.chargebeeSubscriptionId, account.ledgerUnitId);
       if (balance?.usable == null) return null;
-      // A declined top-up's credits are in Chargebee's balance but not paid for.
-      if (!deps.topUpItemPriceId || !account.chargebeeCustomerId) return balance.usable;
+      // A declined top-up's credits are in Chargebee's balance but not paid
+      // for — a pack bought in any currency.
+      if (topUpItemPriceIds.length === 0 || !account.chargebeeCustomerId) return balance.usable;
       const unpaid = await deps.chargebee.unpaidTopUpCredits({
         customerId: account.chargebeeCustomerId,
         subscriptionId: account.chargebeeSubscriptionId,
         unitId: account.ledgerUnitId ?? undefined,
-        itemPriceId: deps.topUpItemPriceId,
+        itemPriceId: topUpItemPriceIds,
       });
       return subtractFloorZero(balance.usable, unpaid);
     } catch (err) {
@@ -646,6 +773,9 @@ export function createAccountService(deps: AccountDeps) {
     itemPriceId?: string | null;
     termStart?: Date | null;
     termEnd?: Date | null;
+    currency?: string | null;
+    /** As syncSubscription: what the account was linked to when the subscription was chosen. */
+    expectedSubscriptionId?: string | null;
   }) {
     log.log?.(
       { metric: "billing.subscription.renewed", tenantId: args.tenantId, termStart: args.termStart?.toISOString() },
@@ -705,6 +835,21 @@ export function createAccountService(deps: AccountDeps) {
     const account = await accounts.findByTenantId(tenantId);
     if (!account?.chargebeeCustomerId) return null;
 
+    // A currency switch is moving the org's credits. Chargebee's subscriptions
+    // say nothing the switch does not already know — both of them are active
+    // while it moves, and the old one is cancelled only once billing has left
+    // it — and the switch itself links the new one. So a webhook, the daily
+    // resync or a page's pull leaves the account to it: no link (it would be
+    // refused anyway), no cancellation of a subscription the switch is
+    // emptying, and not a single Chargebee call.
+    if (account.status === ACCOUNT.SWITCHING) {
+      log.log?.(
+        { metric: "billing.subscription.sync_skipped_switching", tenantId },
+        "A currency switch is moving this org's credits; the subscription sync leaves the account to it",
+      );
+      return account;
+    }
+
     const subscriptions = await deps.chargebee.activeSubscriptions(account.chargebeeCustomerId);
 
     // §15: the BUSINESS layer decides which subscription receives usage, not an
@@ -742,6 +887,11 @@ export function createAccountService(deps: AccountDeps) {
       itemPriceId: itemPriceIdOf(subscription),
       termStart,
       termEnd: subscription.current_term_end ? new Date(subscription.current_term_end * 1000) : null,
+      currency: typeof subscription.currency_code === "string" ? subscription.currency_code : null,
+      // What the chooser saw. The link is a compare-and-set on it, so a sync
+      // that chose from an account another writer has since moved writes
+      // nothing (syncSubscription).
+      expectedSubscriptionId: account.chargebeeSubscriptionId,
     };
 
     // Strictly forward: a term start that matches, or somehow predates, what we
@@ -948,11 +1098,26 @@ export function createAccountService(deps: AccountDeps) {
         }
 
         const record = records.get(String(invoice.id));
+        // A currency switch is moving the org's credits: nothing is allocated
+        // — not a first send, not a resumed one. Either would land on the
+        // subscription the account was read on, which the switch may have
+        // emptied already, or have stopped billing from; and nothing about
+        // the account is activated (activate() leaves a switching account to
+        // the switch). A pack Chargebee granted itself is still recorded: its
+        // block is on the old subscription, where the switch's rescan finds
+        // it and carries it. The rest are `pending`, and are applied once the
+        // switch has finished — a webhook redelivered, the page's next apply.
+        const switching = now?.status === ACCOUNT.SWITCHING;
         let granted: { credits: string } | null | typeof GRANT_NOT_VISIBLE;
         try {
-          granted = record
-            ? await resumeTopUp(record, ledger)
-            : await firstTopUp(tenantId, invoice, itemPriceId, creditsPerUnit, linked, account.currentTermEnd, ledger, chargebeeGrants);
+          if (record) {
+            granted = switching ? GRANT_NOT_VISIBLE : await resumeTopUp(record, ledger);
+          } else {
+            granted = await firstTopUp(tenantId, invoice, itemPriceId, creditsPerUnit, linked, account.currentTermEnd, ledger, chargebeeGrants, {
+              allocate: !switching,
+              linkedSubscriptionId: now?.chargebeeSubscriptionId ?? linked.subscriptionId,
+            });
+          }
         } catch (err) {
           // Unknown outcome — a timeout, a 5xx, Chargebee unreachable: stop
           // here, the rest would meet the same. A definite refusal of THIS
@@ -983,7 +1148,12 @@ export function createAccountService(deps: AccountDeps) {
     return { applied, credits, ...(pending.length > 0 ? { pending } : {}) };
   }
 
-  /** An invoice with no row yet: Chargebee's own grant, or claim → allocate → APPLIED. */
+  /**
+   * An invoice with no row yet: Chargebee's own grant, or claim → allocate →
+   * APPLIED. `allocate` false (a currency switch is moving the org's credits)
+   * records a grant Chargebee made, and sends nothing: an invoice billing
+   * would allocate itself is left `pending` for after the switch.
+   */
   async function firstTopUp(
     tenantId: string,
     invoice: Record<string, any>,
@@ -993,19 +1163,36 @@ export function createAccountService(deps: AccountDeps) {
     termEnd: Date | null,
     ledger: Map<string, { blocks: GrantBlock[]; complete: boolean }>,
     chargebeeGrants: boolean,
+    { allocate = true, linkedSubscriptionId = linked.subscriptionId }: { allocate?: boolean; linkedSubscriptionId?: string } = {},
   ): Promise<{ credits: string } | null | typeof GRANT_NOT_VISIBLE> {
     const invoiceId = String(invoice.id);
 
     const catalogue = catalogueGrantFor(invoice, itemPriceId, ledger);
-    if (catalogue.length > 0) return recordCatalogueGrant(tenantId, invoiceId, linked.unitId, catalogue);
+    if (catalogue.length > 0) return recordCatalogueGrant(tenantId, invoiceId, linked.unitId, catalogue, linkedSubscriptionId);
 
     // Chargebee grants this pack itself. No block naming it yet means not yet,
     // never "allocate instead": that would be a second grant once Chargebee's
-    // lands. No row is written, so the next apply looks again.
+    // lands. No row is written, so the next apply looks again. MEASURED: the
+    // block follows the payment by about a second — so one still missing ten
+    // minutes after the invoice was paid is not "not yet" any more, and is an
+    // error a person is alerted to (the pack's Credit Grant is missing, or in
+    // another unit), not a warning every apply repeats (A19).
     if (chargebeeGrants) {
+      const paidAtMs = typeof invoice.paid_at === "number" ? invoice.paid_at * 1000 : null;
+      const overdue = paidAtMs != null && clock() - paidAtMs > GRANT_NOT_VISIBLE_ALERT_MS;
+      log[overdue ? "error" : "warn"]?.(
+        { metric: "billing.topup.grant_not_visible", tenantId, invoiceId, itemPriceId, paidAt: paidAtMs == null ? null : new Date(paidAtMs).toISOString() },
+        overdue
+          ? "Paid top-up still has no Chargebee grant block ten minutes after payment; nothing allocated. Check the pack's Credit Grant in the Chargebee catalogue"
+          : "Paid top-up has no Chargebee grant block yet; nothing allocated, looked for again on the next apply",
+      );
+      return GRANT_NOT_VISIBLE;
+    }
+
+    if (!allocate) {
       log.warn?.(
-        { metric: "billing.topup.grant_not_visible", tenantId, invoiceId, itemPriceId },
-        "Paid top-up has no Chargebee grant block yet; nothing allocated, looked for again on the next apply",
+        { metric: "billing.topup.deferred_switching", tenantId, invoiceId, itemPriceId },
+        "Paid top-up not allocated while a currency switch is moving the org's credits; it is applied once the switch has finished",
       );
       return GRANT_NOT_VISIBLE;
     }
@@ -1016,7 +1203,7 @@ export function createAccountService(deps: AccountDeps) {
     if (creditsPerUnit === "") {
       log.error?.(
         { metric: "billing.topup.credits_per_unit_unset", tenantId, invoiceId, itemPriceId },
-        "Paid top-up not granted: TOPUP_CREDITS is not set, and billing allocates packs (TOPUP_CHARGEBEE_GRANTS=false). Set TOPUP_CREDITS, or give the pack a Credit Grant in Chargebee and set TOPUP_CHARGEBEE_GRANTS=true",
+        "Paid top-up not granted: TOPUP_CREDITS_<currency> is not set for this pack's currency, and billing allocates its packs (TOPUP_CHARGEBEE_GRANTS[_<currency>] is false). Set it, or give the pack a Credit Grant in Chargebee and set the grant mode to true",
       );
       return null;
     }
@@ -1168,6 +1355,13 @@ export function createAccountService(deps: AccountDeps) {
     let expiresAt: Date;
     if (record.invoiceId === FREE_PLAN_GRANT) {
       expiresAt = freePlanCreditsExpiry();
+    } else if (isCarryInvoiceId(record.invoiceId)) {
+      // A currency switch's copy of one grant block keeps THAT block's expiry
+      // — a pack's never expires, a plan's ends with its term — not the term
+      // end of the subscription it is copied onto, which would expire carried
+      // pack credits at the new plan's first renewal. Only moved out to the
+      // least lead a stored request needs, if it has come that close.
+      expiresAt = carriedExpiry(record.expiresAt);
     } else {
       const account = await accounts.findByTenantId(record.tenantId);
       const termEnd = account?.chargebeeSubscriptionId === record.chargebeeSubscriptionId ? account.currentTermEnd : null;
@@ -1280,13 +1474,21 @@ export function createAccountService(deps: AccountDeps) {
       (other) => other.id !== record.id && compare(other.credits, record.credits) === 0,
     );
 
-    // Every block that could be an allocation of this size into this unit.
+    // Every block that could be an allocation of this size into this unit —
+    // and with this row's expiry. Two rows of the same size (a currency
+    // switch copies one block per row, and packs come in a few sizes) are
+    // then told apart by what each asked for, not only by when: matched on
+    // size and time alone, a row that never landed was once resolved from
+    // the other's block, and the other re-sent with the wrong expiry (critic
+    // finding, reproduced in a simulation). A block that names no expiry
+    // cannot be told apart that way, and matches as before.
     const pool = listed.blocks.filter(
       (b) =>
         isAllocationBlock(b) &&
         b.unitId === record.ledgerUnitId &&
         compare(b.grantedAmount, record.credits) === 0 &&
-        b.createdAtMs != null,
+        b.createdAtMs != null &&
+        sameExpiry(b, record),
     );
     const owned = new Set(
       others.map((o) => o.chargebeeRef ?? "").filter((ref) => ref.startsWith("grant_block:")).map((ref) => ref.slice(12)),
@@ -1325,12 +1527,21 @@ export function createAccountService(deps: AccountDeps) {
     return op.createdAtMs;
   }
 
-  /** Chargebee granted this pack itself. Record it; allocate nothing. */
+  /**
+   * Chargebee granted this pack itself. Record it; allocate nothing.
+   *
+   * A grant on a subscription the account no longer bills — a pack paid on
+   * the old subscription while a currency switch was moving the org, or
+   * before a resubscription — is recorded all the same (never granted
+   * twice), and raised as an error: the credits sit where billing no longer
+   * draws from, and a person moves them.
+   */
   async function recordCatalogueGrant(
     tenantId: string,
     invoiceId: string,
     accountUnitId: string,
     blocks: GrantBlock[],
+    linkedSubscriptionId: string,
   ): Promise<{ credits: string } | null> {
     const credits = add("0", ...blocks.map((b) => b.grantedAmount));
     const recorded = await topUps.recordCatalogueGrant({
@@ -1343,6 +1554,22 @@ export function createAccountService(deps: AccountDeps) {
       at: new Date(clock()),
     });
     if (!recorded) return null;
+
+    const elsewhere = blocks.filter((b) => b.subscriptionId !== linkedSubscriptionId);
+    if (elsewhere.length > 0) {
+      log.error?.(
+        {
+          metric: "billing.topup.granted_to_previous_subscription",
+          tenantId,
+          invoiceId,
+          grantBlockIds: elsewhere.map((b) => b.id),
+          grantedOn: [...new Set(elsewhere.map((b) => b.subscriptionId))],
+          linkedSubscriptionId,
+          credits,
+        },
+        "Chargebee granted this paid top-up on a subscription the org is no longer billed on; recorded (never granted twice), but the credits sit where billing does not draw from. Move them to the linked subscription by hand",
+      );
+    }
 
     const wrongUnit = blocks.filter((b) => b.unitId !== accountUnitId);
     if (wrongUnit.length > 0) {
@@ -1368,6 +1595,122 @@ export function createAccountService(deps: AccountDeps) {
       "Chargebee granted this top-up itself (its item price carries a Credit Grant); recorded, nothing allocated",
     );
     return { credits };
+  }
+
+  /**
+   * One allocation, made exactly once under the guard row `guardId` — the
+   * currency switch's copy of one grant block onto the new subscription
+   * (`carry:<switch id>:<block id>`, currency-switch.repository carryInvoiceId).
+   *
+   * The same machinery as a pack and the free plan's credits: the row is
+   * claimed with the whole request (subscription, unit, credits, expiry, key)
+   * before anything is sent, then sent, resumed or searched for exactly as
+   * resumeTopUp does — so a crash, a lost answer or a second caller delays an
+   * allocation but never makes it twice. It moves no cap and activates
+   * nothing: the caller is the switch, which does both itself once every
+   * copy is in.
+   *
+   * The answer is decided by READING THE ROW AGAIN after the attempt, never
+   * by what the attempt returned: `applied` only when the row is APPLIED.
+   * Everything else — another caller sending it, an answer lost, a send held
+   * past its key's window, a refusal, an outage — is `pending`, and the
+   * caller waits; asking again later resumes the same row. A null from the
+   * machinery used to mean both "already granted" and "someone else is
+   * sending it", and a caller that took the second for the first went on to
+   * mirror credits that were never there (critic finding, A12). `refused`
+   * says Chargebee definitely refused the request — the switch may give up
+   * on that, while nothing has moved.
+   *
+   * A row already there for `guardId` is the request: an attempt with other
+   * figures is refused (`guard_mismatch`, logged) rather than sent, since the
+   * row's own request is what its key may replay.
+   */
+  async function allocateOnce(args: {
+    tenantId: string;
+    guardId: string;
+    subscriptionId: string;
+    unitId: string;
+    credits: string;
+    expiresAt: Date;
+  }): Promise<{ kind: "applied"; credits: string } | { kind: "pending"; reason: string; refused?: boolean }> {
+    const { tenantId, guardId } = args;
+    let failure: unknown = null;
+    try {
+      const record = await topUps.findByInvoice(tenantId, guardId);
+      if (record?.status === TOPUP.APPLIED && sameRequest(record, args)) return { kind: "applied", credits: record.credits };
+      if (record && !sameRequest(record, args)) return guardMismatch(record, args);
+      if (record) {
+        await resumeTopUp(record, new Map());
+      } else {
+        const claimed = await topUps.claim({
+          tenantId,
+          invoiceId: guardId,
+          chargebeeSubscriptionId: args.subscriptionId,
+          ledgerUnitId: args.unitId,
+          credits: args.credits,
+          // To the second, as allocate takes it: what is stored is exactly what is sent.
+          expiresAt: toSecond(args.expiresAt),
+          idempotencyKey: allocationKey({ tenantId, invoiceId: guardId }),
+          at: new Date(clock()),
+        });
+        if (claimed) {
+          await sendTopUp(claimed, { id: claimed.id, attemptCount: claimed.attemptCount });
+        } else {
+          // Another caller claimed it between our read and our insert; it is theirs, or resumed.
+          const current = await topUps.findByInvoice(tenantId, guardId);
+          if (current && current.status !== TOPUP.APPLIED) await resumeTopUp(current, new Map());
+        }
+      }
+    } catch (err) {
+      failure = err;
+      log.warn?.(
+        { metric: "billing.topup.allocate_once_pending", tenantId, guardId, err: errorMessage(err) },
+        "A one-time allocation did not complete; its guard row is resumed on the next attempt, never sent twice",
+      );
+    }
+
+    const now = await topUps.findByInvoice(tenantId, guardId);
+    if (now?.status === TOPUP.APPLIED) return { kind: "applied", credits: now.credits };
+    if (failure) {
+      const refused = isDefiniteRefusal(failure as ChargebeeError);
+      return { kind: "pending", reason: refused ? "refused" : "unknown_outcome", ...(refused ? { refused: true } : {}) };
+    }
+    return { kind: "pending", reason: now ? now.status.toLowerCase() : "not_claimed" };
+  }
+
+  /** Does the guard row hold THIS request — the same subscription, unit and credits? (Its expiry may have been re-issued.) */
+  function sameRequest(
+    row: Pick<TopUpGrant, "chargebeeSubscriptionId" | "ledgerUnitId" | "credits">,
+    args: { subscriptionId: string; unitId: string; credits: string },
+  ): boolean {
+    return row.chargebeeSubscriptionId === args.subscriptionId && row.ledgerUnitId === args.unitId && compare(row.credits, args.credits) === 0;
+  }
+
+  function guardMismatch(
+    row: Pick<TopUpGrant, "tenantId" | "invoiceId" | "chargebeeSubscriptionId" | "ledgerUnitId" | "credits" | "status">,
+    args: { subscriptionId: string; unitId: string; credits: string },
+  ): { kind: "pending"; reason: string } {
+    log.error?.(
+      {
+        metric: "billing.topup.guard_mismatch",
+        tenantId: row.tenantId,
+        guardId: row.invoiceId,
+        stored: { subscriptionId: row.chargebeeSubscriptionId, unitId: row.ledgerUnitId, credits: row.credits, status: row.status },
+        asked: args,
+      },
+      "A one-time allocation was asked for with other figures than its guard row holds; nothing sent. The row's own request is the one its key may replay",
+    );
+    return { kind: "pending", reason: "guard_mismatch" };
+  }
+
+  /**
+   * A carried block's expiry for a request re-issued under a new key: the
+   * one stored — the block's own — moved out to the least lead a stored
+   * request needs (TOPUP_MIN_EXPIRY_LEAD_MS) if it has come closer than that.
+   */
+  function carriedExpiry(stored: Date | null): Date {
+    const least = clock() + TOPUP_MIN_EXPIRY_LEAD_MS;
+    return toSecond(new Date(Math.max(stored?.getTime() ?? least, least)));
   }
 
   /**
@@ -1430,7 +1773,7 @@ export function createAccountService(deps: AccountDeps) {
     // recorded and allocated nothing; one it gave less — a grant cut to zero,
     // or to a token kept only so Chargebee opens a wallet — gets the rest.
     const planBlocks = listed.blocks.filter(
-      (b) => b.itemPriceId === deps.freeItemPriceId && compare(b.grantedAmount, "0") > 0,
+      (b) => b.itemPriceId != null && freeItemPriceIds.includes(b.itemPriceId) && compare(b.grantedAmount, "0") > 0,
     );
     const planGranted = add("0", ...planBlocks.map((b) => b.grantedAmount));
     const owed = subtractFloorZero(deps.freePlanCredits!, planGranted);
@@ -1540,12 +1883,13 @@ export function createAccountService(deps: AccountDeps) {
     return record?.status !== TOPUP.APPLIED;
   }
 
+  /** On ANY currency's free plan, with the one-time credits configured. Once per org whichever it is (FREE_PLAN_GRANT). */
   function onFreePlanCredits(account: { chargebeeSubscriptionId: string | null; chargebeeItemPriceId?: string | null }): boolean {
     return (
       !!deps.freePlanCredits &&
-      !!deps.freeItemPriceId &&
       account.chargebeeSubscriptionId != null &&
-      account.chargebeeItemPriceId === deps.freeItemPriceId
+      account.chargebeeItemPriceId != null &&
+      freeItemPriceIds.includes(account.chargebeeItemPriceId)
     );
   }
 
@@ -1584,22 +1928,53 @@ export function createAccountService(deps: AccountDeps) {
     applyPaidTopUps,
     renew,
     cancel,
+    // The currency switch's (services/currency-switch.service.ts):
+    activate,
+    activateAfterSwitch,
+    allocateOnce,
+    freePlanCreditsOwed,
+    grantFreePlanCreditsOrLog,
   };
 }
 
 export type AccountService = ReturnType<typeof createAccountService>;
 
-/** A paid pack whose Chargebee grant block has not appeared yet (applyPaidTopUps `chargebeeGrants`). */
+/**
+ * A paid pack not granted yet, and looked for again on the next apply: its
+ * Chargebee grant block has not appeared (applyPaidTopUps `chargebeeGrants`),
+ * or a currency switch is moving the org's credits.
+ */
 const GRANT_NOT_VISIBLE = Symbol("grant-not-visible");
+
+/** How long after payment a pack's missing grant block is a warning; past it, an alerted error (A19). */
+const GRANT_NOT_VISIBLE_ALERT_MS = 10 * 60_000;
 
 /**
  * The `chargebee-idempotency-key` a guard row's allocate is first sent under;
  * a re-issue appends `:<n>`. Keys are site-wide, so the free plan's names the
  * tenant (and is not `free-plan:<tenant>`, the free-plan subscribe's key); an
- * invoice id is already unique on the site.
+ * invoice id is already unique on the site, and so is a currency switch's
+ * carry (`carry:<switch id>:<block id>`), which is its own key.
  */
 function allocationKey(record: { tenantId: string; invoiceId: string }): string {
-  return record.invoiceId === FREE_PLAN_GRANT ? `free-plan-credits:${record.tenantId}` : `invoice:${record.invoiceId}`;
+  if (record.invoiceId === FREE_PLAN_GRANT) return `free-plan-credits:${record.tenantId}`;
+  if (isCarryInvoiceId(record.invoiceId)) return record.invoiceId;
+  return `invoice:${record.invoiceId}`;
+}
+
+/** A time to the second, as allocate's `expires_at` takes it. */
+function toSecond(at: Date): Date {
+  return new Date(Math.floor(at.getTime() / 1000) * 1000);
+}
+
+/**
+ * Could this grant block be the allocation this row asked for, by expiry?
+ * Compared to the second (allocate's `expires_at` is in seconds). A block or
+ * a row that names no expiry cannot be told apart this way, and matches.
+ */
+function sameExpiry(block: GrantBlock, row: Pick<TopUpGrant, "expiresAt">): boolean {
+  if (block.expiresAtMs == null || row.expiresAt == null) return true;
+  return Math.floor(block.expiresAtMs / 1000) === Math.floor(row.expiresAt.getTime() / 1000);
 }
 
 /**

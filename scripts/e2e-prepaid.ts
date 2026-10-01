@@ -47,7 +47,9 @@ const SMTP4DEV = "http://localhost:5080";
 const CB = `https://${env("CHARGEBEE_SITE")}.chargebee.com/api/v2`;
 const RATE = Number(process.env.USD_PER_CREDIT ?? "0.001");
 const ITEM_PRICE = process.env.DEFAULT_ITEM_PRICE_ID ?? "pre-paid-test-v1-INR-Monthly";
-const TOPUP_ITEM = process.env.TOPUP_ITEM_PRICE_ID ?? "token-pack-5m-INR";
+// The run subscribes ITEM_PRICE (an INR plan), and Chargebee refuses a charge
+// in another currency than the subscription's — so the pack is the INR one.
+const TOPUP_ITEM = process.env.TOPUP_ITEM_PRICE_ID_INR ?? "api_token-INR";
 const LITELLM_CONTAINER = "enginos-litellm";
 
 // ── reporting ───────────────────────────────────────────────────────────────

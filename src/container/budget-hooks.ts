@@ -7,6 +7,7 @@
 
 import { getConfig } from "../config/config";
 import { createChargebee, type ChargebeeClient } from "../integrations/chargebee";
+import { currencyCatalog, topUpItemPriceIds } from "../models/currency";
 import { subtractFloorZero } from "../models/decimal";
 import { createGatewayClient } from "../integrations/litellm/client";
 import { createBillingAccountRepository, type BillingAccount } from "../repositories/billing-account.repository";
@@ -32,14 +33,15 @@ export function gatewayBudgetHooks(): BudgetHooks {
   const chargebee = createChargebee();
   const accounts = createBillingAccountRepository();
   const platform = createPlatformRepository();
+  // Every currency's top-up: an unpaid pack is held back whatever it was bought in.
+  const topUps = topUpItemPriceIds(currencyCatalog(config.currencyRules, config.billing));
 
   return budgetHooksFor(
     createGatewayBudget({
       gateway: createGatewayClient(config.litellm),
       usdPerCredit: config.usdPerCredit,
       teamIdFor: (tenantId) => platform.litellmTeamId(tenantId),
-      grantedCreditsFor: async (tenantId) =>
-        paidGrantedCredits(chargebee, await accounts.findByTenantId(tenantId), config.topUpItemPriceId),
+      grantedCreditsFor: async (tenantId) => paidGrantedCredits(chargebee, await accounts.findByTenantId(tenantId), topUps),
     }),
   );
 }
@@ -53,21 +55,25 @@ export function gatewayBudgetHooks(): BudgetHooks {
  * money arrives. Throws on a Chargebee outage, and should: activate() catches
  * it, holds the account `activating` and blocks the team. A cap of zero would
  * look deliberate and silently cut off a paying customer.
+ *
+ * `topUpItemPriceIds` is one top-up item price or every currency's. None
+ * configured: nothing to hold back, and Chargebee is not asked.
  */
 export async function paidGrantedCredits(
   chargebee: Pick<ChargebeeClient, "grantedCredits" | "unpaidTopUpCredits">,
   account: Pick<BillingAccount, "chargebeeCustomerId" | "chargebeeSubscriptionId" | "ledgerUnitId"> | null,
-  topUpItemPriceId: string,
+  topUpItemPriceIds: string | string[],
 ): Promise<string> {
   if (!account?.chargebeeSubscriptionId) return "0";
   const unitId = account.ledgerUnitId ?? undefined;
   const { credits } = await chargebee.grantedCredits(account.chargebeeSubscriptionId, unitId);
-  if (!account.chargebeeCustomerId) return credits;
+  const noTopUps = Array.isArray(topUpItemPriceIds) ? topUpItemPriceIds.length === 0 : topUpItemPriceIds === "";
+  if (!account.chargebeeCustomerId || noTopUps) return credits;
   const unpaid = await chargebee.unpaidTopUpCredits({
     customerId: account.chargebeeCustomerId,
     subscriptionId: account.chargebeeSubscriptionId,
     unitId,
-    itemPriceId: topUpItemPriceId,
+    itemPriceId: topUpItemPriceIds,
   });
   return subtractFloorZero(credits, unpaid);
 }

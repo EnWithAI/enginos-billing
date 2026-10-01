@@ -61,6 +61,29 @@ export function itemPriceIdOf(subscription: SubscriptionLike | null | undefined)
 }
 
 /**
+ * Does this subscription cost NOTHING — so moving the org to another currency
+ * forfeits nothing? Decided from the LIVE Chargebee record, never from
+ * `itemPriceIdOf` alone, which reads only the first item: a ₹0 plan carrying a
+ * paid addon added in the dashboard, or a ₹0 postpaid plan, would look free,
+ * and cancelling it with nothing credited would forfeit the paid term.
+ *
+ * Free means all of: exactly one item, a `plan`, of `amount` 0; `mrr` 0 when
+ * Chargebee gives one; no scheduled change; no invoice due. Anything else —
+ * including a field missing that should say so — is paid, and keeps its
+ * currency.
+ */
+export function isFreeSubscriptionRecord(subscription: Record<string, any> | null | undefined): boolean {
+  if (!subscription) return false;
+  const items = subscription.subscription_items;
+  if (!Array.isArray(items) || items.length !== 1) return false;
+  const item = items[0] as Record<string, unknown> | undefined;
+  if (item?.item_type !== "plan" || item.amount !== 0) return false;
+  if (subscription.mrr != null && subscription.mrr !== 0) return false;
+  if (subscription.has_scheduled_changes === true) return false;
+  return (subscription.due_invoices_count ?? 0) === 0;
+}
+
+/**
  * Pick the usage-billing subscription.
  *
  * `currentId` is what `billing_account` already holds, and it wins whenever it

@@ -24,7 +24,7 @@ Code: `worker/hatchet-worker.ts`, `worker/passes.ts`, `worker/alerts.ts`,
 6. [Ranges and the cursor](#6-ranges-and-the-cursor)
 7. [The ClickHouse query](#7-the-clickhouse-query)
 8. [Charging Chargebee](#8-charging-chargebee)
-9. [Sentry — the four alerts](#9-sentry--the-four-alerts)
+9. [Sentry — the five alerts](#9-sentry--the-five-alerts)
 10. [The daily resync](#10-the-daily-resync)
 11. [When the worker is down](#11-when-the-worker-is-down)
 12. [Running it by hand](#12-running-it-by-hand)
@@ -111,7 +111,8 @@ The `sweep` task, every minute:
 ```mermaid
 flowchart TD
     T([Hatchet fires billing-usage-sync]) --> A
-    A["1 · activatePending()<br/>retry every account held 'activating'<br/>(LiteLLM budget not set yet, or free-plan<br/>credits owed) — grant owed credits, then open it"] --> S
+    A["1 · activatePending()<br/>retry every account held 'activating'<br/>(LiteLLM budget not set yet, or free-plan<br/>credits owed) — grant owed credits, then open it"] --> C
+    C["1b · currencySwitch.advanceOpen()<br/>move every open currency switch on<br/>no step started after 20 s"] --> S
     S["2 · usageSync.runOnce()<br/>bill every org's usage — §4 to §8<br/>no new range after 3 min"] --> G
     G["3 · reopenBlockedActive()<br/>re-open any 'active' account whose team a<br/>racing block closed — stops at 4 min"] --> R
     R([return the sweep summary to Hatchet])
@@ -131,7 +132,31 @@ one pass each.
 
 The order matters. Held accounts are retried **first** — one held for the free
 plan's credits is granted them before it is opened — so one that activates is
-billed in the same tick. The gate check is **last** — one LiteLLM read per
+billed in the same tick. Open currency switches come **next**, before the usage
+sync, so a switch that links its new subscription this minute is billed on it
+this minute; they start no step after 20 s (`SWITCH_DEADLINE_MS`), so a slow
+Chargebee cannot eat the sync's time, and a failure there never stops the
+sweep.
+
+**Step 1b, the currency switches** (`services/currency-switch.service.ts`,
+docs/BILLING-USER-FLOWS.md §4):
+
+- an account left `switching` with no MOVING or LINKED switch (an abort that
+  crashed half-way) is activated again on the subscription it is linked to —
+  `billing.currency_switch.orphan_recovered`;
+- every open switch (`currency_switch` REQUESTED, MOVING or LINKED) is advanced
+  under its lease, from wherever it stopped, re-sending only stored ids;
+- one open for more than 30 minutes is logged `billing.currency_switch.stuck`
+  (the `currency-switch-stuck` alert);
+- with `BILLING_CURRENCY_SWITCH_ENABLED=true`, up to 20 live free-plan accounts
+  whose `currency` is not their `billing_country`'s — and with no switch open or
+  abandoned in the last 30 minutes — get a switch requested
+  (`billing.currency_switch.mismatch`), after `GET /subscriptions/{id}` confirms
+  the plan is free.
+
+While an account is `switching` the usage sync opens no range for it: its usage
+waits, and is billed to the new subscription from the same cursor once the
+switch has linked it. The gate check is **last** — one LiteLLM read per
 active account — so a hung LiteLLM cannot spend the tick's 5 minutes before a
 single capture is sent.
 
@@ -437,10 +462,10 @@ on a definite 404.
 
 ---
 
-## 9. Sentry — the four alerts
+## 9. Sentry — the five alerts
 
 `worker/alerts.ts`. With `SENTRY_DSN` set (it is, in the local `.env`), the
-worker sends **only these four**. Everything else the SDK would send is dropped
+worker sends **only these five**. Everything else the SDK would send is dropped
 in `beforeSend` and stays in the logs.
 
 | Alert (`alert` tag) | Title | Raised when | Comes from |
@@ -449,6 +474,7 @@ in `beforeSend` and stays in the logs.
 | `postgres-write-failed` | Billing worker could not write to Postgres | Postgres is up and refused a write: read-only failover, full disk, revoked grant, bad value | Prisma client. Not a unique violation — the guard indexes refuse duplicates on purpose |
 | `chargebee-down` | Chargebee is down or refusing the billing worker | Usage-sync error metric `billing.sync.unknown_outcome` (5xx, timeout, dropped socket), `.site_disabled` (403), `.unauthenticated` (401), `.stuck` (unknown past `BILLING_MAX_ATTEMPTS`) | The usage sync's own error log line |
 | `chargebee-update-failed` | Usage could not be written to Chargebee | `billing.sync.invalid` (Chargebee refused the request) or `.no_ledger` (subscription has no prepaid ledger) | The usage sync's error log line |
+| `currency-switch-stuck` | A currency switch has been open for more than 30 minutes | `billing.currency_switch.stuck` — a switch holds the org's top-ups (and, while moving, its billing) until it finishes | The worker's `advanceOpen` |
 
 **One issue per alert.** Each has a fixed fingerprint
 (`["billing-worker", <key>]`), so a Chargebee outage hitting 50 orgs every

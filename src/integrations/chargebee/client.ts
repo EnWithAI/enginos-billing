@@ -24,6 +24,7 @@
  */
 
 import { getConfig } from "../../config/config";
+import type { BillingAddress } from "../../models/billing-address";
 import { add, decimal } from "../../models/decimal";
 import {
   CAPTURE_OK,
@@ -32,18 +33,22 @@ import {
   CAPTURE_RETRYABLE,
   NO_LEDGER_CODES,
   classify,
+  isDefiniteRefusal,
   isRateLimited,
   isResourceNotFound,
   isUnreachable,
   type CaptureResult,
   type ChargebeeError,
 } from "./errors";
-import { grantBlockInvoiceRefs, isLiveGrantBlock } from "./ledger";
+import { grantBlockInvoiceRefs, isLiveGrantBlock, isUnsettledTopUpGrant } from "./ledger";
 import type {
+  AddressFields,
   CaptureArgs,
   ChargebeeClient,
   ChargedInvoice,
   ChargebeeOptions,
+  CustomerBillingAddress,
+  CustomerDetails,
   GrantBlock,
   InvoiceDownload,
   InvoiceRef,
@@ -564,6 +569,7 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
           status: String(block.status ?? "available"),
           source: block.grant_source == null ? null : String(block.grant_source),
           createdAtMs: typeof block.created_at === "number" ? block.created_at * 1000 : null,
+          expiresAtMs: typeof block.expires_at === "number" && block.expires_at > 0 ? block.expires_at * 1000 : null,
           invoices: refs.invoices,
           itemPriceId: refs.itemPriceId,
           doneBy: refs.doneBy,
@@ -651,11 +657,13 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     itemPriceId,
     quantity = 1,
     redirectUrl,
+    billingAddress,
   }: {
     customerId: string;
     itemPriceId: string;
     quantity?: number;
     redirectUrl?: string;
+    billingAddress?: AddressFields | null;
   }) {
     const payload = await withRetry(() =>
       request("POST", "/hosted_pages/checkout_new_for_items", {
@@ -666,6 +674,11 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
         // openCheckout it must be left out: a redirect_url makes Chargebee
         // navigate away instead of calling the success callback in place.
         ...(redirectUrl ? { redirect_url: redirectUrl } : {}),
+        // The address the org confirmed, pre-filled. MEASURED: a hosted
+        // page writes the address it collects back onto the customer — one
+        // in another country than the confirmed one would leave invoices
+        // and the currency billing chose disagreeing.
+        ...billingAddressParams(billingAddress),
       }),
     );
     return payload.hosted_page as Record<string, unknown>;
@@ -714,31 +727,53 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
 
   /**
    * Subscribe an existing customer to a plan with no checkout and no card —
-   * only ever the free plan (checkout.provisionFreePlan checks its price is
+   * only ever a free plan (checkout.provisionFreePlan checks its price is
    * zero first). Carries `chargebee-idempotency-key`, so the sign-up hook and a
    * billing page opened in the same moment create ONE subscription: a repeat
    * of the same request inside the key's window is answered with the first.
+   *
+   * With `subscriptionId` the subscription is created under that id (the
+   * currency switch's B: `cs_<switch id>`), which makes "was it created?" a
+   * question with an answer. Chargebee CACHES a 5xx under an idempotency key
+   * for the key's 30 minutes, so a retry cannot learn it; and a refusal of
+   * the id as a duplicate means an earlier attempt landed. Either way the
+   * subscription is read BY THAT ID — never "some subscription on the
+   * price", which could be another's — and returned if it is there.
    */
   async function subscribeCustomer({
     customerId,
     itemPriceId,
     idempotencyKey,
+    subscriptionId,
   }: {
     customerId: string;
     itemPriceId: string;
     idempotencyKey: string;
+    subscriptionId?: string;
   }) {
-    const payload = await withRetry(() =>
-      request(
-        "POST",
-        `/customers/${encodeURIComponent(customerId)}/subscription_for_items`,
-        {
-          "subscription_items[item_price_id][0]": itemPriceId,
-          "subscription_items[quantity][0]": 1,
-        },
-        idempotencyKey,
-      ),
-    );
+    let payload: Record<string, any>;
+    try {
+      payload = await withRetry(() =>
+        request(
+          "POST",
+          `/customers/${encodeURIComponent(customerId)}/subscription_for_items`,
+          {
+            id: subscriptionId,
+            "subscription_items[item_price_id][0]": itemPriceId,
+            "subscription_items[quantity][0]": 1,
+          },
+          idempotencyKey,
+        ),
+      );
+    } catch (err) {
+      const e = err as ChargebeeError;
+      const duplicate = e.apiErrorCode === "duplicate_entry" || e.apiErrorCode === "resource_already_exists";
+      if (subscriptionId && (duplicate || e.retryable)) {
+        const existing = await subscription(subscriptionId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
     return payload.subscription as Record<string, unknown>;
   }
 
@@ -886,8 +921,14 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
    * The customer's top-up invoices Chargebee has not collected, oldest first.
    * `payment_due` while it retries the card; `not_paid` once its retries ran
    * out. Either is still owed.
+   *
+   * `itemPriceIds` is one top-up or several — every currency's, for the
+   * one-owed-at-a-time rule: an INR pack left unpaid is still owed after the
+   * org has moved to USD. None asks Chargebee nothing.
    */
-  async function unpaidInvoicesFor(customerId: string, itemPriceId: string): Promise<UnpaidInvoice[]> {
+  async function unpaidInvoicesFor(customerId: string, itemPriceIds: string | string[]): Promise<UnpaidInvoice[]> {
+    const ids = idList(itemPriceIds);
+    if (ids.length === 0) return [];
     const payload = await withRetry(() =>
       request("GET", "/invoices", {
         "customer_id[is]": customerId,
@@ -898,7 +939,7 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     );
     return (payload.list ?? [])
       .map((entry: Record<string, any>) => entry.invoice)
-      .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, itemPriceId))
+      .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, ids))
       .map((invoice: Record<string, any>) => ({
         id: String(invoice.id),
         status: String(invoice.status),
@@ -921,7 +962,10 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
    * invoice is paid. The live blocks of every top-up invoice still owed
    * (`payment_due`), abandoned by dunning (`not_paid`), voided or `pending`
    * are summed here, over the same page of blocks `grantedCredits` counts.
-   * One call when nothing is unsettled — the usual case.
+   * One call when nothing is unsettled — the usual case — and none when no
+   * top-up is configured at all. `itemPriceId` may name every currency's
+   * top-up: a pack's block stays on the subscription it was charged to, and
+   * is held back whatever currency it was bought in.
    */
   async function unpaidTopUpCredits({
     customerId,
@@ -933,22 +977,12 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     customerId: string;
     subscriptionId: string;
     unitId?: string;
-    itemPriceId: string;
+    itemPriceId: string | string[];
     now?: number;
   }): Promise<string> {
-    const invoices = await withRetry(() =>
-      request("GET", "/invoices", {
-        "customer_id[is]": customerId,
-        "status[in]": '["payment_due","not_paid","voided","pending"]',
-        limit: 100,
-      }),
-    );
-    const unsettled = new Set<string>(
-      (invoices.list ?? [])
-        .map((entry: Record<string, any>) => entry.invoice)
-        .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, itemPriceId))
-        .map((invoice: Record<string, any>) => String(invoice.id)),
-    );
+    const ids = idList(itemPriceId);
+    if (ids.length === 0) return "0";
+    const unsettled = new Set(await unsettledTopUpInvoiceIds(customerId, ids));
     if (unsettled.size === 0) return "0";
 
     const payload = await withRetry(() =>
@@ -959,24 +993,57 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
       .filter((block: Record<string, any> | undefined) => block != null)
       .filter((block: Record<string, any>) => !unitId || block.unit_id === unitId)
       .filter((block: Record<string, any>) => isLiveGrantBlock(block, now))
-      .filter((block: Record<string, any>) => {
-        const refs = grantBlockInvoiceRefs(block);
-        return (
-          refs.itemPriceId === itemPriceId &&
-          refs.invoices.some((ref) => ref.invoiceId != null && unsettled.has(ref.invoiceId))
-        );
-      });
+      .filter((block: Record<string, any>) => isUnsettledTopUpGrant(grantBlockInvoiceRefs(block), unsettled, ids));
     return add("0", ...held.map((block) => String(block.granted_amount ?? 0)));
   }
 
   /**
-   * Paid invoices for a customer containing a given item price.
+   * The ids of the customer's top-up invoices that are not settled: owed
+   * (`payment_due`), abandoned by dunning (`not_paid`), `voided` or `pending`
+   * — for any of these item prices. One read, the first 100; none asked for
+   * none configured.
+   */
+  async function unsettledTopUpInvoiceIds(customerId: string, itemPriceIds: string | string[]): Promise<string[]> {
+    return (await unsettledTopUpInvoices(customerId, itemPriceIds)).map((invoice) => invoice.id);
+  }
+
+  /**
+   * The same read as unsettledTopUpInvoiceIds, with each invoice's status —
+   * for a caller that must tell them apart: an owed invoice is the customer's
+   * to pay, a `pending` one may still become payable, a `voided` one never
+   * will. A currency switch waits on the first two (the org pays, or it
+   * settles), and lets the third through.
+   */
+  async function unsettledTopUpInvoices(
+    customerId: string,
+    itemPriceIds: string | string[],
+  ): Promise<Array<{ id: string; status: string }>> {
+    const ids = idList(itemPriceIds);
+    if (ids.length === 0) return [];
+    const invoices = await withRetry(() =>
+      request("GET", "/invoices", {
+        "customer_id[is]": customerId,
+        "status[in]": '["payment_due","not_paid","voided","pending"]',
+        limit: 100,
+      }),
+    );
+    return (invoices.list ?? [])
+      .map((entry: Record<string, any>) => entry.invoice)
+      .filter((invoice: Record<string, any> | undefined) => hasLineFor(invoice, ids))
+      .map((invoice: Record<string, any>) => ({ id: String(invoice.id), status: String(invoice.status) }));
+  }
+
+  /**
+   * Paid invoices for a customer with a line for any of these item prices.
    *
    * This is the proof of payment a top-up needs. The invoice id becomes the
    * ledger entry's source_ref, so one paid invoice can grant credits exactly
-   * once no matter how often the sync runs.
+   * once no matter how often the sync runs. Several ids — every currency's
+   * top-up — are one read, filtered here; none asks Chargebee nothing.
    */
-  async function paidInvoicesFor(customerId: string, itemPriceId: string) {
+  async function paidInvoicesFor(customerId: string, itemPriceIds: string | string[]) {
+    const ids = idList(itemPriceIds);
+    if (ids.length === 0) return [];
     const payload = await withRetry(() =>
       request("GET", "/invoices", {
         "customer_id[is]": customerId,
@@ -991,9 +1058,7 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     return (payload.list ?? [])
       .map((entry: Record<string, any>) => entry.invoice)
       .filter(Boolean)
-      .filter((inv: any) =>
-        (inv.line_items ?? []).some((li: any) => li.entity_id === itemPriceId),
-      );
+      .filter((inv: Record<string, any>) => hasLineFor(inv, ids));
   }
 
   /**
@@ -1179,13 +1244,105 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
   }
 
   /**
-   * One customer. Null only for a definite 404 `resource_not_found`.
+   * End a subscription now: `POST /subscriptions/{id}/cancel_for_items`.
    *
-   * Asked for one reason: to tell a subscription that was DELETED (its
-   * customer is still there) from a site or key that is simply the wrong one
-   * (nothing is there) before a missing subscription is taken as an ended one.
+   * Used for one thing — the currency switch's old subscription, once billing
+   * has moved off it and its credits are gone — so everything Chargebee would
+   * otherwise decide from the SITE's settings is said here:
+   *
+   *   end_of_term=false        now. A `non_renewing` subscription still counts
+   *                            as active, and billing would stay on it until
+   *                            its term ended (a year, on the free plan).
+   *   credit_option_for_current_term_charges=none
+   *                            no credit note: one in INR cannot pay a USD
+   *                            invoice, and the free plan charged nothing.
+   *   unbilled_charges_option=delete
+   *   account_receivables_handling=no_action
+   *                            an unpaid top-up stays owed, and collectable,
+   *                            exactly as it was.
+   *   refundable_credits_handling=no_action
+   *
+   * Retried like any call (a cancel is safe to repeat), and a REFUSAL because
+   * it is already cancelled — a retry whose first answer was lost, or a person
+   * in the dashboard — is success: on a definite 4xx the subscription is read,
+   * and returned if it says `cancelled`. One that is GONE (a definite 404,
+   * deleted in the dashboard or by a test-site cleanup) is as ended as a
+   * cancelled one, and answers `{ id, status: "cancelled" }`: waiting for it
+   * to cancel would wait for ever. Anything else is thrown.
    */
-  async function customer(id: string): Promise<{ id: string } | null> {
+  async function cancelSubscription(subscriptionId: string): Promise<Record<string, unknown>> {
+    let payload: Record<string, any>;
+    try {
+      payload = await withRetry(() =>
+        request("POST", `/subscriptions/${encodeURIComponent(subscriptionId)}/cancel_for_items`, {
+          end_of_term: false,
+          credit_option_for_current_term_charges: "none",
+          unbilled_charges_option: "delete",
+          account_receivables_handling: "no_action",
+          refundable_credits_handling: "no_action",
+        }),
+      );
+    } catch (err) {
+      if (!isDefiniteRefusal(err as ChargebeeError)) throw err;
+      const current = await subscription(subscriptionId);
+      if (!current) return { id: subscriptionId, status: "cancelled" };
+      if (current.status === "cancelled" || current.status === "non_renewing") return current;
+      // MEASURED 2026-10-01 on the USD free plan, whose item carries a Credit
+      // Grant: "You cannot cancel a subscription with items having credit unit
+      // grants immediately or mid-term. You can schedule the updates during
+      // renewal." So it is cancelled at its term end instead. That is safe for
+      // the one caller: billing has already moved off this subscription and
+      // emptied it, and the subscription choice keeps the account on the one
+      // it is linked to while this one sits `non_renewing` (models/subscription.ts).
+      return scheduleCancellation(subscriptionId, err as ChargebeeError);
+    }
+    if (!payload.subscription) {
+      throw Object.assign(new Error(`Chargebee cancel of ${subscriptionId} answered with no subscription`), {
+        retryable: true,
+      }) as ChargebeeError;
+    }
+    return payload.subscription as Record<string, unknown>;
+  }
+
+  /**
+   * Cancel at the end of the current term — the fallback when Chargebee refuses
+   * an immediate cancel (a plan whose item carries a Credit Grant). Answers the
+   * subscription, now `non_renewing`; a refusal of this too throws the ORIGINAL
+   * refusal, which names why the immediate cancel failed.
+   */
+  async function scheduleCancellation(subscriptionId: string, original: ChargebeeError): Promise<Record<string, unknown>> {
+    let payload: Record<string, any>;
+    try {
+      payload = await withRetry(() =>
+        request("POST", `/subscriptions/${encodeURIComponent(subscriptionId)}/cancel_for_items`, { end_of_term: true }),
+      );
+    } catch (err) {
+      if (!isDefiniteRefusal(err as ChargebeeError)) throw err;
+      throw original;
+    }
+    if (!payload.subscription) {
+      throw Object.assign(new Error(`Chargebee scheduled cancel of ${subscriptionId} answered with no subscription`), {
+        retryable: true,
+      }) as ChargebeeError;
+    }
+    log.warn?.(
+      { metric: "billing.subscription.cancel_scheduled", subscriptionId, reason: original.message },
+      "Chargebee refused an immediate cancel; the subscription is cancelled at its term end instead",
+    );
+    return payload.subscription as Record<string, unknown>;
+  }
+
+  /**
+   * One customer, with the billing address Chargebee holds for it. Null only
+   * for a definite 404 `resource_not_found`.
+   *
+   * Asked for two reasons: to tell a subscription that was DELETED (its
+   * customer is still there) from a site or key that is simply the wrong one
+   * (nothing is there) before a missing subscription is taken as an ended one
+   * — which reads only whether it is there — and to show the billing page the
+   * address on file, and pre-fill its form with it.
+   */
+  async function customer(id: string): Promise<CustomerDetails | null> {
     let payload: Record<string, any>;
     try {
       payload = await withRetry(() => request("GET", `/customers/${encodeURIComponent(id)}`));
@@ -1198,7 +1355,94 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
         retryable: true,
       }) as ChargebeeError;
     }
-    return { id: String(payload.customer.id ?? id) };
+    return toCustomerDetails(payload.customer, id);
+  }
+
+  /**
+   * Set the customer's billing address: `POST /customers/{id}/update_billing_info`.
+   *
+   * What invoices print, and what billing's currency decision rests on — the
+   * address is validated before it gets here (models/billing-address.ts).
+   *
+   * Chargebee REPLACES on this call: "if you do not include a parameter in
+   * the request, Chargebee removes the corresponding attribute" — MEASURED on
+   * the test site, the tax registration and the address's email, phone and
+   * line3 included. So the customer is read first, and what billing's form
+   * does not own — vat_number, vat_number_prefix, registered_for_gst,
+   * business_customer_without_vat_number, billing_address email, phone and
+   * line3 — is sent back exactly as it was: an Indian business's GSTIN, or an
+   * EU business's VAT number and with it reverse charge, would otherwise be
+   * deleted by an address edit. What the form DOES own is sent when given and
+   * left out when not — which, on this call, is how a cleared field is
+   * cleared.
+   *
+   * A TAX REGISTRATION BELONGS TO ITS COUNTRY (A28). A GSTIN means nothing
+   * for an address in the US, nor an EU VAT number for one in India — and
+   * Chargebee may refuse one there, which the org could not correct from the
+   * form. So the four tax fields are sent back only while the address stays
+   * in the country it was in; an address moved to another country leaves
+   * them out, and Chargebee's replace clears them. Which ones were there is
+   * logged — never their values — for a person to set the new country's.
+   * The address's email, phone and line3 are sent back either way.
+   *
+   * Retried like any call: setting the same address twice is the same
+   * address. A refusal — a country or state Chargebee does not accept — is a
+   * 4xx the caller turns into a 400 naming Chargebee's reason. Chargebee's own
+   * answer is mapped, so the caller has the address as Chargebee now holds it.
+   */
+  async function updateBillingInfo(customerId: string, address: BillingAddress): Promise<CustomerDetails> {
+    const kept = await customer(customerId);
+    const from = kept?.billingAddress?.country ?? null;
+    const tax = {
+      vat_number: kept?.vatNumber,
+      vat_number_prefix: kept?.vatNumberPrefix,
+      registered_for_gst: kept?.registeredForGst,
+      business_customer_without_vat_number: kept?.businessCustomerWithoutVatNumber,
+    };
+    const sameCountry = from === address.country;
+    const cleared = sameCountry ? [] : Object.entries(tax).filter(([, value]) => value != null).map(([field]) => field);
+    const payload = await withRetry(() =>
+      request("POST", `/customers/${encodeURIComponent(customerId)}/update_billing_info`, {
+        ...billingAddressParams(address),
+        "billing_address[email]": kept?.billingAddress?.email,
+        "billing_address[phone]": kept?.billingAddress?.phone,
+        "billing_address[line3]": kept?.billingAddress?.line3,
+        ...(sameCountry ? tax : {}),
+      }),
+    );
+    if (cleared.length > 0) {
+      log.warn?.(
+        { metric: "billing.address.tax_registration_cleared", customerId, from, to: address.country, fields: cleared },
+        "The billing address moved to another country; its tax registration was for the old one and is cleared. Set the new country's in Chargebee if the customer has one",
+      );
+    }
+    if (!payload.customer) {
+      throw Object.assign(new Error(`Chargebee billing address update for ${customerId} answered with no customer`), {
+        retryable: true,
+      }) as ChargebeeError;
+    }
+    return toCustomerDetails(payload.customer, customerId);
+  }
+
+  /**
+   * The currency Chargebee routes this customer's payments in:
+   * `POST /customers/{id}` with `preferred_currency_code`, and nothing else
+   * (an update, unlike update_billing_info, leaves what it is not sent).
+   * MEASURED: every customer on the test site prefers INR — the site's first
+   * currency — and Chargebee picks the payment gateway by it, so a USD charge
+   * for a customer still preferring INR may go through the wrong one. Set
+   * whenever billing decides the currency of an org's subscription.
+   */
+  async function setPreferredCurrency(customerId: string, currencyCode: string): Promise<CustomerDetails> {
+    const payload = await withRetry(() =>
+      request("POST", `/customers/${encodeURIComponent(customerId)}`, { preferred_currency_code: currencyCode }),
+    );
+    if (!payload.customer) {
+      throw Object.assign(new Error(`Chargebee preferred currency update for ${customerId} answered with no customer`), {
+        retryable: true,
+      }) as ChargebeeError;
+    }
+    return toCustomerDetails(payload.customer, customerId);
   }
 
   /**
@@ -1232,7 +1476,10 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     ledgerOperations,
     ledgerOperation,
     subscription,
+    cancelSubscription,
     customer,
+    updateBillingInfo,
+    setPreferredCurrency,
     subscriptionIdsOf,
     itemPrice,
     activeSubscriptions,
@@ -1243,6 +1490,8 @@ export function createChargebee(options: ChargebeeOptions = {}): ChargebeeClient
     paidInvoicesFor,
     unpaidInvoicesFor,
     unpaidTopUpCredits,
+    unsettledTopUpInvoiceIds,
+    unsettledTopUpInvoices,
     transactionsPage,
     paymentSource,
     invoice,
@@ -1265,8 +1514,74 @@ function toChargedInvoice(raw: unknown): ChargedInvoice {
   };
 }
 
-function hasLineFor(invoice: Record<string, any> | undefined, itemPriceId: string): boolean {
-  return (invoice?.line_items ?? []).some((line: Record<string, any>) => line?.entity_id === itemPriceId);
+/** Does the invoice carry a line for any of these item prices? */
+function hasLineFor(invoice: Record<string, any> | undefined, itemPriceIds: string[]): boolean {
+  return (invoice?.line_items ?? []).some((line: Record<string, any>) => itemPriceIds.includes(line?.entity_id));
+}
+
+/** One item price id or several, as a list. Empty ids are no ids. */
+function idList(itemPriceIds: string | string[]): string[] {
+  return (typeof itemPriceIds === "string" ? [itemPriceIds] : itemPriceIds).filter((id) => id !== "");
+}
+
+/**
+ * A customer as billing reads it. `billing_address` is left out entirely by
+ * Chargebee when none was ever set, and any field of it may be; both are null
+ * here rather than empty strings, so "not given" stays distinguishable.
+ */
+function toCustomerDetails(raw: Record<string, any>, fallbackId: string): CustomerDetails {
+  const address = raw.billing_address as Record<string, any> | undefined;
+  const field = (key: string) => (address?.[key] == null || address[key] === "" ? null : String(address[key]));
+  const text = (value: unknown) => (value == null || value === "" ? null : String(value));
+  const flag = (value: unknown) => (typeof value === "boolean" ? value : null);
+  const billingAddress: CustomerBillingAddress | null =
+    address != null && typeof address === "object"
+      ? {
+          firstName: field("first_name"),
+          lastName: field("last_name"),
+          company: field("company"),
+          line1: field("line1"),
+          line2: field("line2"),
+          city: field("city"),
+          state: field("state"),
+          stateCode: field("state_code"),
+          zip: field("zip"),
+          country: field("country"),
+          email: field("email"),
+          phone: field("phone"),
+          line3: field("line3"),
+        }
+      : null;
+  return {
+    id: String(raw.id ?? fallbackId),
+    billingAddress,
+    preferredCurrencyCode: text(raw.preferred_currency_code),
+    vatNumber: text(raw.vat_number),
+    vatNumberPrefix: text(raw.vat_number_prefix),
+    registeredForGst: flag(raw.registered_for_gst),
+    businessCustomerWithoutVatNumber: flag(raw.business_customer_without_vat_number),
+  };
+}
+
+/**
+ * An address as `billing_address[...]` form parameters: the fields billing's
+ * form owns, each sent only when it has a value (null and undefined are left
+ * out by request()).
+ */
+function billingAddressParams(address: AddressFields | null | undefined): Record<string, string | null | undefined> {
+  if (!address) return {};
+  return {
+    "billing_address[first_name]": address.firstName,
+    "billing_address[last_name]": address.lastName,
+    "billing_address[company]": address.company,
+    "billing_address[line1]": address.line1,
+    "billing_address[line2]": address.line2,
+    "billing_address[city]": address.city,
+    "billing_address[state]": address.state,
+    "billing_address[state_code]": address.stateCode,
+    "billing_address[zip]": address.zip,
+    "billing_address[country]": address.country,
+  };
 }
 
 function fromUnixSeconds(value: unknown): Date | null {

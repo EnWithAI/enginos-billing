@@ -431,17 +431,24 @@ describe("C06 — two workers run at the same time", () => {
     oneEvent(r);
     r.at(2);
 
-    // Worker 1 stalls after its INSERT, before its PROCESSING write.
+    // Worker 1 stalls after its INSERT, before its claim. The claim is a
+    // transaction whose FIRST statement takes the account row's lock (the
+    // write of `updated_at` alone — chargebee-sync.repository.ts claim), so the
+    // stall is just before it: a worker stalled INSIDE the claim would hold
+    // that lock, and worker 2 would wait for it, as in Postgres (pinned in
+    // currency-repositories.test.ts). What this pins is the race before.
     const beforeProcessing = new Gate();
+    const isClaimLock = (args: any) =>
+      args?.data?.updatedAt instanceof Date && Object.keys(args.data).length === 1 && "tenantId" in (args.where ?? {});
     const w1Prisma = new Proxy(r.prisma, {
       get(target: any, key: string) {
-        if (key !== "chargebeeSync") return target[key];
-        return new Proxy(target.chargebeeSync, {
-          get(sync: any, method: string) {
-            if (method !== "updateMany") return sync[method];
+        if (key !== "billingAccount") return target[key];
+        return new Proxy(target.billingAccount, {
+          get(account: any, method: string) {
+            if (method !== "updateMany") return account[method];
             return async (args: any) => {
-              if (args.data?.status === SYNC.PROCESSING) await beforeProcessing.pass();
-              return sync.updateMany(args);
+              if (isClaimLock(args)) await beforeProcessing.pass();
+              return account.updateMany(args);
             };
           },
         });

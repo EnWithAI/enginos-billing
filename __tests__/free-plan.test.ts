@@ -18,7 +18,7 @@ import { createBillingOverviewService } from "@/services/billing-overview.servic
 import { createCheckoutService } from "@/services/checkout.service";
 import { AppError } from "@/shared/errors";
 
-import { TENANT, makeFakePrisma, quietLogger } from "./harness";
+import { TENANT, makeFakePrisma, quietLogger, testCatalog } from "./harness";
 
 const FREE = "free-yearly";
 
@@ -48,13 +48,12 @@ function rig(
     accounts,
     itemPriceIds: opts.itemPriceIds ?? [FREE, "paid-monthly"],
     defaultItemPriceId: "paid-monthly",
-    freeItemPriceId: opts.freeItemPriceId ?? FREE,
+    // The free plan and the pack in the default currency (testCatalog).
+    catalog: testCatalog({ free: opts.freeItemPriceId ?? FREE, topUp: "pack", credits: "50" }),
     // On unless a test says otherwise: most of this file is about the org the
     // free plan IS for. The production default is off (config.ts).
     freePlanDefault: opts.freePlanDefault ?? true,
     checkoutRedirectUrl: "https://app.test/organization/billing?from=checkout",
-    topUpItemPriceId: "pack",
-    topUpCredits: "50",
     logger: quietLogger,
     sleep,
   });
@@ -71,14 +70,16 @@ async function refusal(p: Promise<unknown>) {
 }
 
 describe("putting an org on the free plan", () => {
-  it("subscribes an org with no subscription — no card — under a per-tenant idempotency key, then links it", async () => {
+  it("subscribes an org with no subscription — no card — under an idempotency key per tenant and currency, then links it", async () => {
     const r = rig();
 
     expect(await r.checkout.provisionFreePlan(TENANT)).toEqual({ status: "subscribed", subscriptionId: "sub_free" });
+    // The currency is in the key: the free plan of one currency must never
+    // replay — or be refused under — the key another currency's create used.
     expect(r.chargebee.subscribeCustomer).toHaveBeenCalledWith({
       customerId: TENANT,
       itemPriceId: FREE,
-      idempotencyKey: `free-plan:${TENANT}`,
+      idempotencyKey: `free-plan:${TENANT}:INR`,
     });
     expect(r.accountService.syncFromChargebee).toHaveBeenCalledWith(TENANT);
   });
@@ -218,7 +219,8 @@ describe("which org the free plan is for", () => {
 
   it("checkout sells the paid plans to an org the free plan is not for — and never the free plan itself", async () => {
     const checkoutPage = vi.fn(async () => ({ id: "hp_1", url: "https://cb.test/hp_1" }));
-    const r = rig({ checkoutPage: checkoutPage as never }, {}, { freePlanDefault: false });
+    // An org that has confirmed an address in the plans' currency (INR).
+    const r = rig({ checkoutPage: checkoutPage as never }, { billingCountry: "IN" }, { freePlanDefault: false });
 
     const err = await refusal(r.checkout.startSubscription(TENANT, FREE));
     expect([err.kind, err.code]).toEqual(["invalid", "plan-not-offered"]);
@@ -229,6 +231,7 @@ describe("which org the free plan is for", () => {
       customerId: TENANT,
       itemPriceId: "paid-monthly",
       redirectUrl: "https://app.test/organization/billing?from=checkout",
+      billingAddress: { country: "IN" },
     });
   });
 
@@ -282,7 +285,7 @@ describe("the billing page as the fallback", () => {
       syncs: createChargebeeSyncRepository(prisma as never),
       plansOffered: async () => [plan(FREE), plan("paid-monthly")],
       autoSubscribe,
-      freeItemPriceId: FREE,
+      catalog: testCatalog({ free: FREE }),
       freePlanDefault,
       logger: quietLogger,
     });
@@ -295,7 +298,8 @@ describe("the billing page as the fallback", () => {
 
   it("offers an org the free plan is not for the paid plans, and does not try to subscribe it", async () => {
     const autoSubscribe = vi.fn(async () => undefined);
-    const { service } = overview({ chargebeeSubscriptionId: null }, autoSubscribe, false);
+    // With its billing address confirmed: the plans are those of its country's currency (INR here).
+    const { service } = overview({ chargebeeSubscriptionId: null, billingCountry: "IN" }, autoSubscribe, false);
 
     const page = await service.overview(TENANT);
 
@@ -306,7 +310,7 @@ describe("the billing page as the fallback", () => {
 
   it("still lists the free plan for an org already on it, so the page can name its plan", async () => {
     const { service } = overview(
-      { chargebeeSubscriptionId: "sub_free", chargebeeItemPriceId: FREE, status: "active", freePlan: false },
+      { chargebeeSubscriptionId: "sub_free", chargebeeItemPriceId: FREE, status: "active", freePlan: false, billingCountry: "IN" },
       vi.fn(async () => undefined),
       true,
     );

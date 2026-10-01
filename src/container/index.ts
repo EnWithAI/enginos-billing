@@ -15,12 +15,23 @@
 import { getConfig } from "../config/config";
 import { createChargebee } from "../integrations/chargebee";
 import { createUsageSource } from "../integrations/clickhouse/usage-source";
+import {
+  currencyCatalog,
+  freeItemPriceIds,
+  topUpItemPriceIds,
+  topUpsOf,
+  type TopUpSettingsForCurrency,
+} from "../models/currency";
 import { createBillingAccountRepository } from "../repositories/billing-account.repository";
 import { createChargebeeSyncRepository } from "../repositories/chargebee-sync.repository";
+import { createCurrencySwitchRepository } from "../repositories/currency-switch.repository";
 import { createPlatformRepository } from "../repositories/platform.repository";
+import { createTopUpGrantRepository } from "../repositories/topup-grant.repository";
 import { createAccountService } from "../services/account.service";
+import { createBillingAddressService } from "../services/billing-address.service";
 import { createBillingOverviewService } from "../services/billing-overview.service";
 import { createCheckoutService } from "../services/checkout.service";
+import { createCurrencySwitchService } from "../services/currency-switch.service";
 import { createInvoiceService } from "../services/invoice.service";
 import { describePlans, describeTopUp } from "../services/plan-catalog.service";
 import { createPortalService } from "../services/portal.service";
@@ -35,17 +46,23 @@ export function createServices() {
   const chargebee = createChargebee();
   const accounts = createBillingAccountRepository();
   const syncs = createChargebeeSyncRepository();
+  const switches = createCurrencySwitchRepository();
+  const topUps = createTopUpGrantRepository();
   const platform = createPlatformRepository();
   const budget = gatewayBudgetHooks();
+  // What billing sells in each currency, and the rule that picks one — the
+  // one place configuration becomes the catalog every service reads.
+  const catalog = currencyCatalog(config.currencyRules, config.billing);
 
   const accountService = createAccountService({
     chargebee,
     accounts,
     platform,
+    topUps,
     usdPerCredit: config.usdPerCredit,
     billingItemPriceIds: config.itemPriceIds,
-    topUpItemPriceId: config.topUpItemPriceId,
-    freeItemPriceId: config.freeItemPriceId,
+    topUpItemPriceIds: topUpItemPriceIds(catalog),
+    freeItemPriceIds: freeItemPriceIds(catalog),
     freePlanCredits: config.freePlanCredits,
     freePlanCreditUnit: config.freePlanCreditUnit,
     ...budget,
@@ -53,19 +70,16 @@ export function createServices() {
 
   const billingPage = `${config.appUrl.replace(/\/+$/, "")}/organization/billing`;
 
-  // One description of the top-up for the page AND for the charge: the limits
-  // the page offers are the ones checkout enforces.
-  const topUpOffer = () =>
-    describeTopUp(
-      {
-        itemPriceId: config.topUpItemPriceId,
-        presetAmounts: config.topUpAmounts,
-        minAmount: config.topUpMinAmount,
-        maxAmount: config.topUpMaxAmount,
-      },
-      chargebee,
-      { ttlMs: config.planCacheTtlMs },
-    );
+  // One description of a currency's top-up for the page AND for the charge:
+  // the limits the page offers are the ones checkout enforces.
+  const topUpOffer = (topUp: TopUpSettingsForCurrency) =>
+    describeTopUp(topUp, chargebee, { ttlMs: config.planCacheTtlMs });
+  // A plan's currency, from the same cached catalogue read the page lists the
+  // plans from — so checkout refuses exactly the plans the page did not offer.
+  const planCurrency = async (itemPriceId: string) => {
+    const [plan] = await describePlans([itemPriceId], chargebee, { ttlMs: config.planCacheTtlMs });
+    return plan?.resolved ? plan.currencyCode : null;
+  };
 
   const checkout = createCheckoutService({
     chargebee,
@@ -73,15 +87,43 @@ export function createServices() {
     accounts,
     itemPriceIds: config.itemPriceIds,
     defaultItemPriceId: config.defaultItemPriceId,
-    freeItemPriceId: config.freeItemPriceId,
+    catalog,
     freePlanDefault: config.freePlanDefault,
     // The page reads `from=checkout` (Chargebee appends `id` and `state`) and
     // pulls the new subscription at once, rather than waiting on the webhook.
     checkoutRedirectUrl: `${billingPage}?from=checkout`,
-    topUpItemPriceId: config.topUpItemPriceId,
-    topUpCredits: config.topUpCredits,
     topUpOffer,
     topUpChargebeeGrants: config.topUpChargebeeGrants,
+    switches,
+    planCurrency,
+  });
+
+  // The currency switch (services/currency-switch.service.ts). Inline — the
+  // address sync — it runs on a client bounded by the request's remaining
+  // time, one attempt per call (A3); the worker passes its alerting logger.
+  const currencySwitch = (logger?: Logger) =>
+    createCurrencySwitchService({
+      chargebee,
+      chargebeeFor: (timeoutMs) => createChargebee({ timeoutMs, maxAttempts: 1 }),
+      accountService,
+      accounts,
+      switches,
+      topUps,
+      catalog,
+      applyTopUps: (tenantId) => checkout.applyTopUps(tenantId),
+      currencySwitchEnabled: config.currencySwitchEnabled,
+      logger,
+    });
+
+  const billingAddress = createBillingAddressService({
+    chargebee,
+    accountService,
+    accounts,
+    switches,
+    catalog,
+    currencySwitchEnabled: config.currencySwitchEnabled,
+    switchInlineMs: config.switchInlineMs,
+    currencySwitch: currencySwitch(),
   });
 
   return {
@@ -96,15 +138,32 @@ export function createServices() {
       syncs,
       plansOffered: () => describePlans(config.itemPriceIds, chargebee, { ttlMs: config.planCacheTtlMs }),
       topUpOffer,
-      autoSubscribe: config.freeItemPriceId ? (tenantId) => checkout.provisionFreePlan(tenantId) : undefined,
-      freeItemPriceId: config.freeItemPriceId,
+      autoSubscribe: freeItemPriceIds(catalog).length > 0 ? (tenantId) => checkout.provisionFreePlan(tenantId) : undefined,
+      catalog,
+      switches,
+      currencySwitchEnabled: config.currencySwitchEnabled,
+      addressEditEnabled: config.addressEditEnabled,
       freePlanDefault: config.freePlanDefault,
-      topUpItemPriceId: config.topUpItemPriceId,
     }),
 
     checkout,
 
-    portal: createPortalService({ chargebee, accounts, redirectUrl: config.appUrl, enabled: config.portalEnabled }),
+    billingAddress,
+
+    /** Built on demand, like usageSync: the worker advances every open switch each minute with its alerting logger. */
+    currencySwitch,
+
+    // The billing page opens Chargebee's billing-address editor on this
+    // portal's session (A29) — before the org has subscribed, too — so a
+    // tenant with no customer yet gets one, as checkout would make it.
+    portal: createPortalService({
+      chargebee,
+      accounts,
+      redirectUrl: config.appUrl,
+      enabled: config.portalEnabled,
+      addressEditEnabled: config.addressEditEnabled,
+      customerFor: (tenantId) => checkout.customerFor(tenantId),
+    }),
 
     paymentMethod: createPaymentMethodService({
       chargebee,
@@ -117,11 +176,13 @@ export function createServices() {
     webhooks: createWebhookService({
       accountService,
       accounts,
-      topUp: {
-        itemPriceId: config.topUpItemPriceId,
-        creditsPerUnit: config.topUpCredits,
-        chargebeeGrants: config.topUpChargebeeGrants,
-      },
+      topUps: topUpsOf(catalog).map((topUp) => ({
+        itemPriceId: topUp.itemPriceId,
+        creditsPerUnit: topUp.credits,
+        chargebeeGrants: topUp.chargebeeGrants,
+      })),
+      chargebeeGrants: config.topUpChargebeeGrants,
+      billingAddress,
     }),
 
     /**

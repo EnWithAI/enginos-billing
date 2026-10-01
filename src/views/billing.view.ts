@@ -4,12 +4,15 @@
  * ONE SHAPE for every state, so the page never has to guess which fields
  * exist: an unlinked tenant gets the same keys with empty values. Returning 404
  * for "no billing row" once left `site` null, so Chargebee.js never loaded and
- * the Subscribe button stayed disabled.
+ * the Subscribe button stayed disabled. That includes the billing address and
+ * currency keys (§1.1): the page asks for the address first in EVERY state —
+ * unlinked, activating, switching or linked — and a key missing from one of
+ * them would read, to the page, as a billing too old to have it (A26).
  */
 
 import type { Transaction } from "../integrations/chargebee";
 import { ACCOUNT } from "../models/account-status";
-import type { BillingOverview, LastSync, SubscriptionDetails } from "../services/billing-overview.service";
+import type { BillingOverview, CurrencyFacts, LastSync, SubscriptionDetails } from "../services/billing-overview.service";
 import type { TopUpOffer } from "../services/plan-catalog.service";
 
 export interface BillingViewConfig {
@@ -24,6 +27,7 @@ export interface BillingViewConfig {
 const NO_CREDIT_FIGURES = { granted: "0", allocated: "0", consumed: "0", current: "0" };
 
 export function renderBillingOverview(overview: BillingOverview, config: BillingViewConfig) {
+  const currency = renderCurrency(overview);
   const empty = {
     site: config.site,
     plansOffered: overview.plansOffered,
@@ -43,6 +47,7 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
     // Only a linked subscription can be topped up.
     topUp: null as TopUpOffer | null,
     unpaidTopUps: [] as unknown[] | null,
+    ...currency,
   };
 
   if (overview.kind === "unlinked") return empty;
@@ -51,13 +56,15 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
   const plan = { itemPriceId: account.chargebeeItemPriceId ?? config.defaultItemPriceId };
   const term = { start: account.currentTermStart, end: account.currentTermEnd };
 
-  // Paid, but the gateway does not hold the budget yet. Showing the credits
-  // would promise service that is blocked; they appear once it turns active.
-  if (overview.kind === "activating") {
+  // Paid, but the gateway does not hold the budget yet — or a currency switch
+  // is moving the credits to a subscription in another currency. Showing the
+  // credits would promise service that is blocked, or figures half-way
+  // between two subscriptions; they appear once it turns active.
+  if (overview.kind === "activating" || overview.kind === "switching") {
     return {
       ...empty,
       plan,
-      status: ACCOUNT.ACTIVATING,
+      status: overview.kind === "switching" ? ACCOUNT.SWITCHING : ACCOUNT.ACTIVATING,
       term,
       credits: { unit: account.ledgerUnitId, ...NO_CREDIT_FIGURES },
     };
@@ -88,6 +95,35 @@ export function renderBillingOverview(overview: BillingOverview, config: Billing
         currencyCode: invoice.currencyCode,
         nextRetryAt: invoice.nextRetryAt,
       })) ?? null,
+    ...currency,
+  };
+}
+
+/**
+ * The billing address and currency keys (§1.1), the same for every kind. The
+ * address is the ten fields of the page's form — never the email, phone or
+ * third line Chargebee also holds — and a switch's time is when it reached
+ * its state.
+ */
+function renderCurrency(facts: CurrencyFacts) {
+  return {
+    billingCountry: facts.billingCountry,
+    billingAddress: facts.billingAddress,
+    currency: facts.currency,
+    currencyRules: facts.currencyRules,
+    currencySwitch: facts.currencySwitch
+      ? {
+          fromCurrency: facts.currencySwitch.fromCurrency,
+          toCurrency: facts.currencySwitch.toCurrency,
+          state: facts.currencySwitch.state,
+          reason: facts.currencySwitch.reason,
+          since: facts.currencySwitch.since,
+        }
+      : null,
+    currencyLocked: facts.currencyLocked,
+    currencyChange: facts.currencyChange,
+    plansMissingForCurrency: facts.plansMissingForCurrency,
+    addressEditable: facts.addressEditable,
   };
 }
 

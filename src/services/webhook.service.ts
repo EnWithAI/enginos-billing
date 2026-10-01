@@ -44,6 +44,7 @@
 import type { BillingAccountRepository } from "../repositories/billing-account.repository";
 import type { Logger } from "../shared/logger";
 import type { AccountService } from "./account.service";
+import type { BillingAddressService } from "./billing-address.service";
 
 /** The error a handler throws when the event's customer maps to no billing account. */
 const UNMAPPED_CUSTOMER = "unmapped customer";
@@ -73,8 +74,16 @@ export interface ChargebeeEvent {
 export function createWebhookService(deps: {
   accountService: AccountService;
   accounts: BillingAccountRepository;
-  /** The top-up charge, the credits one unit of it grants, and who grants them (config.ts). */
-  topUp: { itemPriceId: string; creditsPerUnit: string; chargebeeGrants?: boolean };
+  /**
+   * Every currency's top-up charge, and the credits one unit of it grants
+   * (config.ts). A pack paid in any of them is recorded: one bought in INR is
+   * still the org's after it has moved to USD.
+   */
+  topUps: Array<{ itemPriceId: string; creditsPerUnit: string; chargebeeGrants?: boolean }>;
+  /** The packs' charges carry their own Credit Grant: Chargebee grants, billing only records. A top-up's own setting wins. */
+  chargebeeGrants?: boolean;
+  /** For `customer_changed`: the billing address sync (billing-address.service.ts). Absent: the event is acknowledged and nothing read. */
+  billingAddress?: Pick<BillingAddressService, "syncBillingAddress">;
   logger?: Logger;
 }) {
   const log = deps.logger ?? console;
@@ -139,15 +148,22 @@ export function createWebhookService(deps: {
       // payment by a second. Still missing, the delivery is failed on purpose:
       // Chargebee redelivers it later, by when the block is there to record —
       // a 200 now would leave the gateway cap unmoved until the next top-up.
+      //
+      // Any currency's pack: each top-up the invoice carries a line for is
+      // applied with its own credits per unit.
       case "payment_succeeded": {
         const lines = event.content?.invoice?.line_items ?? [];
-        if (!lines.some((line) => line?.entity_id === deps.topUp.itemPriceId)) return;
-        const result = await accounts.applyPaidTopUps(mapped(), deps.topUp.itemPriceId, deps.topUp.creditsPerUnit, {
-          chargebeeGrants: deps.topUp.chargebeeGrants,
-        });
+        const paid = deps.topUps.filter((topUp) => lines.some((line) => line?.entity_id === topUp.itemPriceId));
+        if (paid.length === 0) return;
+        const tenant = mapped();
         const invoiceId = event.content?.invoice?.id;
-        if (invoiceId && result.pending?.includes(String(invoiceId))) {
-          throw new Error(`grant block for top-up invoice ${invoiceId} not visible yet`);
+        for (const topUp of paid) {
+          const result = await accounts.applyPaidTopUps(tenant, topUp.itemPriceId, topUp.creditsPerUnit, {
+            chargebeeGrants: topUp.chargebeeGrants ?? deps.chargebeeGrants,
+          });
+          if (invoiceId && result.pending?.includes(String(invoiceId))) {
+            throw new Error(`grant block for top-up invoice ${invoiceId} not visible yet`);
+          }
         }
         return;
       }
@@ -180,6 +196,35 @@ export function createWebhookService(deps: {
           }
           await accounts.syncFromChargebee(owner);
         }
+        return;
+      }
+
+      // The customer's details changed in Chargebee: the org saved its address
+      // in Chargebee's editor (the page syncs too, when the editor closes),
+      // someone edited it in the dashboard, or billing set the customer's
+      // preferred currency. Chargebee holds the address (A29), so for an org
+      // that has CONFIRMED one on its billing page the same sync runs: the
+      // country is read back from Chargebee — never taken from the body — and
+      // kept, and a free subscription in another currency is switched. Only
+      // asked for here, not run: Chargebee waits on this answer, and the
+      // worker runs the switch within the minute.
+      //
+      // An org that has confirmed none is left alone, and said: an address a
+      // hosted checkout wrote back is not one the org chose to be billed by.
+      // Neither is a customer that is no org's (one made by hand in the
+      // dashboard) — acknowledged, already logged by resolveTenant, rather
+      // than failed into Chargebee's retries.
+      case "customer_changed": {
+        if (!tenantId || !deps.billingAddress) return;
+        const account = await deps.accounts.findByTenantId(tenantId);
+        if (!account?.billingCountry) {
+          log.log?.(
+            { metric: "billing.address.changed_unconfirmed", eventId: event.id, tenantId },
+            "The customer changed in Chargebee, and the org has confirmed no billing address on its billing page; nothing synced",
+          );
+          return;
+        }
+        await deps.billingAddress.syncBillingAddress(tenantId, { inline: false });
         return;
       }
 

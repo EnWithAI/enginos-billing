@@ -5,6 +5,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["__tests__/**/*.test.ts"],
+    // Keeps the developer's .env out of every test (see the file).
+    setupFiles: ["./__tests__/setup.ts"],
   },
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },

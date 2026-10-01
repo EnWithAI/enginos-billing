@@ -148,15 +148,15 @@ export interface TopUpOffer {
   unitPriceMinor: number | null;
   currencyCode: string | null;
   /**
-   * The one-click amounts (TOPUP_AMOUNTS), in the charge's MAJOR currency
+   * The one-click amounts (TOPUP_AMOUNTS_<CUR>), in the charge's MAJOR currency
    * unit — `[50, 100]` is ₹50 and ₹100 on an INR charge. The page offers those
    * it can sell whole within the limits below, and Custom beside them.
    */
   presetAmounts: number[];
   /**
-   * Fewest and most units one top-up may buy: TOPUP_MIN_AMOUNT and
-   * TOPUP_MAX_AMOUNT turned into units of this charge's price. The most is
-   * null — no maximum — while TOPUP_MAX_AMOUNT is unset. Both 1 for a charge
+   * Fewest and most units one top-up may buy: TOPUP_MIN_AMOUNT_<CUR> and
+   * TOPUP_MAX_AMOUNT_<CUR> turned into units of this charge's price. The most
+   * is null — no maximum — while the maximum is unset. Both 1 for a charge
    * with no unit price. checkout's startTopUp enforces exactly these, so the
    * page cannot offer what billing refuses.
    */

@@ -6,6 +6,13 @@
  * "Invalid api key", which gives no hint that the value was never filled in.
  */
 
+import {
+  currenciesOf,
+  normaliseCountry,
+  normaliseCurrency,
+  type CurrencyRules,
+  type TopUpSettingsForCurrency,
+} from "../models/currency";
 import { decimal, divide, isPositive } from "../models/decimal";
 import { assertRate } from "../models/rate";
 
@@ -54,13 +61,15 @@ function readRate(): string {
 
 /**
  * FREE_PLAN_CREDITS: the credits billing grants an org ONCE, when it is first
- * linked to the free plan. Empty turns it off, and the plan's own Credit Grant
- * is all an org gets. Anything set must be a decimal greater than zero — a
- * typo here would otherwise be sent to Chargebee as every new org's grant.
+ * linked to the free plan. Empty — or 0, which says the same thing and is what
+ * an operator turning the grant off naturally writes — turns it off, and the
+ * plan's own Credit Grant is all an org gets. Anything else must be a decimal
+ * greater than zero — a typo here would otherwise be sent to Chargebee as
+ * every new org's grant.
  */
 function freePlanCredits(): string {
   const raw = optional("FREE_PLAN_CREDITS", "").trim();
-  if (raw === "") return "";
+  if (raw === "" || /^0+(\.0+)?$/.test(raw)) return "";
   let positive: boolean;
   try {
     positive = isPositive(raw);
@@ -93,17 +102,159 @@ function freePlanCreditUnit(credits: string): string {
 }
 
 /**
- * The plan allowlist: ITEM_PRICE_IDS, with the free plan always on it. A site
- * whose only plan is the free one needs no ITEM_PRICE_IDS at all, and one that
- * lists others cannot leave the free plan off by accident — which would stop
- * every new org being subscribed.
+ * The plan allowlist: ITEM_PRICE_IDS, with every currency's free plan always
+ * on it. A site whose only plans are the free ones needs no ITEM_PRICE_IDS at
+ * all, and one that lists others cannot leave a free plan off by accident —
+ * which would stop every new org billed in that currency being subscribed.
  */
-function planAllowlist(listed: string, freePlan: string): string[] {
+function planAllowlist(listed: string, freePlans: string[]): string[] {
   const ids = listed
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean);
-  return freePlan !== "" && !ids.includes(freePlan) ? [...ids, freePlan] : ids;
+  return [...ids, ...freePlans.filter((id, i) => !ids.includes(id) && freePlans.indexOf(id) === i)];
+}
+
+/**
+ * The currency rule (models/currency.ts): BILLING_DEFAULT_CURRENCY, USD unless
+ * set, for an org with no billing address and for every country not mapped;
+ * BILLING_COUNTRY_CURRENCIES, `IN:INR` unless set, for the countries that are.
+ *
+ * Codes are trimmed and upper-cased, then checked — a currency here becomes the
+ * suffix of the variables below (`TOPUP_ITEM_PRICE_ID_INR`), so a typo would
+ * otherwise go looking for settings nobody wrote. A country named twice is
+ * refused: it cannot be billed in two currencies.
+ */
+function currencyRules(): CurrencyRules {
+  const rawDefault = optional("BILLING_DEFAULT_CURRENCY", "USD");
+  const defaultCurrency = normaliseCurrency(rawDefault);
+  if (defaultCurrency == null) {
+    throw new Error(
+      `BILLING_DEFAULT_CURRENCY must be a three-letter ISO 4217 currency code such as USD, got ${JSON.stringify(rawDefault)}`,
+    );
+  }
+
+  const byCountry: Record<string, string> = {};
+  const entries = optional("BILLING_COUNTRY_CURRENCIES", "IN:INR")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const parts = entry.split(":");
+    const country = normaliseCountry(parts[0]);
+    const currency = normaliseCurrency(parts[1]);
+    if (parts.length !== 2 || country == null || currency == null) {
+      throw new Error(
+        `BILLING_COUNTRY_CURRENCIES must be COUNTRY:CURRENCY pairs separated by commas, such as IN:INR or IN:INR,GB:GBP — ` +
+          `a two-letter ISO 3166-1 country and a three-letter ISO 4217 currency. ${JSON.stringify(entry)} is not one`,
+      );
+    }
+    if (byCountry[country] != null) {
+      throw new Error(
+        `BILLING_COUNTRY_CURRENCIES names ${country} twice (${byCountry[country]} and ${currency}); a country is billed in one currency`,
+      );
+    }
+    byCountry[country] = currency;
+  }
+  return { defaultCurrency, byCountry };
+}
+
+/**
+ * The single-currency names, read until plans and top-ups became per currency.
+ * Each is REFUSED when set, never quietly ignored: a stale .env would
+ * otherwise boot with no free plan and no top-up at all — every new org left
+ * unsubscribed — rather than fail at start with the names to use instead.
+ */
+const LEGACY_SINGLE_CURRENCY = [
+  "FREE_PLAN_ITEM_PRICE_ID",
+  "TOPUP_ITEM_PRICE_ID",
+  "TOPUP_AMOUNTS",
+  "TOPUP_MIN_AMOUNT",
+  "TOPUP_MAX_AMOUNT",
+  "TOPUP_CREDITS",
+] as const;
+
+function refuseSingleCurrency(currencies: string[]): void {
+  const stale = LEGACY_SINGLE_CURRENCY.filter((name) => (process.env[name] ?? "").trim() !== "");
+  if (stale.length === 0) return;
+  const replacements = stale.map((name) => `${name} with ${currencies.map((currency) => `${name}_${currency}`).join(" and ")}`);
+  throw new Error(
+    `${stale.join(", ")} ${stale.length === 1 ? "is" : "are"} no longer read: plans and top-ups are set per billing ` +
+      `currency (${currencies.join(", ")} — from BILLING_DEFAULT_CURRENCY and BILLING_COUNTRY_CURRENCIES). ` +
+      `Replace ${replacements.join("; ")}, each set for its own currency, and remove the old ` +
+      `${stale.length === 1 ? "name" : "names"}.`,
+  );
+}
+
+/**
+ * `<name>_<CUR>` for EVERY billing currency, or for none.
+ *
+ * None turns the feature off, as an empty FREE_PLAN_ITEM_PRICE_ID used to.
+ * Some but not all is refused: an org billed in a currency left out would have
+ * no free plan to be put on, or no top-up to buy — found out by a customer
+ * long after the deploy, rather than by the process at start.
+ */
+function allOrNone(name: string, currencies: string[], what: string): Record<string, string | null> {
+  const values = Object.fromEntries(currencies.map((currency) => [currency, optional(`${name}_${currency}`, "").trim() || null]));
+  const set = currencies.filter((currency) => values[currency] != null);
+  const missing = currencies.filter((currency) => values[currency] == null);
+  if (set.length > 0 && missing.length > 0) {
+    const names = (list: string[]) => list.map((currency) => `${name}_${currency}`).join(" and ");
+    throw new Error(
+      `${names(missing)} ${missing.length === 1 ? "is" : "are"} not set, but ${names(set)} ${set.length === 1 ? "is" : "are"}: ` +
+        `every billing currency (${currencies.join(", ")}) needs its own ${what}, or an org billed in ${missing[0]} has none. ` +
+        `Set ${names(missing)}, or unset ${names(set)} to turn the ${what} off.`,
+    );
+  }
+  return values;
+}
+
+/** What billing sells in one currency, before the container makes a catalog of it (models/currency.ts). */
+export interface CurrencyBilling {
+  freeItemPriceId: string | null;
+  topUp: TopUpSettingsForCurrency | null;
+}
+
+/**
+ * Each billing currency's free plan and top-up, from the per-currency
+ * variables. Every value is checked whether or not its feature is on — a typo
+ * in TOPUP_MAX_AMOUNT_USD is refused today, not on the day top-ups are
+ * switched on.
+ */
+function billingByCurrency(currencies: string[], grantsByDefault: boolean): Record<string, CurrencyBilling> {
+  const free = allOrNone("FREE_PLAN_ITEM_PRICE_ID", currencies, "free plan");
+  const topUpPrices = allOrNone("TOPUP_ITEM_PRICE_ID", currencies, "top-up");
+  const billing: Record<string, CurrencyBilling> = {};
+  for (const currency of currencies) {
+    const minAmount = optionalAmount(`TOPUP_MIN_AMOUNT_${currency}`);
+    const maxAmount = optionalAmount(`TOPUP_MAX_AMOUNT_${currency}`);
+    if (minAmount != null && maxAmount != null && minAmount > maxAmount) {
+      throw new RangeError(
+        `TOPUP_MIN_AMOUNT_${currency} (${minAmount}) is larger than TOPUP_MAX_AMOUNT_${currency} (${maxAmount})`,
+      );
+    }
+    const presetAmounts = amountList(`TOPUP_AMOUNTS_${currency}`, "50,100");
+    const credits = topUpCredits(`TOPUP_CREDITS_${currency}`);
+    const chargebeeGrants = grantMode(`TOPUP_CHARGEBEE_GRANTS_${currency}`, grantsByDefault);
+    const itemPriceId = topUpPrices[currency] ?? null;
+    billing[currency] = {
+      freeItemPriceId: free[currency] ?? null,
+      topUp: itemPriceId ? { itemPriceId, presetAmounts, minAmount, maxAmount, credits, chargebeeGrants } : null,
+    };
+  }
+  return billing;
+}
+
+/**
+ * TOPUP_CHARGEBEE_GRANTS_<CUR>: `true` or `false`, else the site-wide
+ * TOPUP_CHARGEBEE_GRANTS. Anything else is refused — a typo here decides
+ * whether a paid pack is granted by Chargebee, by billing, or twice.
+ */
+function grantMode(name: string, fallback: boolean): boolean {
+  const raw = optional(name, "").trim();
+  if (raw === "") return fallback;
+  if (raw === "true" || raw === "false") return raw === "true";
+  throw new Error(`${name} must be true or false, got ${JSON.stringify(raw)}`);
 }
 
 /**
@@ -193,11 +344,14 @@ export function resetConfig(): void {
 
 function buildConfig() {
   const freeCredits = freePlanCredits();
-  const minTopUp = optionalAmount("TOPUP_MIN_AMOUNT");
-  const maxTopUp = optionalAmount("TOPUP_MAX_AMOUNT");
-  if (minTopUp != null && maxTopUp != null && minTopUp > maxTopUp) {
-    throw new RangeError(`TOPUP_MIN_AMOUNT (${minTopUp}) is larger than TOPUP_MAX_AMOUNT (${maxTopUp})`);
-  }
+  const rules = currencyRules();
+  const currencies = currenciesOf(rules);
+  // Before anything per-currency is read: a stale .env gets the names to use
+  // instead, not an all-or-none complaint about variables it never had.
+  refuseSingleCurrency(currencies);
+  const topUpChargebeeGrants = optional("TOPUP_CHARGEBEE_GRANTS", "false") === "true";
+  const billing = billingByCurrency(currencies, topUpChargebeeGrants);
+  const freePlans = currencies.map((currency) => billing[currency]!.freeItemPriceId).filter((id): id is string => id != null);
   return {
     /** Charged per credit, in USD. */
     usdPerCredit: readRate(),
@@ -273,28 +427,107 @@ function buildConfig() {
     },
 
     /**
+     * How a billing country becomes a currency (models/currency.ts):
+     * BILLING_DEFAULT_CURRENCY (USD) for an org with no billing address and
+     * for every country BILLING_COUNTRY_CURRENCIES (`IN:INR`) does not map.
+     * An org already subscribed only ever moves to another currency when it
+     * CONFIRMS an address — never because of the default.
+     */
+    currencyRules: rules,
+
+    /** Every currency billing can bill in: the default first, then each mapped one. */
+    currencies,
+
+    /**
+     * What billing sells in each currency, keyed by currency code — the
+     * container makes the catalog every service reads from this. Chargebee
+     * fixes a subscription's currency, and refuses a charge in any other
+     * (MEASURED: `currency_mismatched`), so each currency has its own item
+     * prices:
+     *
+     *   FREE_PLAN_ITEM_PRICE_ID_<CUR>   the plan an org billed in <CUR> is put
+     *                                   on automatically — at sign-up, and when
+     *                                   its billing page is opened with no
+     *                                   subscription — with no checkout and no
+     *                                   card. Must cost nothing (checked
+     *                                   against the catalogue before every
+     *                                   create); always on the plan allowlist.
+     *   TOPUP_ITEM_PRICE_ID_<CUR>       the top-up pack in <CUR>: a ONE-TIME
+     *                                   charge, not a second subscription —
+     *                                   which would leave the customer with
+     *                                   two, where the schema allows one. An
+     *                                   ITEM PRICE id (`api_token-USD`), not
+     *                                   the item's (`api_token`): checkout
+     *                                   looks the price up to learn its
+     *                                   currency, and the paid-invoice match is
+     *                                   on `line_items[].entity_id`, which is
+     *                                   the item price. The live .env once held
+     *                                   the item id, and every top-up checkout
+     *                                   failed with "No currency for item price
+     *                                   test-top-up" (C57c).
+     *   TOPUP_AMOUNTS_<CUR>             the one-click amounts, in <CUR>'s MAJOR
+     *                                   unit (`50,100` is ₹50 and ₹100). The
+     *                                   page shows those it can sell whole
+     *                                   within the limits, and Custom beside
+     *                                   them. `50,100` unless set.
+     *   TOPUP_MIN_AMOUNT_<CUR>,         the smallest and largest top-up, in the
+     *   TOPUP_MAX_AMOUNT_<CUR>          same unit. Unset: the smallest is one
+     *                                   unit, and there is no largest. Enforced
+     *                                   by billing (checkout.startTopUp), not
+     *                                   only shown by the page.
+     *   TOPUP_CREDITS_<CUR>             credits ONE unit of the pack grants —
+     *                                   read only when BILLING allocates the
+     *                                   pack (TOPUP_CHARGEBEE_GRANTS=false),
+     *                                   and required then. With Chargebee
+     *                                   granting it (the pack's own Credit
+     *                                   Grant) the credits are Chargebee's,
+     *                                   read back from the grant block: the
+     *                                   page quotes an amount, not credits.
+     *
+     * The free plan and the top-up are each set for EVERY currency or for
+     * none (none turns it off). The old unsuffixed names are refused at start.
+     */
+    billing,
+
+    /**
      * The plans an org may be on: the allowlist the linking step picks a usage
      * subscription from, and checkout sells from. ITEM_PRICE_IDS lists any
-     * besides the free plan, which is always included — so a site that uses
-     * only the free plan sets nothing here. An org's CURRENT subscription is
-     * kept whatever this says (models/subscription.ts).
+     * besides the free plans, which are always included — so a site that uses
+     * only the free plans sets nothing here. ONE list across currencies: a
+     * paid plan's currency is read from the Chargebee catalogue, never parsed
+     * from its id. An org's CURRENT subscription is kept whatever this says
+     * (models/subscription.ts).
      *
      * An ALLOWLIST, not a menu. Every request naming an item price is checked
      * against it, so a tampered request cannot start a checkout for some other
      * plan in the catalogue.
      */
-    itemPriceIds: planAllowlist(optional("ITEM_PRICE_IDS", ""), optional("FREE_PLAN_ITEM_PRICE_ID", "")),
+    itemPriceIds: planAllowlist(optional("ITEM_PRICE_IDS", ""), freePlans),
 
+    /** The paid plan checkout uses when none is named — only for an org billed in that plan's currency. */
     defaultItemPriceId: optional("DEFAULT_ITEM_PRICE_ID", "pre-paid-test-v1-INR-Monthly"),
 
     /**
-     * The plan every org is put on automatically — at sign-up, and when its
-     * billing page is opened with no subscription — with no checkout and no
-     * card. Must cost nothing (checked against the catalogue before every
-     * create); always on the plan allowlist. Empty turns automatic
-     * subscription off.
+     * How long POST /api/internal/billing-address/sync runs a currency switch
+     * inline before answering, in milliseconds, counted from the start of the
+     * request; the rest finishes in the background (the worker each minute).
+     * Under the platform proxy's 10-second timeout with room for reading the
+     * address back from Chargebee. 0 runs nothing inline.
      */
-    freeItemPriceId: optional("FREE_PLAN_ITEM_PRICE_ID", ""),
+    switchInlineMs: nonNegativeInteger("BILLING_SWITCH_INLINE_MS", 6000),
+
+    /**
+     * Whether saving an address that changes the currency of a LIVE free
+     * subscription switches it (BILLING_CURRENCY_SWITCH_ENABLED). OFF unless
+     * exactly `true`. Off, addresses are still saved and still decide the
+     * currency of NEW subscriptions, but such a change is refused and nothing
+     * is written. A ROLLOUT GATE: an API replica or worker still running the
+     * code before this would write `active` or `exhausted` over `switching`
+     * and capture on the emptied subscription, leaving a switch stuck — so it
+     * is turned on only once every replica and worker runs this code, with
+     * both billing-currency migrations applied.
+     */
+    currencySwitchEnabled: optional("BILLING_CURRENCY_SWITCH_ENABLED", "false") === "true",
 
     /**
      * Whether an org with no setting of its own is put on the free plan. Off
@@ -335,59 +568,34 @@ function buildConfig() {
     portalEnabled: optional("CHARGEBEE_PORTAL_ENABLED", "false") === "true",
 
     /**
-     * The top-up pack: a ONE-TIME charge, not a second subscription.
-     *
-     * Buying another subscription would leave the customer with two, and the
-     * schema allows only one per tenant. A charge adds credits to the existing
-     * subscription's ledger instead.
+     * Whether an org that has saved a billing address may change it. OFF
+     * unless exactly `true`: the first address is still added (it decides the
+     * currency, and top-ups wait on it), but once one is saved the page shows
+     * no edit button and the portal refuses a session (409 `address-edit-off`).
      */
-    //
-    // An ITEM PRICE id (e.g. `test-top-up-INR`), not the item's id
-    // (`test-top-up`): checkout looks the price up to learn its currency, and
-    // the paid-invoice match is on `line_items[].entity_id`, which is the
-    // item price. The live .env once held the item id, and every top-up
-    // checkout failed with "No currency for item price test-top-up" (C57c).
-    topUpItemPriceId: optional("TOPUP_ITEM_PRICE_ID", "token-pack-5m-INR"),
+    addressEditEnabled: optional("BILLING_ADDRESS_EDIT_ENABLED", "false") === "true",
+
     /**
-     * Credits ONE UNIT of the top-up charge grants — read only when BILLING
-     * allocates the pack (TOPUP_CHARGEBEE_GRANTS=false), and required then.
-     * With Chargebee granting it (the pack's own Credit Grant) the credits are
-     * Chargebee's, read back from the grant block, and this is not needed: the
-     * page quotes an amount, not credits.
+     * The top-up charge carries its own Credit Grant in the Chargebee
+     * catalogue, so Chargebee grants each paid pack and billing only records
+     * it — and never allocates, which would grant twice. The site-wide
+     * default; each currency's top-up says for itself in `billing` (from
+     * TOPUP_CHARGEBEE_GRANTS_<CUR>, else this).
      */
-    topUpCredits: topUpCredits(),
-    /**
-     * The one-click top-up amounts, in the charge's MAJOR currency unit
-     * (`50,100` is ₹50 and ₹100 on an INR charge). The page shows those it can
-     * sell whole within the limits, and Custom beside them.
-     */
-    topUpAmounts: amountList("TOPUP_AMOUNTS", "50,100"),
-    /**
-     * The smallest and largest top-up, in the charge's MAJOR currency unit.
-     * Unset: the smallest is one unit, and there is no largest.
-     * Enforced by billing (checkout.startTopUp), not only shown by the page.
-     */
-    topUpMinAmount: minTopUp,
-    topUpMaxAmount: maxTopUp,
-    /**
-     * The top-up charge carries its own Credit Grant in the Chargebee catalogue,
-     * so Chargebee grants each paid pack and billing only records it — and never
-     * allocates, which would grant twice.
-     */
-    topUpChargebeeGrants: optional("TOPUP_CHARGEBEE_GRANTS", "false") === "true",
+    topUpChargebeeGrants,
   } as const;
 }
 
 /**
- * TOPUP_CREDITS, or "" when unset. Needed only when billing allocates a paid
- * pack itself (TOPUP_CHARGEBEE_GRANTS=false); a pack it would have to allocate
- * without it is held and said out loud (account.service.ts firstTopUp) —
- * never granted a guessed amount.
+ * TOPUP_CREDITS_<CUR>, or "" when unset. Needed only when billing allocates a
+ * paid pack itself (TOPUP_CHARGEBEE_GRANTS=false); a pack it would have to
+ * allocate without it is held and said out loud (account.service.ts
+ * firstTopUp) — never granted a guessed amount.
  */
-function topUpCredits(): string {
-  const raw = optional("TOPUP_CREDITS", "").trim();
+function topUpCredits(name: string): string {
+  const raw = optional(name, "").trim();
   if (raw === "") return "";
-  if (!isPositiveDecimal(raw)) throw new RangeError(`TOPUP_CREDITS must be a number greater than zero, got ${raw}`);
+  if (!isPositiveDecimal(raw)) throw new RangeError(`${name} must be a number greater than zero, got ${raw}`);
   return decimal(raw);
 }
 

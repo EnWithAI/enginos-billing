@@ -49,7 +49,9 @@ What Postgres answers is narrow:
 
 ## 2. Schema
 
-Two tables. That is the whole of the usage-billing schema.
+Two tables. That is the whole of the usage-billing schema. (`topup_grant`,
+the grant guard, and `currency_switch`, the stored request for each capture of
+a currency switch, are described in [SCHEMA.md](SCHEMA.md).)
 
 ```
 billing_account          tenant ↔ Chargebee mapping, AND the billing cursor
@@ -73,7 +75,10 @@ the index names still call it a *window*. It is not a fixed length (§3).
 | `billing_email` | `varchar(320)` | Captured at provisioning, before any User row exists |
 | `free_plan` | `boolean` | Whether the org is put on the free plan; null follows `FREE_PLAN_DEFAULT` (§11) |
 | `current_term_start` / `_end` | `timestamptz` | Mirrored for display and for top-up expiry |
-| `status` | `varchar(20)` | `unlinked` / `activating` / `active` / `cancelled` / `exhausted` |
+| `billing_country` | `varchar(2)` | The country of the billing address the org saved in Chargebee's form, read back by the address sync. Decides the currency (India → INR, else USD); null until one is saved, and then nothing priced is sold |
+| `currency` | `varchar(3)` | The linked subscription's `currency_code`, stored at every link |
+| `topup_charging_until` | `timestamptz(3)` | The top-up charge lease: a charge on the wire until then; a currency switch does not start under it |
+| `status` | `varchar(20)` | `unlinked` / `activating` / `active` / `cancelled` / `exhausted` / `switching` (a currency switch is moving the credits) |
 | **`last_processed_ingested_at`** | `timestamptz(3)` | **THE CURSOR** — a call end time; see below |
 | `created_at` / `updated_at` | `timestamptz` | |
 
@@ -498,7 +503,7 @@ is hand-rolled.
 | Verb | Endpoint | Notes |
 |---|---|---|
 | POST | `/ledger_operations/capture` | **The usage charge.** `id` = our sync row id. `ledger_operation_timestamp` is always *now* — the API rejects anything older than 10 minutes — and the range travels in metadata (`ingested_from` / `ingested_to`, call end times despite the names) |
-| POST | `/ledger_operations/allocate` | Top-up grant, and the free plan's one-time credits (`FREE_PLAN_CREDITS`) — on a zero-grant plan that allocate is what creates the credit wallet (MEASURED 2026-09-30). Accepts **no client-supplied id** and never returns the metadata sent with it, so it carries `chargebee-idempotency-key` (**30-minute window**, same request only) and a mandatory `expires_at`; the guard is `topup_grant` (§10 #1) |
+| POST | `/ledger_operations/allocate` | Top-up grant, the free plan's one-time credits (`FREE_PLAN_CREDITS`) — on a zero-grant plan that allocate is what creates the credit wallet (MEASURED 2026-09-30) — and a currency switch's copy of each grant block onto the new subscription (`topup_grant` row and key `carry:<switch id>:<block id>`). Accepts **no client-supplied id** and never returns the metadata sent with it, so it carries `chargebee-idempotency-key` (**30-minute window**, same request only) and a mandatory `expires_at`; the guard is `topup_grant` (§10 #1) |
 | GET | `/ledger_operations/{id}` | **Recovery lookup.** A 404 with `resource_not_found` is the *only* answer meaning "never captured" |
 | GET | `/ledger_operations` | Listing (`ledgerOperations`), read only by `scripts/e2e-prepaid.ts`. Filters are not uniformly honoured — it ignores `id[is]`, which is why recovery retrieves by id |
 
@@ -515,7 +520,10 @@ is hand-rolled.
 |---|---|---|
 | POST | `/customers` | id = tenant UUID, so a retry collides instead of duplicating |
 | GET | `/subscriptions` | Active subs for a customer, newest first |
-| GET | `/subscriptions/{id}` | Status, term, `next_billing_at` for the Subscription card |
+| GET | `/subscriptions/{id}` | Status, term, `next_billing_at` for the Subscription card; `currency_code`, stored as `billing_account.currency` |
+| POST | `/subscriptions/{id}/cancel_for_items` | A currency switch's old subscription, once billing has left it: now, no credit note. MEASURED: refused mid-term for a plan carrying a Credit Grant (*"You cannot cancel a subscription with items having credit unit grants immediately or mid-term…"*), so then `end_of_term=true` |
+| GET | `/customers/{id}` | The billing address Chargebee holds — read back by the address sync, shown on the page, pre-filled into a checkout. Only its country is kept (`billing_account.billing_country`) |
+| POST | `/customers/{id}` | `preferred_currency_code` only, whenever billing decides a subscription's currency (sign-up, a switch's link). Best effort |
 | POST | `/subscriptions/{id}/update_for_items` | Addon attach. **Refused mid-term when items carry credit grants** |
 | POST | `/estimates/update_subscription_for_items` | Dry run. Takes `subscription[id]`, *not* `subscription_id` |
 
@@ -534,11 +542,11 @@ is hand-rolled.
 | Verb | Endpoint | Notes |
 |---|---|---|
 | GET | `/item_prices/{id}` | Plan details. The free plan's price is checked to be **zero** before every subscribe |
-| POST | `/customers/{id}/subscription_for_items` | **The free plan**, no checkout and no card — for an org it is for, at sign-up and as the billing page's fallback. `chargebee-idempotency-key: free-plan:<tenant>` |
+| POST | `/customers/{id}/subscription_for_items` | **The free plan**, no checkout and no card — for an org it is for, at sign-up and as the billing page's fallback, in its billing currency (`FREE_PLAN_ITEM_PRICE_ID_<CUR>`). `chargebee-idempotency-key: free-plan:<tenant>:<currency>`. Also a currency switch's new subscription, under our id `cs_<switch id>` and key `currency-switch:<switch id>` |
 | POST | `/invoices/create_for_charge_items_and_charges` | **Top-up**, charged onto the subscription and collected from the card on file. **Never retried** |
 | POST | `/hosted_pages/manage_payment_sources` | *Update card*. `redirect_url` on port 80, 443, 8080 or 8443 only |
 | POST | `/hosted_pages/checkout_new_for_items` | Paid-plan checkout, from the page's **Choose a plan** for an org with no plan. `redirect_url` = `APP_URL/organization/billing?from=checkout`; the page then syncs the new subscription at once |
-| POST | `/portal_sessions` | Built, never rendered, and disabled on the test site. Refused by billing (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`: customers must not be able to cancel |
+| POST | `/portal_sessions` | The session Chargebee.js opens the **billing-address form** on (the portal's ADDRESS section only). Refused by billing (409 `portal-off`) unless `CHARGEBEE_PORTAL_ENABLED=true`: customers must not be able to cancel. MEASURED: with portal API access off on the site, Chargebee answers *"Customer portal access via API is disabled."* (`portal_access_disabled_for_api`), and billing 409 `portal-disabled` |
 
 ### Units trap
 
@@ -569,7 +577,8 @@ as "open".
 
 | Event | Billing does |
 |---|---|
-| `subscription_created` `_activated` `_changed` `_renewed` `_reactivated` `_resumed` `_cancelled` `_deleted` | `syncFromChargebee(tenant)`; the body is only a trigger (§10 #3) |
+| `subscription_created` `_activated` `_changed` `_renewed` `_reactivated` `_resumed` `_cancelled` `_deleted` | `syncFromChargebee(tenant)`; the body is only a trigger (§10 #3). Nothing while the account is `switching`: the currency switch links its new subscription itself |
+| `customer_changed` | For an org with a saved `billing_country`: `syncBillingAddress(tenant, { inline: false })` — the address read back from Chargebee, its country kept, a currency switch requested if needed (the worker runs it). With none saved: logged `billing.address.changed_unconfirmed` only |
 | `payment_succeeded`, invoice with a top-up line | `applyPaidTopUps`. 500 while a grant-carrying pack's block is not visible yet, so Chargebee redelivers |
 | `grant_blocks_created` | For each subscription in `content.grant_blocks`: the org whose **current** subscription it is (`findTenantIdBySubscriptionId`) → `syncFromChargebee`. Credits added by hand in the Chargebee dashboard, and any other grant, move the LiteLLM limit — and reopen an exhausted team — within seconds instead of at the daily resync. A subscription that is no org's current one, or a `cbdemo_` one → logged `billing.webhook.grant_unlinked_subscription`, 200 |
 | `payment_failed`, `alert_status_changed` | Logged only |
@@ -789,7 +798,7 @@ stop everyone else's billing (`billing.sync.tenant_error`).
 
 ### Sentry alerts (the worker)
 
-`worker/alerts.ts` raises four alerts, each ONE Sentry issue however many tenants
+`worker/alerts.ts` raises five alerts, each ONE Sentry issue however many tenants
 and ticks raise it:
 
 | Alert | Raised when |
@@ -798,6 +807,7 @@ and ticks raise it:
 | `postgres-write-failed` | the database is up and refused a write |
 | `chargebee-down` | Chargebee does not answer (5xx, timeout, network), refuses the key, or a sync is stuck |
 | `chargebee-update-failed` | Chargebee refused a usage range (400, 404) |
+| `currency-switch-stuck` | A currency switch has been open for more than 30 minutes (`billing.currency_switch.stuck`) |
 
 Out of credits, rate limiting and every other error send nothing.
 `npx tsx scripts/sentry-alerts-check.ts` fires every case against the Sentry
@@ -990,9 +1000,9 @@ is Chargebee's dunning setting, not billing's.
 - **The page quotes amounts, never credits.** What a pack grants is the
   charge's Credit Grant in Chargebee, which its API does not expose before a
   purchase; the credits are read back from the grant block once paid.
-  `TOPUP_CREDITS` is read only when billing allocates packs itself
-  (`TOPUP_CHARGEBEE_GRANTS=false`); unset there, a paid pack is held and logged
-  (`billing.topup.credits_per_unit_unset`), never granted a guessed amount.
+  `TOPUP_CREDITS_<CUR>` is read only when billing allocates packs itself
+  (`TOPUP_CHARGEBEE_GRANTS[_<CUR>]=false`); unset there, a paid pack is held and
+  logged (`billing.topup.credits_per_unit_unset`), never granted a guessed amount.
 
 ---
 
@@ -1001,8 +1011,12 @@ is Chargebee's dunning setting, not billing's.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CREDITS_PER_USD` | `1000` | Credits that buy $1 of LLM spend. `.env`: `50`. `USD_PER_CREDIT` (per credit, default `0.001`) is read only when this is unset |
-| `FREE_PLAN_ITEM_PRICE_ID` | empty | The plan an org it is for is put on at sign-up — no card, so it must cost zero (checked before every subscribe). Empty turns automatic subscription off |
-| `FREE_PLAN_CREDITS` | empty | The **total** free credits each free-plan org starts with, granted **once** per org, ever. The plan's own Credit Grant is cut to zero (or a single token) in the catalogue, so a renewal grants nothing; billing allocates `FREE_PLAN_CREDITS` less what that grant gave (floor 0). An org the plan already gave at least that much (one put on it before the cut) is recorded as a `catalogue_grant` and allocated nothing. Guarded by a `topup_grant` row with invoice id `free-plan-credits` (key `free-plan-credits:<tenant>`); expires 10 years out (`FREE_PLAN_CREDITS_YEARS`); resubscribing grants nothing more. Runs in `syncSubscription` before `activate()`; while it is owed and the org is out of credits or has no wallet yet, `activate()` holds it `activating` (team blocked), and `activatePending` retries every minute. Requires `FREE_PLAN_CREDIT_UNIT`. Empty: off |
+| `BILLING_DEFAULT_CURRENCY` | `USD` | The currency of an org with no billing address yet, and of every country not mapped below (ISO 4217) |
+| `BILLING_COUNTRY_CURRENCIES` | `IN:INR` | `COUNTRY:CURRENCY` pairs, comma-separated: the billing country (ISO 3166-1 alpha-2) an org confirms decides the currency it is billed in. Every currency named here or as the default is a **billing currency**: the `_<CUR>` variables below are set for each of them |
+| `BILLING_SWITCH_INLINE_MS` | `6000` | How long, from the start of `POST /api/internal/billing-address/sync`, a currency switch it starts runs inline before the sync answers; the worker finishes the rest. Under the platform proxy's 10-second timeout. `0` runs nothing inline |
+| `BILLING_CURRENCY_SWITCH_ENABLED` | `false` | Rollout gate: off, the address sync still keeps the country (and with it the currency of a NEW subscription), but a live free subscription in another currency keeps its currency, as a paid one does (`currencyLocked`), and the worker requests no switch. Turn on only once every API replica and the worker run the currency code with both migrations applied |
+| `FREE_PLAN_ITEM_PRICE_ID_<CUR>` | empty | Per billing currency: the plan an org it is for is put on at sign-up, in its billing currency — no card, so it must cost zero (checked before every subscribe). Set for **every** billing currency or none (none turns automatic subscription off). The unsuffixed `FREE_PLAN_ITEM_PRICE_ID` is refused at start |
+| `FREE_PLAN_CREDITS` | empty | The **total** free credits each free-plan org starts with, granted **once** per org, ever. The plan's own Credit Grant is cut to zero (or a single token) in the catalogue, so a renewal grants nothing; billing allocates `FREE_PLAN_CREDITS` less what that grant gave (floor 0). An org the plan already gave at least that much (one put on it before the cut) is recorded as a `catalogue_grant` and allocated nothing. Guarded by a `topup_grant` row with invoice id `free-plan-credits` (key `free-plan-credits:<tenant>`); expires 10 years out (`FREE_PLAN_CREDITS_YEARS`); resubscribing grants nothing more. Runs in `syncSubscription` before `activate()`; while it is owed and the org is out of credits or has no wallet yet, `activate()` holds it `activating` (team blocked), and `activatePending` retries every minute. Requires `FREE_PLAN_CREDIT_UNIT`. Empty or `0`: off — and a free plan that grants nothing is then linked to `FREE_PLAN_CREDIT_UNIT` with 0 credits |
 | `FREE_PLAN_CREDIT_UNIT` | empty | **Required** with `FREE_PLAN_CREDITS` (the configuration is refused without it): the credit unit the free credits go into, e.g. `token-test`. MEASURED 2026-09-30: a zero-grant plan gets **no** credit wallet (ledger account) from Chargebee; billing's allocate into this unit creates it, and the account adopts the unit (`adoptLedgerUnit`). An org whose wallet exists keeps its own unit |
 | `FREE_PLAN_DEFAULT` | `false` | Whether an org with no setting of its own (`billing_account.free_plan` null) gets the free plan. One it is not for is offered the paid plans and cannot check out the free one. Per org: `POST /api/internal/free-plan {tenantId, enabled}` — **operators only**, never forwarded by the platform |
 | `BILLING_LAG_MS` | `60000` | Only LLM calls that ended at least this long ago (by ClickHouse's clock) are read. Under `30000` (`MIN_LAG_MS`) — 0 included — the configuration is refused. `.env`: `45000`. MEASURED: a span lands p50 23 s, p99 44 s after its call ended; one landing later than the lag is never billed (§3) — [BILLING-WORKER.md](BILLING-WORKER.md) §6 |
@@ -1011,14 +1025,14 @@ is Chargebee's dunning setting, not billing's.
 | `BILLING_SWEEP_INTERVAL_MS` | `60000` | Time between usage-sync passes. The cron fires once a minute, so above `60000` it behaves as `60000`; under it, each run makes several passes (none after 45 s) — an option, not used. Usage reaches Chargebee about lag + up to one interval after the call ended: ~1–2 min with the defaults |
 | `BILLING_MAX_ATTEMPTS` | `10` | Escalation threshold; never converts unknown → failure |
 | `BILLING_PLAN_CACHE_TTL_MS` | `600000` | Plan catalogue cache; 0 disables |
-| `TOPUP_ITEM_PRICE_ID` | `token-pack-5m-INR` | The top-up charge — an **item price** id (`api_token-INR`), not the item id |
-| `TOPUP_CHARGEBEE_GRANTS` | `false` | `true` when the charge carries its own Credit Grant: Chargebee grants, billing only records (§10 #4). `false` with a grant would grant twice |
-| `TOPUP_CREDITS` | empty | Credits per unit — only when billing allocates packs (`TOPUP_CHARGEBEE_GRANTS=false`); unset there, a paid pack is held and logged. Not shown on the page |
-| `TOPUP_AMOUNTS` | `50,100` | One-click top-up amounts on the page, in the charge's currency (major unit); Custom is always offered. An amount that is not a whole number of units or is outside the limits is not shown |
-| `TOPUP_MIN_AMOUNT` / `TOPUP_MAX_AMOUNT` | empty | Smallest / largest top-up, in the charge's currency — turned into units of its price and **enforced by `startTopUp`** (400 `topup-quantity-invalid`), not only shown. Unset: one unit / no maximum. With no unit price (flat fee, tiered, Chargebee unreachable) a top-up is one unit |
-| `ITEM_PRICE_IDS` | empty | Plans besides the free one an org may be on. The free plan is **always** included. An org's current subscription is kept whatever this says |
+| `TOPUP_ITEM_PRICE_ID_<CUR>` | empty | Per billing currency: the top-up charge in that currency — an **item price** id (`api_token-USD`, `api_token-INR`), not the item id. Chargebee refuses a charge in another currency than the subscription's, so an org is only ever offered, and charged, its own currency's. Set for every billing currency or none. The unsuffixed `TOPUP_ITEM_PRICE_ID` is refused at start |
+| `TOPUP_CHARGEBEE_GRANTS` | `false` | `true` when the charges carry their own Credit Grant: Chargebee grants, billing only records (§10 #4). `false` with a grant would grant twice. `TOPUP_CHARGEBEE_GRANTS_<CUR>` (`true`/`false`) overrides it for one currency's charge |
+| `TOPUP_CREDITS_<CUR>` | empty | Credits per unit of that currency's pack — only when billing allocates packs (grants off for it); unset there, a paid pack is held and logged. Not shown on the page |
+| `TOPUP_AMOUNTS_<CUR>` | `50,100` | One-click top-up amounts on the page, in that currency (major unit); Custom is always offered. An amount that is not a whole number of units or is outside the limits is not shown |
+| `TOPUP_MIN_AMOUNT_<CUR>` / `TOPUP_MAX_AMOUNT_<CUR>` | empty | Smallest / largest top-up, in that currency — turned into units of its price and **enforced by `startTopUp`** (400 `topup-quantity-invalid`), not only shown. Unset: one unit / no maximum. With no unit price (flat fee, tiered, Chargebee unreachable) a top-up is one unit. The unsuffixed names are refused at start |
+| `ITEM_PRICE_IDS` | empty | Plans besides the free ones an org may be on, in any currency (a plan's currency is read from the catalogue). Every currency's free plan is **always** included. An org's current subscription is kept whatever this says |
 | `APP_URL` | `http://localhost:4200` | Where Chargebee sends the browser back to. Chargebee accepts port 80, 443, 8080 or 8443 only, so locally the HTTPS dev origin |
-| `CHARGEBEE_PORTAL_ENABLED` | `false` | The self-serve portal route answers 409 `portal-off` unless this is exactly `true`. Customers must not be able to cancel; set it only after "Allow customers to cancel subscriptions" is off in the site's Self-Serve Portal settings |
+| `CHARGEBEE_PORTAL_ENABLED` | `false` | The portal route — the session the billing page's address form opens on — answers 409 `portal-off` unless this is exactly `true`; so without it no billing address can be added. Customers must not be able to cancel: set it only after "Allow customers to cancel subscriptions" is off in the site's Self-Serve Portal settings, and with portal access through the API enabled (else 409 `portal-disabled`) |
 | `CHARGEBEE_WEBHOOK_USER` / `CHARGEBEE_WEBHOOK_PASSWORD` | empty | The HTTP Basic credentials set on Chargebee's webhook endpoint, checked by billing in constant time (§6). Either unset: every delivery 401 `webhook-unauthorized` |
 
 > **Deployment note:** `BILLING_LAG_MS` is in **milliseconds**. `120` (meant as
@@ -1032,7 +1046,7 @@ is Chargebee's dunning setting, not billing's.
 
 | Workflow | Schedule | Does |
 |---|---|---|
-| `billing-usage-sync` | `* * * * *` | The usage path, whole: held activations, then the usage sync (no new range after 3 minutes), then the gate check (bounded to 4 minutes into the 5-minute timeout). With several passes a minute, no pass starts after 45 s and the gate check stops at 55 s. `maxRuns: 1`, `CANCEL_NEWEST` |
+| `billing-usage-sync` | `* * * * *` | The usage path, whole: held activations, then open currency switches (`advanceOpen`, no step started after 20 s: orphan recovery, every open switch advanced, `billing.currency_switch.stuck` past 30 minutes, convergence), then the usage sync (no new range after 3 minutes), then the gate check (bounded to 4 minutes into the 5-minute timeout). With several passes a minute, no pass starts after 45 s and the gate check stops at 55 s. `maxRuns: 1`, `CANCEL_NEWEST` |
 | `billing-subscription-reconcile` | `11 2 * * *` | Re-reads every subscription, repairing state a lost webhook left stale |
 
 Cadence is not freshness — a tick reads LLM calls that ended up to `now − lag`,

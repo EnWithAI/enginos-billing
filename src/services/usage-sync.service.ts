@@ -128,7 +128,7 @@ export const OUTCOME = {
   HOLDING: "holding", // an unresolved sync exists but is not due for retry yet
   EXHAUSTED: "exhausted", // credits used up: team blocked, nothing sent or read until credits come back
   LOCKED: "locked", // another worker is on this window
-  NOT_BILLABLE: "not_billable", // no subscription, or cancelled
+  NOT_BILLABLE: "not_billable", // no subscription, cancelled, or a currency switch moving the credits
   WRITTEN_OFF: "written_off", // refused, and its subscription has ended: given up, once
 } as const;
 
@@ -249,6 +249,19 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     //    first and bills on from there.
     if (account.status === ACCOUNT.EXHAUSTED) return holdExhausted(account);
 
+    // A currency switch is moving the tenant's credits to a subscription in
+    // another currency. Nothing is sent and nothing new is read: the usage
+    // waits in ClickHouse in front of a cursor the switch never moves, and is
+    // billed to the new subscription once it is linked. The repository
+    // refuses every step of a sync while the account is `switching` anyway —
+    // a window (openWindow), an empty-window step (advancePastEmptyWindow),
+    // a send (claim), a write-off (writeOff) — so this is the fast path, not
+    // the guard: it saves the tick its queries, and the log the warnings of a
+    // claim refused every minute for as long as the switch runs. A held row
+    // is not resolved here either: it could not be sent, and the switch
+    // re-pins it to the new subscription if it never landed.
+    if (account.status === ACCOUNT.SWITCHING) return switching(tenantSlug);
+
     log.log?.({ metric: "billing.sync.started", tenantSlug }, "Billing sync started");
 
     // 1. Resolve whatever is unresolved, BEFORE reading anything new.
@@ -290,8 +303,15 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
     if (current.status === ACCOUNT.CANCELLED) {
       return recovered ?? { tenantSlug, outcome: OUTCOME.NOT_BILLABLE, reason: "subscription cancelled" };
     }
+    // A currency switch started while the recovery ran: nothing new is read.
+    if (current.status === ACCOUNT.SWITCHING) return recovered ?? switching(tenantSlug);
 
     return processWindows(current, recovered, deadline);
+  }
+
+  /** A tenant whose credits a currency switch is moving: not billable this tick, and nothing lost by it. */
+  function switching(tenantSlug: string): TenantResult {
+    return { tenantSlug, outcome: OUTCOME.NOT_BILLABLE, reason: "currency switch in progress" };
   }
 
   /**
@@ -892,7 +912,9 @@ export function createUsageSyncService(deps: UsageSyncDeps) {
    */
   async function markExhausted(tenantId: string, tenantSlug: string) {
     // A cancelled account's team has been handed back to its plan: blocking
-    // it would take the free plan away too, and nothing would lift it.
+    // it would take the free plan away too, and nothing would lift it. A
+    // switching one belongs to the currency switch, which decides what it is
+    // once its credits have moved. Either way: nothing.
     if (!(await accounts.markExhaustedUnlessCancelled(tenantId))) return;
     if (await blockExhausted(tenantId, tenantSlug)) {
       log.warn?.({ metric: "billing.budget.exhausted_blocked", tenantSlug }, "Credits used up; LiteLLM team blocked until a top-up");

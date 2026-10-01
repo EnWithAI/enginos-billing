@@ -90,6 +90,14 @@ export const SYNC_DEADLINE_MS = 3 * 60_000;
  * stops at 55 s — what it does not reach, it reaches next minute.
  */
 export const LAST_PASS_START_MS = 45_000;
+
+/**
+ * How far into the run open currency switches may still start a step
+ * (currency-switch.service.ts advanceOpen) — before the usage sync, so a
+ * switch that links this minute is billed on its new subscription this
+ * minute. Bounded so a slow Chargebee cannot eat the sync's time.
+ */
+export const SWITCH_DEADLINE_MS = 20_000;
 export const MULTI_PASS_GATE_DEADLINE_MS = 55_000;
 
 async function main() {
@@ -145,6 +153,14 @@ async function main() {
       // Accounts whose LiteLLM budget push failed are held `activating` with
       // their team blocked. Retried first, so one that lands is billed this tick.
       const activation = await services.accounts.activatePending();
+
+      // Open currency switches, before the usage sync (bounded; a failure
+      // never stops the sweep — the next minute carries on).
+      try {
+        await services.currencySwitch(alertingLogger()).advanceOpen({ deadline: startedAt + SWITCH_DEADLINE_MS });
+      } catch (err) {
+        console.error({ metric: "billing.currency_switch.advance_failed", err: errorMessage(err) }, "Advancing the open currency switches failed");
+      }
 
       // The usage sync, once — or, with an interval under a minute, a pass
       // every BILLING_SWEEP_INTERVAL_MS until LAST_PASS_START_MS (passes.ts).

@@ -44,6 +44,20 @@ export const UNIT = "token-test";
 export const PLAN = "plan-monthly";
 export const PLAN_B = "plan-monthly-large";
 export const PACK = "token-pack";
+/** The test site's two free plans (FREE_PLAN_ITEM_PRICE_ID_USD / _INR). */
+export const USD_FREE = "pre-paid-test-v1-USD-Yearly";
+export const INR_FREE = "pre-paid-test-v1-INR-Yearly";
+
+/**
+ * What a plan's OWN Credit Grant issues when a subscription is created on it,
+ * as the test site's catalogue does — MEASURED 2026-10-01: the USD free plan
+ * grants 1 token-test (block grant_source "subscription_created"), the INR one
+ * none. Any other plan here: 1,000, as the rig always has.
+ */
+const PLAN_GRANT: Record<string, number> = { [USD_FREE]: 1, [INR_FREE]: 0 };
+
+/** Each plan's currency (`currency_code`). The rig's own plans are INR, as the site's paid plans are. */
+const PLAN_CURRENCY: Record<string, string> = { [USD_FREE]: "USD" };
 export const DAY_S = 86_400;
 export const T0_S = Math.floor(T0 / 1000);
 /** The platform's free-plan budget, which its reconciler restores on an unmanaged team. */
@@ -137,6 +151,8 @@ export interface FakeSubscription {
   id: string;
   customer_id: string;
   status: string;
+  /** Fixed by the plan for the subscription's life, as Chargebee fixes it. */
+  currency_code: string;
   created_at: number;
   current_term_start: number;
   current_term_end: number;
@@ -218,19 +234,22 @@ export class ChargebeeWorld {
 
   constructor(private readonly now: () => number) {}
 
+  /** `credits` overrides what the plan's own Credit Grant issues (PLAN_GRANT). */
   subscribe(id: string, opts: { plan?: string; start?: number; end?: number; credits?: number } = {}): FakeSubscription {
     const start = opts.start ?? T0_S;
+    const plan = opts.plan ?? PLAN;
     const sub: FakeSubscription = {
       id,
       customer_id: TENANT,
       status: "active",
+      currency_code: PLAN_CURRENCY[plan] ?? "INR",
       created_at: Math.floor(this.now() / 1000) + this.seq++,
       current_term_start: start,
       current_term_end: opts.end ?? start + 30 * DAY_S,
-      subscription_items: [{ item_price_id: opts.plan ?? PLAN }],
+      subscription_items: [{ item_price_id: plan }],
     };
     this.subscriptions.push(sub);
-    this.grantPlan(id, opts.credits ?? 1000);
+    this.grantPlan(id, opts.credits ?? PLAN_GRANT[plan] ?? 1000);
     return sub;
   }
 
@@ -240,7 +259,11 @@ export class ChargebeeWorld {
     return sub;
   }
 
-  /** The item price's Credit Grant: a new live plan block. A grant of zero makes no block and no wallet. */
+  /**
+   * The item price's Credit Grant: a new live plan block, naming the plan the
+   * subscription is on (its `billing_metadata.item_price_id`, as the live site
+   * writes it). A grant of zero makes no block and no wallet.
+   */
   grantPlan(subscriptionId: string, credits: number) {
     if (credits === 0) return;
     this.wallets.add(subscriptionId);
@@ -254,7 +277,7 @@ export class ChargebeeWorld {
       kind: "plan",
       created_at_ms: this.now(),
       invoice: { id: `inv_plan_${n}`, lineItemId: `li_plan_${n}` },
-      itemPriceId: PLAN,
+      itemPriceId: this.subscriptions.find((s) => s.id === subscriptionId)?.subscription_items[0]?.item_price_id ?? PLAN,
     });
     this.ledger.balance += credits;
   }
@@ -355,8 +378,9 @@ export class ChargebeeWorld {
       const sub = this.subscriptions.find((s) => s.id === id);
       return sub ? structuredClone(sub) : null;
     },
-    /** GET /customers/{id}: our one customer, unless the site is the wrong one. */
-    customer: async (id: string) => (!this.wrongSite && id === TENANT ? { id } : null),
+    /** GET /customers/{id}: our one customer, with no billing address, unless the site is the wrong one. */
+    customer: async (id: string) =>
+      !this.wrongSite && id === TENANT ? { id, billingAddress: null, preferredCurrencyCode: null } : null,
     subscriptionIdsOf: async (customerId: string) =>
       this.subscriptions.filter((s) => s.customer_id === customerId).map((s) => s.id),
     activeSubscriptions: async (customerId: string) =>
@@ -387,6 +411,7 @@ export class ChargebeeWorld {
           status: b.status,
           source: b.kind === "plan" ? "subscription_created" : b.kind === "catalogue" ? "top_up" : "promotional_grants",
           createdAtMs: b.created_at_ms,
+          expiresAtMs: b.expires_at ? b.expires_at * 1000 : null,
           invoices: b.invoice ? [{ invoiceId: b.invoice.id, lineItemId: b.invoice.lineItemId }] : [],
           itemPriceId: b.itemPriceId ?? null,
           doneBy: b.doneBy ?? null,
@@ -467,11 +492,17 @@ export function webhook(eventType: string, sub: FakeSubscription, id = `ev_${eve
 // ── the rig ────────────────────────────────────────────────────────────────
 
 /**
- * `freePlanCredits`: PLAN is the free plan, and billing grants this many credits
- * once to an org on it, into `freePlanCreditUnit` (UNIT unless given) when the
- * subscription has no wallet.
+ * `freePlanCredits`: the free plans (`freeItemPriceIds`, PLAN unless given)
+ * get this many credits once per org, into `freePlanCreditUnit` (UNIT unless
+ * given) when the subscription has no wallet. `""` is FREE_PLAN_CREDITS
+ * configured off: the free plans and the unit are still wired, nothing is
+ * granted. Absent wires none of them.
  */
-export function lifecycleRig({ freePlanCredits, freePlanCreditUnit = UNIT }: { freePlanCredits?: string; freePlanCreditUnit?: string } = {}) {
+export function lifecycleRig({
+  freePlanCredits,
+  freePlanCreditUnit = UNIT,
+  freeItemPriceIds = [PLAN],
+}: { freePlanCredits?: string; freePlanCreditUnit?: string; freeItemPriceIds?: string[] } = {}) {
   let now = T0;
   const prisma = makeFakePrisma({
     chargebeeSubscriptionId: null,
@@ -512,7 +543,9 @@ export function lifecycleRig({ freePlanCredits, freePlanCreditUnit = UNIT }: { f
     chargebee: cb.client as never,
     usdPerCredit: RATE,
     billingItemPriceIds: [PLAN, PLAN_B],
-    ...(freePlanCredits ? { freeItemPriceId: PLAN, freePlanCredits, freePlanCreditUnit } : {}),
+    // Given at all — even "" (FREE_PLAN_CREDITS configured off) — the free
+    // plans and the unit are wired as the container wires them from config.
+    ...(freePlanCredits !== undefined ? { freeItemPriceIds, freePlanCredits, freePlanCreditUnit } : {}),
     clock: () => now,
     logger,
     ...hooks,
@@ -520,7 +553,7 @@ export function lifecycleRig({ freePlanCredits, freePlanCreditUnit = UNIT }: { f
   const webhooks = createWebhookService({
     accountService: accounts,
     accounts: repo,
-    topUp: { itemPriceId: PACK, creditsPerUnit: "1000" },
+    topUps: [{ itemPriceId: PACK, creditsPerUnit: "1000" }],
     logger,
   });
   const usageSync = createUsageSyncService({

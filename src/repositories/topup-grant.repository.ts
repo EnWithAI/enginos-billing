@@ -83,6 +83,25 @@ export function createTopUpGrantRepository(prisma: PrismaClient = defaultPrisma)
     },
 
     /**
+     * Every row whose invoice id starts with `prefix` — a currency switch's
+     * carry rows are `carry:<switch id>:<grant block id>`, and what the switch
+     * carried is the sum of those APPLIED.
+     */
+    async withInvoicePrefix(tenantId: string, prefix: string): Promise<TopUpGrant[]> {
+      const rows = await prisma.topUpGrant.findMany({ where: { tenantId, invoiceId: { startsWith: prefix } } });
+      return rows.map((row) => toGrant(row));
+    },
+
+    /**
+     * How many of the tenant's grants are not settled — SENDING or PENDING, an
+     * allocate that may yet land. A currency switch does not start over one:
+     * it would land on the subscription the switch is emptying.
+     */
+    countUnresolved(tenantId: string): Promise<number> {
+      return prisma.topUpGrant.count({ where: { tenantId, status: { in: [TOPUP.SENDING, TOPUP.PENDING] } } });
+    },
+
+    /**
      * Allocations this service has made and seen land, for a subscription and
      * unit — what the evidence check subtracts, so a grant block of ANOTHER
      * invoice's allocation is not mistaken for this one's.

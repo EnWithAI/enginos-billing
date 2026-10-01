@@ -83,6 +83,40 @@ export interface PushOptions {
    * current spend instead.
    */
   usableCredits?: string | null;
+  /**
+   * Set ONLY by the push that moves the cap onto a currency switch's new
+   * subscription (account.service activateAfterSwitch): the credits that
+   * subscription's own plan granted on creation (`currency_switch.own_grant`),
+   * which the switch's mirror netted out of its balance but which still count
+   * in its granted total. The cap does not move — see push(). Absent: an
+   * ordinary push.
+   */
+  switchAdjustCredits?: string;
+}
+
+/**
+ * A currency switch's push would not guess, and wrote nothing: thrown so the
+ * switch waits and tries again (activateAfterSwitch leaves the account
+ * `switching`).
+ *
+ *   no_term      the new subscription's term start is not known, and without
+ *                it a repeat of the push could not tell it had already moved
+ *                the baseline — it would move it twice
+ *   no_balance   the team has no stored baseline to carry over, and no
+ *                balance was read to rebuild one from
+ */
+export class SwitchPushRefused extends Error {
+  constructor(
+    tenantId: string,
+    readonly reason: "no_term" | "no_balance",
+  ) {
+    super(
+      reason === "no_term"
+        ? `Tenant ${tenantId}: the currency switch's new subscription has no term start to adopt`
+        : `Tenant ${tenantId}'s team has no stored spend baseline, and the currency switch read no balance to rebuild it from`,
+    );
+    this.name = "SwitchPushRefused";
+  }
 }
 
 /** Rounded so a float round trip through LiteLLM does not look like a change. */
@@ -124,7 +158,7 @@ export function createGatewayBudget(deps: {
    */
   async function push(
     tenantId: string,
-    { unblock = true, termStart = null, usableCredits = null }: PushOptions = {},
+    { unblock = true, termStart = null, usableCredits = null, switchAdjustCredits }: PushOptions = {},
   ): Promise<{ teamId: string; maxBudget: number; changed: boolean }> {
     const { teamId, team } = await teamOf(tenantId);
 
@@ -136,12 +170,39 @@ export function createGatewayBudget(deps: {
     // never a reason to hand back credits already spent.
     const term = termStart ? termStart.toISOString() : null;
     const renewed = managed && term != null && heldTerm != null && Date.parse(term) > Date.parse(heldTerm);
-    const nextTerm = term != null && (heldTerm == null || Date.parse(term) > Date.parse(heldTerm)) ? term : heldTerm;
+    let nextTerm = term != null && (heldTerm == null || Date.parse(term) > Date.parse(heldTerm)) ? term : heldTerm;
 
     const spendable = Math.max(Number(await deps.grantedCreditsFor(tenantId)), 0);
 
     let baseline: number;
-    if (managed && Number.isFinite(stored) && !renewed) {
+    if (switchAdjustCredits !== undefined) {
+      // A CURRENCY SWITCH, and the cap must not move. The org's credits were
+      // copied block for block onto a new subscription and its consumption
+      // mirrored there, so the new subscription's paid grant is the old one's
+      // PLUS whatever its own plan granted on creation — which the switch
+      // netted out of the balance but which still counts in the grant. So the
+      // stored baseline drops by exactly that, and max_budget after is
+      // max_budget before. Never the renewal branch: the new subscription's
+      // term start is later than the one held, and read as a renewal with a
+      // balance the switch may not have, the baseline jumped to the team's
+      // spend and the cap by every credit already used (MEASURED in a
+      // simulation: $20 to $32). Its term is ADOPTED instead, so no later
+      // activation sees a renewal either — and a repeat of this push (the
+      // switch re-run after a crash) finds it adopted, and moves nothing twice.
+      if (term == null) throw new SwitchPushRefused(tenantId, "no_term");
+      nextTerm = term;
+      if (managed && Number.isFinite(stored)) {
+        baseline = heldTerm === term ? stored : usd(stored - Number(creditsToUsd(switchAdjustCredits, deps.usdPerCredit)));
+      } else if (usableCredits != null && Number.isFinite(Number(usableCredits))) {
+        // No cap to carry over (a team billing has not managed, or one from
+        // before baselines were stored): built as a renewal is, against the
+        // balance the switch read — never against the bare spend.
+        const consumed = Math.max(spendable - Number(usableCredits), 0);
+        baseline = usd(team.spend - Number(creditsToUsd(consumed, deps.usdPerCredit)));
+      } else {
+        throw new SwitchPushRefused(tenantId, "no_balance");
+      }
+    } else if (managed && Number.isFinite(stored) && !renewed) {
       baseline = stored;
     } else if (renewed && usableCredits != null && Number.isFinite(Number(usableCredits))) {
       // A renewal baselines against CHARGEBEE, not against the spend at the

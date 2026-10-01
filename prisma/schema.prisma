@@ -22,6 +22,11 @@
 // an allocation to the invoice it paid for, so this is the one fact about
 // credits the service has to remember itself — see the model below.
 //
+// A fourth, `currency_switch`, is the same kind of record for the one other
+// time billing moves credits itself: an org whose billing address moved it to
+// another currency, carried from one subscription to another. Each capture of
+// a switch is stored there before it is sent — see the model.
+//
 // Chargebee owns the money. There is no credit ledger here, no balance and no
 // billed-event table: the customer's credits, grants, top-ups and consumption
 // live in Chargebee and are read from it.
@@ -109,11 +114,37 @@ model BillingAccount {
   currentTermStart DateTime? @map("current_term_start") @db.Timestamptz()
   currentTermEnd   DateTime? @map("current_term_end") @db.Timestamptz()
 
-  /// unlinked | activating | active | cancelled | exhausted
+  /// The country of the billing address the org CONFIRMED on its billing page
+  /// (ISO 3166-1 alpha-2, upper case; CHECKed). Null until it gives one — and
+  /// then the page asks for the address first and offers no top-up.
+  ///
+  /// The one part of the address kept here, because it decides which
+  /// subscription the org is on: India is billed in INR, everywhere else in
+  /// USD (models/currency.ts). The address itself lives on the Chargebee
+  /// customer, which invoices take it from, and is read back from there.
+  billingCountry String? @map("billing_country") @db.VarChar(2)
+
+  /// The linked subscription's currency (ISO 4217; CHECKed), mirrored from
+  /// Chargebee's `currency_code` whenever the subscription is linked or
+  /// re-read. Chargebee fixes it for the life of the subscription, so a
+  /// different currency means a different subscription (`currency_switch`).
+  /// Null before the first link, and on a row linked before this existed —
+  /// readers fall back to the live subscription's `currency_code`.
+  currency String? @db.VarChar(3)
+
+  /// A top-up charge is on the wire until then (a lease: a process that dies
+  /// mid-charge leaves it to run out). A currency switch does not start under
+  /// it, and no charge starts while a switch is open — so a pack is never
+  /// charged onto a subscription the switch is about to empty.
+  topupChargingUntil DateTime? @map("topup_charging_until") @db.Timestamptz(3)
+
+  /// unlinked | activating | active | cancelled | exhausted | switching
   ///
   /// Operational state, not financial state: which of them the gateway should
   /// be enforcing and what the page should say. The credit figures behind
-  /// `exhausted` come from Chargebee, never from here.
+  /// `exhausted` come from Chargebee, never from here. `switching` is held
+  /// while a currency switch moves the org's credits to its new subscription:
+  /// no usage is sent, and nothing but the switch may change the row.
   status String @default("unlinked") @db.VarChar(20)
 
   /// THE BILLING CURSOR — `span_nodes.ingested_at` up to which this tenant is
@@ -135,8 +166,9 @@ model BillingAccount {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
 
-  syncs  ChargebeeSync[]
-  topUps TopUpGrant[]
+  syncs    ChargebeeSync[]
+  topUps   TopUpGrant[]
+  switches CurrencySwitch[]
 
   @@index([status])
   @@map("billing_account")
@@ -315,4 +347,111 @@ model TopUpGrant {
   /// The guard itself: two callers applying the same invoice collide here.
   @@unique([tenantId, invoiceId], map: "topup_grant_invoice_uq")
   @@map("topup_grant")
+}
+
+/// One row per currency switch: an org whose billing address moved it to
+/// another currency, carried from its subscription A to a new subscription B
+/// in that currency, its credit state with it.
+///
+/// Why a switch exists at all. Chargebee fixes a subscription's currency
+/// ("cancel it and create a new one with the required currency"), and its
+/// credit ledger — balances, grant blocks, captures — is keyed per
+/// subscription. So the org's credits are re-created on B block by block (the
+/// carry allocates, guarded by `topup_grant` rows `carry:<switch id>:<block>`),
+/// A is drained to zero, A's consumption is captured on B (the mirror) so B's
+/// ledger CONTINUES A's — same granted, same used, same left — and only then is
+/// billing relinked to B and A cancelled. services/currency-switch.service.ts
+/// is the state machine.
+///
+/// Why this row. It is the stored request for each money movement of the
+/// switch, exactly as `topup_grant` is for an allocate: a drain or the mirror
+/// is written here — its operation id and amount — BEFORE the capture is sent,
+/// and re-sent only under that same id, so a crash, a timeout or two advancers
+/// at once can delay a switch but never move money twice.
+///
+///   REQUESTED  the org asked; NOTHING has changed, in Chargebee or here
+///   MOVING     the account is `switching` (no usage sent, nothing else may
+///              write it); credits are being carried, A drained, B mirrored
+///   LINKED     billing points at B; the cap is being re-set, then A cancelled
+///   DONE       finished
+///   ABANDONED  given up before anything moved (the address changed back, the
+///              org was cancelled, or B could not be created)
+///
+/// At most ONE open (REQUESTED, MOVING, LINKED) switch per tenant: a partial
+/// unique index Prisma cannot express (`currency_switch_open_uq`, migration
+/// 20261001120000_billing_currency; the carry columns came with
+/// 20261001130000_currency_switch_carry). Never delete rows: an open one is
+/// money in flight, and a finished one is the record of where an org's
+/// credits went. The relation is RESTRICT, as for `topup_grant`.
+model CurrencySwitch {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId String         @map("tenant_id") @db.Uuid
+  account  BillingAccount @relation(fields: [tenantId], references: [tenantId], onDelete: Restrict)
+
+  /// A: the subscription the org is billed on when the switch is asked for.
+  fromSubscriptionId String @map("from_subscription_id") @db.VarChar(100)
+  fromCurrency       String @map("from_currency") @db.VarChar(3)
+  toCurrency         String @map("to_currency") @db.VarChar(3)
+  /// The plan B is created on: the free plan of `to_currency`.
+  toItemPriceId      String @map("to_item_price_id") @db.VarChar(100)
+  /// B, once created or found. Set once (compare-and-set from null), with when
+  /// (CHECKed together): B's own plan grant is read only once it can have
+  /// landed.
+  toSubscriptionId   String?   @map("to_subscription_id") @db.VarChar(100)
+  toSubscriptionAt   DateTime? @map("to_subscription_at") @db.Timestamptz(3)
+
+  /// The account's credit unit when MOVING started — every carry, drain and
+  /// mirror is in it. Null: A had no credit wallet, and nothing is moved.
+  ledgerUnitId String? @map("ledger_unit_id") @db.VarChar(50)
+
+  /// REQUESTED | MOVING | LINKED | DONE | ABANDONED
+  status String @db.VarChar(16)
+
+  /// Credits captured off A by drains that have SETTLED. Ten decimal places,
+  /// Chargebee's ledger precision, like every amount here.
+  drained Decimal @default(0) @db.Decimal(20, 10)
+  /// Credits on A that belong to top-up invoices not settled (a voided pack's
+  /// grant stays on A). Never carried — so a pack nobody paid for never
+  /// becomes paid credits on B — and taken off what the drain counts.
+  heldBack Decimal @default(0) @map("held_back") @db.Decimal(20, 10)
+  /// What B's own plan granted on creation (MEASURED: the USD and INR free
+  /// plans each grant 1 credit; read from B, never assumed), netted out of the
+  /// mirror so B's balance is
+  /// A's — and switching back and forth mints nothing.
+  ownGrant Decimal @default(0) @map("own_grant") @db.Decimal(20, 10)
+  /// A drain capture on A that is on the wire, or whose outcome is unknown:
+  /// its operation id and amount are written BEFORE it is sent, and it is
+  /// re-sent only under that id until it settles. Both or neither (CHECKed).
+  drainOperationId String?  @map("drain_operation_id") @db.Uuid
+  drainAmount      Decimal? @map("drain_amount") @db.Decimal(20, 10)
+
+  /// The capture on B that carries A's consumption, so B's ledger shows what
+  /// A showed. Stored before it is sent, like a drain. Both or neither.
+  mirrorOperationId String?   @map("mirror_operation_id") @db.Uuid
+  mirrorAmount      Decimal?  @map("mirror_amount") @db.Decimal(20, 10)
+  mirroredAt        DateTime? @map("mirrored_at") @db.Timestamptz(3)
+
+  /// One advancer at a time (compare-and-set). A lease, not a lock: an
+  /// advancer that dies leaves it to run out, and every step is safe to
+  /// repeat besides. `leaseOwner` is WHICH advancer: every write of an
+  /// advancing switch compares it, so one whose lease was taken over writes
+  /// nothing more. Owner and time together, or neither (CHECKed).
+  leaseUntil   DateTime? @map("lease_until") @db.Timestamptz(3)
+  leaseOwner   String?   @map("lease_owner") @db.Uuid
+  attemptCount Int       @default(0) @map("attempt_count")
+  /// Why the switch is waiting, or why it was abandoned. For a person.
+  error        String?
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  movingAt    DateTime? @map("moving_at") @db.Timestamptz(3)
+  linkedAt    DateTime? @map("linked_at") @db.Timestamptz(3)
+  /// When the org's LiteLLM cap moved to B. After it, cancelling A is a
+  /// background chore that blocks no top-up and no address edit.
+  activatedAt DateTime? @map("activated_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  @@index([status], map: "currency_switch_status_idx")
+  @@map("currency_switch")
 }

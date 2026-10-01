@@ -16,11 +16,13 @@ import { FREE_PLAN_CREDITS_YEARS } from "@/services/account.service";
 
 import {
   gatewayAgreesWithDb,
+  INR_FREE,
   lifecycleRig,
   PLAN_B,
   T0,
   TENANT,
   UNIT,
+  USD_FREE,
   webhook,
   type LifecycleRig,
 } from "./failure-matrix-lifecycle-webhooks-litellm.helpers";
@@ -248,6 +250,34 @@ describe("orgs that get nothing from it", () => {
   });
 });
 
+describe("which unit syncSubscription links when FREE_PLAN_CREDITS is off", () => {
+  it("a free plan that grants zero, with no wallet: linked to FREE_PLAN_CREDIT_UNIT on 0 credits, nothing allocated", async () => {
+    const r = lifecycleRig({ freePlanCredits: "" });
+    await r.subscribe("sub_1", { credits: 0 });
+
+    expect(r.cb.wallets.has("sub_1")).toBe(false);
+    expect(r.cb.allocateCalls).toHaveLength(0);
+    expect(rows(r)).toEqual([]);
+    expect(r.account()).toMatchObject({ chargebeeSubscriptionId: "sub_1", ledgerUnitId: UNIT, status: "active" });
+  });
+
+  it("a subscription that holds a wallet keeps its own unit, whatever FREE_PLAN_CREDIT_UNIT says", async () => {
+    const r = lifecycleRig({ freePlanCredits: "", freePlanCreditUnit: "other-unit" });
+    await r.subscribe("sub_1", { credits: 1 });
+
+    expect(r.account()).toMatchObject({ ledgerUnitId: UNIT, status: "active" });
+    expect(r.cb.allocateCalls).toHaveLength(0);
+  });
+
+  it("a paid plan that grants zero is not given the free plan's unit", async () => {
+    const r = lifecycleRig({ freePlanCredits: "" });
+    await r.subscribe("sub_1", { plan: PLAN_B, credits: 0 });
+
+    expect(r.account()).toMatchObject({ chargebeeSubscriptionId: "sub_1", ledgerUnitId: null });
+    expect(r.cb.allocateCalls).toHaveLength(0);
+  });
+});
+
 describe("FREE_PLAN_CREDITS", () => {
   const KEYS = ["FREE_PLAN_CREDITS", "FREE_PLAN_CREDIT_UNIT", "CHARGEBEE_SITE", "CHARGEBEE_API_KEY", "CLICKHOUSE_PASSWORD"];
   let saved: Record<string, string | undefined>;
@@ -283,8 +313,51 @@ describe("FREE_PLAN_CREDITS", () => {
     expect(() => getConfig()).toThrow(/FREE_PLAN_CREDIT_UNIT is not set/);
   });
 
-  it.each(["0", "-10", "abc", "10k"])("refuses %s", (value) => {
+  // OBSERVED LIVE 2026-10-01: an operator turning the grant off wrote
+  // FREE_PLAN_CREDITS=0, and the refusal took every billing route down.
+  it.each(["0", "0.0", "00"])("takes %s as off, like empty — never a boot failure", (value) => {
+    process.env.FREE_PLAN_CREDITS = value;
+    expect(getConfig().freePlanCredits).toBe("");
+  });
+
+  it.each(["-10", "abc", "10k"])("refuses %s", (value) => {
     process.env.FREE_PLAN_CREDITS = value;
     expect(() => getConfig()).toThrow(/FREE_PLAN_CREDITS must be a number greater than zero/);
+  });
+});
+
+describe("every currency's free plan is the free plan (FREE_PLAN_ITEM_PRICE_ID_<CUR>)", () => {
+  // OBSERVED LIVE 2026-10-01: an org put on the USD free plan showed 2 credits
+  // with FREE_PLAN_CREDITS=1 — the plan's own 1-credit block (MEASURED: the
+  // USD free plan grants 1 token-test on creation) was not counted, because
+  // only the INR plan was "the free plan", and billing allocated another 1.
+  it("counts the USD plan's own grant: it grants 1, FREE_PLAN_CREDITS is 1 — nothing is allocated", async () => {
+    const r = lifecycleRig({ freePlanCredits: "1", freeItemPriceIds: [USD_FREE, INR_FREE] });
+
+    await r.subscribe("sub_1", { plan: USD_FREE });
+
+    expect(r.cb.allocateCalls).toEqual([]);
+    expect(r.cb.liveCredits("sub_1")).toBe(1);
+    expect(rows(r)).toEqual([expect.objectContaining({ invoiceId: FREE_PLAN_GRANT, source: "catalogue_grant", status: "APPLIED", credits: "1" })]);
+    expect(r.account()).toMatchObject({ status: "active", currency: "USD" });
+  });
+
+  it("tops the USD plan's grant up to FREE_PLAN_CREDITS, never past it", async () => {
+    const r = lifecycleRig({ freePlanCredits: "5", freeItemPriceIds: [USD_FREE, INR_FREE] });
+
+    await r.subscribe("sub_1", { plan: USD_FREE });
+
+    expect(r.cb.allocateCalls).toEqual([expect.objectContaining({ subscriptionId: "sub_1", amount: "4" })]);
+    expect(r.cb.liveCredits("sub_1")).toBe(5);
+  });
+
+  it("grants the INR plan, which grants nothing itself, the whole of FREE_PLAN_CREDITS — once, as before", async () => {
+    const r = lifecycleRig({ freePlanCredits: "1", freeItemPriceIds: [USD_FREE, INR_FREE] });
+
+    await r.subscribe("sub_1", { plan: INR_FREE });
+
+    expect(r.cb.allocateCalls).toEqual([expect.objectContaining({ subscriptionId: "sub_1", amount: "1", unitId: UNIT })]);
+    expect(r.cb.liveCredits("sub_1")).toBe(1);
+    expect(r.account()).toMatchObject({ status: "active", currency: "INR" });
   });
 });

@@ -2,6 +2,7 @@
  * The shapes the Chargebee client speaks, narrowed to what this service reads.
  */
 
+import type { BillingAddress } from "../../models/billing-address";
 import type { Logger } from "../../shared/logger";
 import type { CaptureResult } from "./errors";
 
@@ -79,10 +80,68 @@ export interface GrantBlock {
   /** `grant_source`: subscription_created, top_up, promotional_grants, … */
   source: string | null;
   createdAtMs: number | null;
+  /**
+   * When the block stops counting (`expires_at`, epoch seconds on the wire),
+   * in ms; null when Chargebee gave none. A pack's grant is far out (MEASURED:
+   * 2149-12-31), a plan's ends with its term — so a block re-created on
+   * another subscription keeps its own.
+   */
+  expiresAtMs: number | null;
   invoices: Array<{ invoiceId: string | null; lineItemId: string | null }>;
   itemPriceId: string | null;
   doneBy: string | null;
 }
+
+/**
+ * The billing address Chargebee holds for a customer — what invoices print,
+ * and what the billing page shows and pre-fills its form from.
+ *
+ * Every field may be missing: Chargebee leaves out what was never set, and an
+ * address edited in its dashboard need not be complete. Distinct from the
+ * models/billing-address.ts `BillingAddress`, which is one billing has
+ * VALIDATED, on its way in.
+ */
+export interface CustomerBillingAddress {
+  firstName: string | null;
+  lastName: string | null;
+  company: string | null;
+  line1: string | null;
+  line2: string | null;
+  city: string | null;
+  state: string | null;
+  stateCode: string | null;
+  zip: string | null;
+  /** ISO 3166-1 alpha-2, as Chargebee stores it. */
+  country: string | null;
+  /** Not on billing's form — read only so updateBillingInfo can send them back unchanged. */
+  email: string | null;
+  phone: string | null;
+  line3: string | null;
+}
+
+/** One customer, narrowed to what billing reads. */
+export interface CustomerDetails {
+  id: string;
+  /** Null when the customer has no billing address at all. */
+  billingAddress: CustomerBillingAddress | null;
+  /** ISO 4217. Present only on a site with Multi-Currency on, and only once set. */
+  preferredCurrencyCode: string | null;
+  /**
+   * Tax registration on the customer (a GSTIN, a VAT number), set on a
+   * Chargebee hosted page or by hand. Billing never edits it; it is read so
+   * updateBillingInfo — which DELETES whatever it is not sent — can send it
+   * back as it was.
+   */
+  vatNumber: string | null;
+  vatNumberPrefix: string | null;
+  registeredForGst: boolean | null;
+  businessCustomerWithoutVatNumber: boolean | null;
+}
+
+/** An address to pre-fill a hosted page with: the confirmed one, as billing or Chargebee holds it. */
+export type AddressFields = Partial<
+  Record<"firstName" | "lastName" | "company" | "line1" | "line2" | "city" | "state" | "stateCode" | "zip" | "country", string | null>
+>;
 
 /**
  * One movement of real money: a payment, or a refund of one.
@@ -200,6 +259,8 @@ export interface ChargebeeClient {
     quantity?: number;
     /** Where Chargebee sends the browser once the checkout is done. Omit it when Chargebee.js opens the page. */
     redirectUrl?: string;
+    /** The confirmed billing address, pre-filled — so the page does not write a different one back. */
+    billingAddress?: AddressFields | null;
   }): Promise<Record<string, unknown>>;
   portalSession(args: { customerId: string; redirectUrl: string }): Promise<Record<string, unknown>>;
   /** A hosted page where the customer manages their cards — no cancellation, unlike the portal. */
@@ -213,18 +274,39 @@ export interface ChargebeeClient {
   ledgerOperation(id: string): Promise<LedgerOperation | null>;
   /** One subscription, any status. Null only on a definite 404; anything else unclear throws. */
   subscription(id: string): Promise<Record<string, unknown> | null>;
-  /** One customer. Null only on a definite 404. */
-  customer(id: string): Promise<{ id: string } | null>;
+  /**
+   * End a subscription NOW (`cancel_for_items`, `end_of_term=false`), crediting,
+   * invoicing and refunding nothing. One already cancelled — or gone — counts
+   * as cancelled. Returns the subscription as Chargebee left it.
+   */
+  cancelSubscription(subscriptionId: string): Promise<Record<string, unknown>>;
+  /** One customer, with the billing address it holds. Null only on a definite 404. */
+  customer(id: string): Promise<CustomerDetails | null>;
+  /**
+   * Set the customer's billing address (`update_billing_info`), keeping the
+   * tax registration and the address fields billing does not own; answers the
+   * customer as it now stands. No route calls it since A29: the org edits its
+   * address in Chargebee's own editor, and billing reads it back (customer()).
+   */
+  updateBillingInfo(customerId: string, address: BillingAddress): Promise<CustomerDetails>;
+  /** The currency Chargebee routes the customer's payments in (`preferred_currency_code`). */
+  setPreferredCurrency(customerId: string, currencyCode: string): Promise<CustomerDetails>;
   /** Every subscription id the customer has, whatever its status. */
   subscriptionIdsOf(customerId: string): Promise<string[]>;
   /** One plan's details. Null when the id is not in the catalogue. */
   itemPrice(id: string): Promise<ItemPrice | null>;
   activeSubscriptions(customerId: string): Promise<Array<Record<string, any>>>;
-  /** Subscribe a customer with no checkout — the free plan only. Idempotent per key. */
+  /**
+   * Subscribe a customer with no checkout — the free plan only. Idempotent per
+   * key; with `subscriptionId`, the subscription gets that id, and one that
+   * already has it is the answer.
+   */
   subscribeCustomer(args: {
     customerId: string;
     itemPriceId: string;
     idempotencyKey: string;
+    /** A client-supplied subscription id (at most 50 characters): what makes "was it created?" answerable. */
+    subscriptionId?: string;
   }): Promise<Record<string, unknown>>;
   allocate(args: {
     subscriptionId: string;
@@ -243,18 +325,33 @@ export interface ChargebeeClient {
   }): Promise<ChargedInvoice>;
   /** Charge the card on file for an invoice Chargebee has not collected. Never retried. */
   collectInvoice(invoiceId: string): Promise<ChargedInvoice>;
-  paidInvoicesFor(customerId: string, itemPriceId: string): Promise<Array<Record<string, any>>>;
-  /** The customer's uncollected invoices with a line for this item price, oldest first. */
-  unpaidInvoicesFor(customerId: string, itemPriceId: string): Promise<UnpaidInvoice[]>;
+  /**
+   * The customer's paid invoices with a line for ANY of these item prices —
+   * one id, or several (every currency's top-up). Newest first.
+   */
+  paidInvoicesFor(customerId: string, itemPriceIds: string | string[]): Promise<Array<Record<string, any>>>;
+  /** The customer's uncollected invoices with a line for ANY of these item prices, oldest first. */
+  unpaidInvoicesFor(customerId: string, itemPriceIds: string | string[]): Promise<UnpaidInvoice[]>;
+  /**
+   * The ids of the customer's top-up invoices that are NOT settled — owed,
+   * abandoned by dunning, voided or pending — for any of these item prices.
+   * With ledger.ts isUnsettledTopUpGrant, the one rule for which credits are
+   * not paid for (unpaidTopUpCredits, and what a currency switch holds back).
+   */
+  unsettledTopUpInvoiceIds(customerId: string, itemPriceIds: string | string[]): Promise<string[]>;
+  /** The same invoices with their status — `payment_due`, `not_paid`, `voided` or `pending` — for a caller that must tell them apart. */
+  unsettledTopUpInvoices(customerId: string, itemPriceIds: string | string[]): Promise<Array<{ id: string; status: string }>>;
   /**
    * Credits Chargebee granted for top-ups whose invoice is NOT paid — for the
    * caller to hold back from the balance and the gateway cap. Plain decimal.
+   * `itemPriceId` is one top-up item price or several: a pack bought in any
+   * currency is held back until it is paid.
    */
   unpaidTopUpCredits(args: {
     customerId: string;
     subscriptionId: string;
     unitId?: string;
-    itemPriceId: string;
+    itemPriceId: string | string[];
     now?: number;
   }): Promise<string>;
   /** One page of payments, newest first, and the opaque cursor for the next (null at the end). */

@@ -24,7 +24,7 @@ import { AppError, conflict } from "@/shared/errors";
 import type { Logger } from "@/shared/logger";
 import { renderBillingOverview } from "@/views/billing.view";
 
-import { T0, TENANT, makeFakePrisma, quietLogger } from "./harness";
+import { T0, TENANT, makeFakePrisma, quietLogger, testCatalog } from "./harness";
 
 function request() {
   return new Request("http://billing.test/api/x", { method: "POST", body: "{}" });
@@ -65,6 +65,8 @@ const CARD = { id: "pm_1", type: "card", status: "valid", brand: "visa", last4: 
 function chargebeeStub(over: Partial<ChargebeeClient> = {}) {
   return {
     createCustomer: async ({ id }: { id: string }) => ({ id }),
+    // The plans are INR, as the rig's billing country is billed in (checkoutRig).
+    itemPrice: async (id: string) => ({ id, name: id, priceMinor: 100_000, currencyCode: "INR", period: 1, periodUnit: "month" }),
     checkoutPage: async () => ({ id: "hp_1" }),
     chargeItem: async () => PAID,
     paymentSource: async () => CARD,
@@ -84,7 +86,10 @@ function checkoutRig(
   prepare?: (prisma: ReturnType<typeof makeFakePrisma>) => void,
   topUpOffer?: () => Promise<TopUpOffer>,
 ) {
-  const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, ...account } as never);
+  // An org that has confirmed its billing address, billed in INR — the
+  // currency every fixture here is in (testCatalog's default). A top-up and a
+  // checkout both need a confirmed country now (billing-address-required).
+  const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, billingCountry: "IN", currency: "INR", ...account } as never);
   prepare?.(prisma);
   const chargebee = chargebeeStub(over);
   const accounts = createBillingAccountRepository(prisma);
@@ -95,8 +100,7 @@ function checkoutRig(
     accounts,
     itemPriceIds: ["plan-monthly"],
     defaultItemPriceId: "plan-monthly",
-    topUpItemPriceId: "pack",
-    topUpCredits: "1000",
+    catalog: testCatalog({ topUp: "pack", credits: "1000" }),
     ...(topUpOffer ? { topUpOffer } : {}),
     logger: quietLogger,
   });
@@ -120,7 +124,8 @@ describe("checkout", () => {
   it("opens checkout for the tenant's own customer", async () => {
     const checkoutPage = vi.fn(async () => ({ id: "hp_1" }));
     await checkoutRig({ checkoutPage }).startSubscription(TENANT);
-    expect(checkoutPage).toHaveBeenCalledWith({ customerId: TENANT, itemPriceId: "plan-monthly" });
+    // Pre-filled with the confirmed country: no address of its own is held (the stub's customer cannot be read).
+    expect(checkoutPage).toHaveBeenCalledWith({ customerId: TENANT, itemPriceId: "plan-monthly", billingAddress: { country: "IN" } });
   });
 
   it("will not top up an account with no subscription", async () => {
@@ -340,16 +345,43 @@ describe("checkout", () => {
 });
 
 describe("portal", () => {
-  const portal = (over: Partial<ChargebeeClient>, account: Record<string, unknown> = {}, enabled = true) => {
+  const portal = (
+    over: Partial<ChargebeeClient>,
+    account: Record<string, unknown> = {},
+    enabled = true,
+    customerFor?: (tenantId: string) => Promise<string>,
+    addressEditEnabled?: boolean,
+  ) => {
     const prisma = makeFakePrisma({ chargebeeCustomerId: TENANT, ...account } as never);
     return createPortalService({
       chargebee: chargebeeStub(over),
       accounts: createBillingAccountRepository(prisma),
       redirectUrl: "http://app.test",
       enabled,
+      ...(customerFor ? { customerFor } : {}),
+      ...(addressEditEnabled != null ? { addressEditEnabled } : {}),
       logger: quietLogger,
     });
   };
+
+  it("makes the customer a tenant without one needs, then opens on it — the billing address is entered here, before any subscription (A29)", async () => {
+    const portalSession = vi.fn(async () => ({ id: "ps_1" }));
+    const customerFor = vi.fn(async () => TENANT);
+
+    expect(await portal({ portalSession }, { chargebeeCustomerId: null }, true, customerFor).open(TENANT)).toEqual({ id: "ps_1" });
+    expect(customerFor).toHaveBeenCalledWith(TENANT);
+    expect(portalSession).toHaveBeenCalledWith({ customerId: TENANT, redirectUrl: "http://app.test" });
+
+    // A customer already there is used as it is: nothing is made.
+    const unused = vi.fn(async () => "cus_other");
+    await portal({ portalSession }, {}, true, unused).open(TENANT);
+    expect(unused).not.toHaveBeenCalled();
+
+    // A tenant the platform does not know is the customer step's own 404.
+    const unknown = vi.fn(async () => Promise.reject(new AppError("not_found", "Unknown tenant", "tenant-not-found")));
+    const err = await rejection(portal({ portalSession }, { chargebeeCustomerId: null }, true, unknown).open(TENANT));
+    expect([err.kind, err.code]).toEqual(["not_found", "tenant-not-found"]);
+  });
 
   it("stays shut unless it is turned on — the Chargebee portal lets a customer cancel", async () => {
     const portalSession = vi.fn(async () => ({ id: "ps_1" }));
@@ -358,6 +390,22 @@ describe("portal", () => {
     expect(portalSession).not.toHaveBeenCalled();
 
     expect(await portal({ portalSession }, {}, true).open(TENANT)).toEqual({ id: "ps_1" });
+  });
+
+  it("opens for the FIRST address only while address editing is off (BILLING_ADDRESS_EDIT_ENABLED)", async () => {
+    const portalSession = vi.fn(async () => ({ id: "ps_1" }));
+
+    // No country saved yet: the first address is added as always.
+    expect(await portal({ portalSession }, { billingCountry: null }, true, undefined, false).open(TENANT)).toEqual({ id: "ps_1" });
+
+    // A saved address cannot be changed: no session, nothing asked of Chargebee.
+    portalSession.mockClear();
+    const err = await rejection(portal({ portalSession }, { billingCountry: "US" }, true, undefined, false).open(TENANT));
+    expect([err.kind, err.code]).toEqual(["conflict", "address-edit-off"]);
+    expect(portalSession).not.toHaveBeenCalled();
+
+    // Turned on, it opens to edit.
+    expect(await portal({ portalSession }, { billingCountry: "US" }, true, undefined, true).open(TENANT)).toEqual({ id: "ps_1" });
   });
 
   it("has nothing to open for a tenant with no customer", async () => {
@@ -531,8 +579,22 @@ describe("billing page view", () => {
   const config = { site: "test-site", defaultItemPriceId: "plan-monthly" };
   const plansOffered: never[] = [];
 
+  // No address yet, nothing in any currency: what every kind carries before the org confirms one.
+  const rules = { defaultCurrency: "USD", byCountry: { IN: "INR" } };
+  const noAddress = {
+    billingCountry: null,
+    billingAddress: null,
+    currency: null,
+    currencyRules: rules,
+    currencySwitch: null,
+    currencyLocked: false,
+    currencyChange: "none" as const,
+    plansMissingForCurrency: false,
+    addressEditable: true,
+  };
+
   it("gives an unlinked tenant every key, with the site set so checkout can load", () => {
-    expect(renderBillingOverview({ kind: "unlinked", plansOffered, freePlan: false }, config)).toEqual({
+    expect(renderBillingOverview({ kind: "unlinked", plansOffered, freePlan: false, ...noAddress }, config)).toEqual({
       site: "test-site",
       plansOffered,
       freePlan: false,
@@ -546,6 +608,16 @@ describe("billing page view", () => {
       subscription: null,
       topUp: null,
       unpaidTopUps: [],
+      // The page asks for the billing address first, and is told how a country becomes a currency.
+      billingCountry: null,
+      billingAddress: null,
+      currency: null,
+      currencyRules: rules,
+      currencySwitch: null,
+      currencyLocked: false,
+      currencyChange: "none",
+      plansMissingForCurrency: false,
+      addressEditable: true,
     });
   });
 
@@ -557,7 +629,7 @@ describe("billing page view", () => {
       currentTermStart: null,
       currentTermEnd: null,
     } as never;
-    const view = renderBillingOverview({ kind: "activating", plansOffered, freePlan: true, account }, config);
+    const view = renderBillingOverview({ kind: "activating", plansOffered, freePlan: true, account, ...noAddress }, config);
     expect(view.status).toBe("activating");
     expect(view.plan).toEqual({ itemPriceId: "plan-yearly" });
     expect(view.credits).toEqual({ unit: "token", granted: "0", allocated: "0", consumed: "0", current: "0" });
@@ -578,6 +650,7 @@ describe("billing page view", () => {
         lastSync: null,
         topUp: null,
         unpaidTopUps: [],
+        ...noAddress,
       },
       config,
     );
@@ -601,6 +674,7 @@ describe("billing page view", () => {
         lastSync: null,
         topUp: null,
         unpaidTopUps: [],
+        ...noAddress,
       },
       config,
     );

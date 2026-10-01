@@ -16,12 +16,22 @@
  * integrations/chargebee/client.ts).
  */
 
-import type { ChargedInvoice, ChargebeeClient, ChargebeeError, PaymentSource } from "../integrations/chargebee";
+import type { AddressFields, ChargedInvoice, ChargebeeClient, ChargebeeError, PaymentSource } from "../integrations/chargebee";
 import { ACCOUNT } from "../models/account-status";
+import {
+  currencyForCountry,
+  freeItemPriceIds,
+  settingsFor,
+  topUpItemPriceIds,
+  topUpsOf,
+  type CurrencyCatalog,
+  type TopUpSettingsForCurrency,
+} from "../models/currency";
 import { add } from "../models/decimal";
 import { freePlanFor } from "../models/free-plan";
 import type { BillingAccount, BillingAccountRepository } from "../repositories/billing-account.repository";
-import { conflict, invalid, notFound, upstream } from "../shared/errors";
+import { SWITCH, type CurrencySwitchRepository } from "../repositories/currency-switch.repository";
+import { conflict, errorMessage, invalid, notFound, upstream } from "../shared/errors";
 import type { Logger } from "../shared/logger";
 import type { AccountService } from "./account.service";
 import { currencyDigits, type TopUpOffer } from "./plan-catalog.service";
@@ -33,45 +43,108 @@ export function createCheckoutService(deps: {
   /** The plans checkout may sell. An allowlist, not a menu — see config/config.ts. */
   itemPriceIds: string[];
   defaultItemPriceId: string;
-  /** The plan an org it is for gets automatically, card-free. Empty: none. */
-  freeItemPriceId?: string;
+  /**
+   * Every billing currency's free plan and top-up, and the rule that picks a
+   * currency (models/currency.ts). A currency with no free plan puts no org
+   * on one; with no top-up, sells none.
+   */
+  catalog: CurrencyCatalog;
   /** Whether an org with no setting of its own gets the free plan (FREE_PLAN_DEFAULT). */
   freePlanDefault?: boolean;
   /** Where Chargebee sends the browser after a subscription checkout — the billing page. */
   checkoutRedirectUrl?: string;
-  topUpItemPriceId: string;
-  /** Credits ONE unit of the top-up charge grants. */
-  topUpCredits: string;
   /**
-   * The top-up as the page is offered it (plan-catalog.service describeTopUp):
-   * its fewest and most units — TOPUP_MIN_AMOUNT / TOPUP_MAX_AMOUNT in this
-   * charge's price. Absent: at least one unit, and no maximum.
+   * One currency's top-up as the page is offered it (plan-catalog.service
+   * describeTopUp): its fewest and most units — TOPUP_MIN_AMOUNT_<CUR> /
+   * TOPUP_MAX_AMOUNT_<CUR> in that charge's price. Absent: at least one unit,
+   * and no maximum.
    */
-  topUpOffer?: () => Promise<TopUpOffer>;
-  /** The pack's charge carries its own Credit Grant: Chargebee grants, billing only records. */
+  topUpOffer?: (topUp: TopUpSettingsForCurrency) => Promise<TopUpOffer>;
+  /** The packs' charges carry their own Credit Grant: Chargebee grants, billing only records. A currency's own setting wins. */
   topUpChargebeeGrants?: boolean;
+  /**
+   * The org's currency switches (currency-switch.repository.ts): a top-up is
+   * refused while one is open, before anything else is asked. Absent (a test
+   * about something else): the charge lease still refuses one (A13).
+   */
+  switches?: Pick<CurrencySwitchRepository, "findOpen">;
+  /**
+   * A plan's currency, from the Chargebee catalogue — cached (plan-catalog
+   * describePlans) in production; null when it could not be read. Absent: the
+   * catalogue is asked directly. A plan's currency is never parsed from its id.
+   */
+  planCurrency?: (itemPriceId: string) => Promise<string | null>;
+  clock?: () => number;
   logger?: Logger;
   sleep?: (ms: number) => Promise<void>;
 }) {
   const log = deps.logger ?? console;
   const chargebeeGrants = deps.topUpChargebeeGrants ?? false;
   const freePlanDefault = deps.freePlanDefault ?? false;
+  const clock = deps.clock ?? (() => Date.now());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const planCurrency = deps.planCurrency ?? (async (itemPriceId: string) => (await deps.chargebee.itemPrice(itemPriceId))?.currencyCode ?? null);
 
+  /**
+   * A paid plan's checkout — in the org's billing currency only.
+   *
+   * The org's confirmed billing country decides the currency (models/
+   * currency.ts), so there is no checkout before there is a country: 409
+   * `billing-address-required`, and the page asks for the address first. A
+   * plan in any other currency is not offered — `plan-not-offered`, as for
+   * a plan off the allowlist — read from the Chargebee catalogue, never
+   * from the plan's id. DEFAULT_ITEM_PRICE_ID is the plan when none is
+   * named, and is held to the same rule.
+   *
+   * The hosted page is pre-filled with the address the org confirmed: it
+   * writes the address it collects back onto the customer (MEASURED), and a
+   * page left to ask could write one in another country than the one the
+   * currency was chosen by (A21).
+   */
   async function startSubscription(tenantId: string, requestedItemPriceId?: string) {
     const itemPriceId = requestedItemPriceId ?? deps.defaultItemPriceId;
 
     // A security control, not a menu. Without it a tampered request could
     // subscribe this tenant to any item price in the catalogue.
     if (!deps.itemPriceIds.includes(itemPriceId)) throw invalid("Unknown plan", "plan-not-offered");
-    // Nor to the free plan, when it is not for this org: it costs nothing, so
-    // a request naming it would be the free plan an operator did not give.
-    if (itemPriceId === deps.freeItemPriceId && !freePlanFor(await deps.accounts.findByTenantId(tenantId), freePlanDefault)) {
+    const account = await deps.accounts.findByTenantId(tenantId);
+    // Nor to a free plan — any currency's — when it is not for this org: it
+    // costs nothing, so a request naming one would be the free plan an
+    // operator did not give.
+    if (freeItemPriceIds(deps.catalog).includes(itemPriceId) && !freePlanFor(account, freePlanDefault)) {
       throw invalid("Unknown plan", "plan-not-offered");
     }
 
+    if (!account?.billingCountry) throw billingAddressRequired();
+    const currency = currencyForCountry(account.billingCountry, deps.catalog.rules);
+    const sold = await planCurrency(itemPriceId);
+    if (sold == null) throw upstream("Could not read the plan from Chargebee", "checkout-failed");
+    if (sold !== currency) throw invalid(`That plan is not offered in ${currency}`, "plan-not-offered");
+
     const customerId = await customerFor(tenantId);
-    return deps.chargebee.checkoutPage({ customerId, itemPriceId, redirectUrl: deps.checkoutRedirectUrl });
+    const billingAddress = await confirmedAddress(tenantId, customerId, account.billingCountry);
+    return deps.chargebee.checkoutPage({ customerId, itemPriceId, redirectUrl: deps.checkoutRedirectUrl, billingAddress });
+  }
+
+  /**
+   * The address to pre-fill a hosted page with: the one Chargebee holds for
+   * the customer when it is in the confirmed country — that is the address
+   * the org saved — and otherwise the country alone. Best effort: a customer
+   * that cannot be read pre-fills the country alone, said in the log.
+   */
+  async function confirmedAddress(tenantId: string, customerId: string, country: string): Promise<AddressFields> {
+    try {
+      const held = (await deps.chargebee.customer(customerId))?.billingAddress ?? null;
+      if (held?.country !== country) return { country };
+      const { email: _email, phone: _phone, line3: _line3, ...fields } = held;
+      return fields;
+    } catch (err) {
+      log.warn?.(
+        { metric: "billing.checkout.address_unreadable", tenantId, err: errorMessage(err) },
+        "Could not read the customer's billing address to pre-fill the checkout; pre-filling the confirmed country alone",
+      );
+      return { country };
+    }
   }
 
   /**
@@ -126,6 +199,22 @@ export function createCheckoutService(deps: {
    * Only a plan that costs NOTHING is created this way: with no card on file a
    * paid plan would be an unpaid invoice from day one. Its price is read from
    * the catalogue before every create, not trusted from config.
+   *
+   * IN THE CURRENCY OF THE ORG'S BILLING COUNTRY (models/currency.ts): the
+   * free plan of the currency its confirmed country is billed in — and, with
+   * no address yet (sign-up sends none), of the default currency, USD (R8).
+   * The plan's catalogue currency is checked too, so a USD org is never put
+   * on an INR plan by a typo in FREE_PLAN_ITEM_PRICE_ID_USD: Chargebee fixes
+   * a subscription's currency for good. The idempotency key names the
+   * currency: Chargebee replays a key for 30 minutes and refuses one sent
+   * with another body, so an org whose address moved it to another currency
+   * inside that window must not meet the key its first create used. Once the
+   * subscription's currency is decided, the customer is told to prefer it
+   * (A19) — best effort, never in the way.
+   *
+   * The billing address sync never calls this (A3): an org it gave a
+   * country is put on its free plan by the billing page's next load, which
+   * then picks the plan of the new country's currency.
    */
   async function provisionFreePlan(tenantId: string, { billingEmail }: { billingEmail?: string } = {}) {
     const existing = await deps.accounts.findByTenantId(tenantId);
@@ -143,14 +232,15 @@ export function createCheckoutService(deps: {
       return { status: "not-eligible" as const, subscriptionId: null, customerId };
     }
 
-    const freeItemPriceId = deps.freeItemPriceId ?? "";
+    const currency = currencyForCountry(existing?.billingCountry, deps.catalog.rules);
+    const freeItemPriceId = settingsFor(deps.catalog, currency).freeItemPriceId ?? "";
     if (freeItemPriceId === "") throw conflict("No free plan is configured", "free-plan-not-configured");
     // The linking step below only links plans on the allowlist; one outside it
     // would be created in Chargebee and never reach the account.
     if (!deps.itemPriceIds.includes(freeItemPriceId)) {
       log.error?.(
-        { metric: "billing.free_plan.misconfigured", tenantId, freeItemPriceId },
-        "FREE_PLAN_ITEM_PRICE_ID is not in ITEM_PRICE_IDS; no subscription created",
+        { metric: "billing.free_plan.misconfigured", tenantId, freeItemPriceId, currency },
+        "The free plan (FREE_PLAN_ITEM_PRICE_ID_<currency>) is not in ITEM_PRICE_IDS; no subscription created",
       );
       throw conflict("The free plan is not configured correctly", "free-plan-misconfigured");
     }
@@ -166,11 +256,18 @@ export function createCheckoutService(deps: {
         );
         throw conflict("The free plan is not configured correctly", "free-plan-misconfigured");
       }
+      if (plan.currencyCode !== currency) {
+        log.error?.(
+          { metric: "billing.free_plan.wrong_currency", tenantId, freeItemPriceId, currency, planCurrency: plan.currencyCode },
+          "The configured free plan is not priced in the currency it is configured for; refusing to subscribe the org to it",
+        );
+        throw conflict("The free plan is not configured correctly", "free-plan-misconfigured");
+      }
       try {
         await deps.chargebee.subscribeCustomer({
           customerId,
           itemPriceId: freeItemPriceId,
-          idempotencyKey: `free-plan:${tenantId}`,
+          idempotencyKey: `free-plan:${tenantId}:${currency}`,
         });
       } catch (err) {
         // A concurrent call may have created it first; that one is ours too.
@@ -179,10 +276,13 @@ export function createCheckoutService(deps: {
     }
 
     const account = await linkWithLedger(tenantId);
+    // The currency is decided: the linked subscription's, or the plan's just created.
+    await preferCurrency(tenantId, customerId, account?.currency ?? (live.length === 0 ? currency : null));
     log.log?.(
       {
         metric: "billing.free_plan.provisioned",
         tenantId,
+        currency: account?.currency ?? currency,
         created: live.length === 0,
         status: account?.status ?? null,
         ledgerUnitId: account?.ledgerUnitId ?? null,
@@ -193,6 +293,25 @@ export function createCheckoutService(deps: {
       status: live.length === 0 ? ("subscribed" as const) : ("linked" as const),
       subscriptionId: account?.chargebeeSubscriptionId ?? null,
     };
+  }
+
+  /**
+   * Tell Chargebee the currency the customer's subscription is in
+   * (`preferred_currency_code`, A19): Chargebee routes a charge through the
+   * gateway of the customer's PREFERRED currency, and every customer on the
+   * test site prefers INR (MEASURED). Best effort — the subscription is what
+   * fixes the currency, and a failure is said, never in the way.
+   */
+  async function preferCurrency(tenantId: string, customerId: string, currency: string | null) {
+    if (!currency) return;
+    try {
+      await deps.chargebee.setPreferredCurrency(customerId, currency);
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.customer.preferred_currency_failed", tenantId, customerId, currency, err: errorMessage(err) },
+        "Could not set the customer's preferred currency in Chargebee; its charges may be routed through another currency's gateway until it is set",
+      );
+    }
   }
 
   /**
@@ -248,8 +367,35 @@ export function createCheckoutService(deps: {
    *
    * The quantity only sizes the charge. What gets GRANTED is read back off
    * the paid invoice — Chargebee's own grant block for it, or billing's
-   * allocation of `topUpCredits` per unit invoiced — so a tampered number here
+   * allocation of TOPUP_CREDITS_<CUR> per unit invoiced — so a tampered number here
    * can at most change what the customer pays, never what they get for it.
+   *
+   * IN THE SUBSCRIPTION'S CURRENCY, AND ONLY ITS (R5, R6). Chargebee refuses
+   * a charge in any other (MEASURED: `currency_mismatched`), so the pack sold
+   * is the top-up item price of the currency the org's subscription is in —
+   * never the default currency's, never a choice the request makes. Refused,
+   * in this order, each before anything is charged:
+   *
+   *   currency-switch-in-progress  a currency switch is open: no pack is sold
+   *                                in either currency until it has finished
+   *   no-subscription /            nothing live to add credits to
+   *   subscription-cancelled
+   *   billing-address-required     no billing country confirmed yet — the
+   *                                page asks for the address first (R1)
+   *   topup-not-offered            no top-up configured in this currency
+   *   topup-quantity-invalid       outside the limits the page was offered
+   *   topup-in-progress            another top-up is being charged right now
+   *   topup-unpaid                 one is still owed, in any currency
+   *   no-payment-method            no card Chargebee will charge
+   *
+   * THE CHARGE LEASE (A13). The charge runs under a lease on the account
+   * row, taken in the same transaction that checks no currency switch is
+   * open; a switch starts under the same row lock and refuses a live lease.
+   * So a charge and a switch never overlap: without it, a pack paid a second
+   * after the switch's last look at the old subscription landed on one about
+   * to be emptied and cancelled — paid for, never spendable. It serialises
+   * two top-ups of one org too: the second waits for the first to be
+   * recorded, rather than both passing the one-owed-at-a-time check.
    *
    * A declined card grants NOTHING (decided 2026-09-28). MEASURED: the charge
    * then answers 200 with a `payment_due` invoice, not an error — and
@@ -269,67 +415,82 @@ export function createCheckoutService(deps: {
    * the page does not call a declined card an outage.
    */
   async function startTopUp(tenantId: string, quantity: number = 1) {
+    const open = (await deps.switches?.findOpen(tenantId)) ?? null;
+    if (open && blocksTopUps(open)) throw currencySwitchInProgress();
+    const account = await subscribedAccount(tenantId);
+    if (!account.billingCountry) throw billingAddressRequired();
+
+    // The subscription's own currency: stored at the link, or read off the
+    // live subscription for an account linked before that was stored.
+    const currency = account.currency ?? (await liveCurrency(account));
+    const topUp = currency ? settingsFor(deps.catalog, currency).topUp : null;
+    if (!topUp) throw topUpNotOffered();
     // The same limits the page was offered — never only the page's word for
     // them. describeTopUp never throws (a Chargebee outage leaves one unit).
-    // No maximum while TOPUP_MAX_AMOUNT is unset.
-    const offer = deps.topUpOffer ? await deps.topUpOffer() : null;
+    // No maximum while TOPUP_MAX_AMOUNT_<CUR> is unset.
+    const offer = deps.topUpOffer ? await deps.topUpOffer(topUp) : null;
     const fewest = offer?.minQuantity ?? 1;
     const most = offer?.maxQuantity ?? null;
     if (!Number.isInteger(quantity) || quantity < fewest || (most != null && quantity > most)) {
       throw invalid(topUpRangeMessage(offer, fewest, most), "topup-quantity-invalid");
     }
-    const account = await subscribedAccount(tenantId);
 
-    const owed = await deps.chargebee.unpaidInvoicesFor(account.chargebeeCustomerId!, deps.topUpItemPriceId);
-    if (owed.length > 0) {
-      throw conflict("Pay the unpaid top-up before buying more credits", "topup-unpaid");
-    }
-
-    // A free-plan org starts with no card, and Chargebee will not charge one
-    // (MEASURED: 400 `payment_method_not_present`, "no valid card on file").
-    // Asked first, so the page sends the customer to add a card rather than
-    // reporting a failed charge.
-    if (!isChargeable(await deps.chargebee.paymentSource(account.chargebeeCustomerId!))) {
-      throw noPaymentMethod();
-    }
-
-    let invoice: ChargedInvoice;
+    const lease = await takeCharge(tenantId);
     try {
-      invoice = await deps.chargebee.chargeItem({
-        subscriptionId: account.chargebeeSubscriptionId!,
-        itemPriceId: deps.topUpItemPriceId,
-        quantity,
-      });
-    } catch (err) {
-      // The card went away between the check above and the charge.
-      if ((err as ChargebeeError).apiErrorCode === "payment_method_not_present") throw noPaymentMethod();
-      if (isPaymentFailure(err as ChargebeeError)) {
-        log.warn?.(
-          { metric: "billing.topup.payment_failed", tenantId, quantity, reason: (err as Error).message },
-          "Top-up charge was not collected",
-        );
-        throw conflict(`Payment failed: ${(err as Error).message}`, "topup-payment-failed");
+      // Owed in ANY currency: one unpaid pack at a time, whatever it was bought in.
+      const owed = await deps.chargebee.unpaidInvoicesFor(account.chargebeeCustomerId!, topUpItemPriceIds(deps.catalog));
+      if (owed.length > 0) {
+        throw conflict("Pay the unpaid top-up before buying more credits", "topup-unpaid");
       }
-      throw err;
-    }
 
-    if (invoice.status !== "paid") {
-      log.warn?.(
-        {
-          metric: "billing.topup.unpaid",
-          tenantId,
-          invoiceId: invoice.id,
-          status: invoice.status,
-          amountDueMinor: invoice.amountDueMinor,
-          nextRetryAt: invoice.nextRetryAt,
-        },
-        "Top-up invoiced but the card was not collected; nothing granted until Chargebee collects it",
-      );
-      return { invoice, quantity, applied: 0, credits: "0" };
-    }
+      // A free-plan org starts with no card, and Chargebee will not charge one
+      // (MEASURED: 400 `payment_method_not_present`, "no valid card on file").
+      // Asked first, so the page sends the customer to add a card rather than
+      // reporting a failed charge.
+      if (!isChargeable(await deps.chargebee.paymentSource(account.chargebeeCustomerId!))) {
+        throw noPaymentMethod();
+      }
 
-    const granted = await applyCharged(tenantId, invoice.id);
-    return { invoice, quantity, applied: granted.applied, credits: granted.credits };
+      let invoice: ChargedInvoice;
+      try {
+        invoice = await deps.chargebee.chargeItem({
+          subscriptionId: account.chargebeeSubscriptionId!,
+          itemPriceId: topUp.itemPriceId,
+          quantity,
+        });
+      } catch (err) {
+        // The card went away between the check above and the charge.
+        if ((err as ChargebeeError).apiErrorCode === "payment_method_not_present") throw noPaymentMethod();
+        if (isPaymentFailure(err as ChargebeeError)) {
+          log.warn?.(
+            { metric: "billing.topup.payment_failed", tenantId, quantity, reason: (err as Error).message },
+            "Top-up charge was not collected",
+          );
+          throw conflict(`Payment failed: ${(err as Error).message}`, "topup-payment-failed");
+        }
+        throw err;
+      }
+
+      if (invoice.status !== "paid") {
+        log.warn?.(
+          {
+            metric: "billing.topup.unpaid",
+            tenantId,
+            invoiceId: invoice.id,
+            status: invoice.status,
+            amountDueMinor: invoice.amountDueMinor,
+            nextRetryAt: invoice.nextRetryAt,
+          },
+          "Top-up invoiced but the card was not collected; nothing granted until Chargebee collects it",
+        );
+        return { invoice, quantity, applied: 0, credits: "0" };
+      }
+
+      const granted = await applyCharged(tenantId, invoice.id);
+      return { invoice, quantity, applied: granted.applied, credits: granted.credits };
+    } finally {
+      await releaseCharge(tenantId, lease);
+    }
   }
 
   /**
@@ -342,37 +503,88 @@ export function createCheckoutService(deps: {
    * (`topup-unpaid`).
    * Never retried. A card that declines again is the same 409 as a declined
    * top-up, and the invoices stay owed.
+   *
+   * Under the same charge lease as a top-up — but allowed while a currency
+   * switch is only REQUESTED: such a switch waits for exactly this (it does
+   * not start over an unpaid top-up), and it cannot start while the lease is
+   * held. Refused once one is moving credits (`currency-switch-in-progress`).
+   * Every currency's packs are collected: one left unpaid in INR is still
+   * owed once the org is billed in USD.
    */
   async function payUnpaidTopUps(tenantId: string) {
     const account = await subscribedAccount(tenantId);
-    const owed = await deps.chargebee.unpaidInvoicesFor(account.chargebeeCustomerId!, deps.topUpItemPriceId);
-    if (owed.length === 0) return { invoices: [], applied: 0, credits: "0" };
-    if (!isChargeable(await deps.chargebee.paymentSource(account.chargebeeCustomerId!))) {
-      throw noPaymentMethod();
-    }
+    const open = (await deps.switches?.findOpen(tenantId)) ?? null;
+    if (open && open.status !== SWITCH.REQUESTED && blocksTopUps(open)) throw currencySwitchInProgress();
 
-    const invoices: Array<{ id: string; status: string }> = [];
-    for (const unpaid of owed) {
-      let invoice: ChargedInvoice;
-      try {
-        invoice = await deps.chargebee.collectInvoice(unpaid.id);
-      } catch (err) {
-        if ((err as ChargebeeError).apiErrorCode === "payment_method_not_present") throw noPaymentMethod();
-        if (isPaymentFailure(err as ChargebeeError)) {
-          log.warn?.(
-            { metric: "billing.topup.collect_failed", tenantId, invoiceId: unpaid.id, reason: (err as Error).message },
-            "Unpaid top-up could not be collected; it stays owed",
-          );
-          throw conflict(`Payment failed: ${(err as Error).message}`, "topup-payment-failed");
-        }
-        throw err;
+    const lease = await takeCharge(tenantId, { duringRequestedSwitch: true });
+    try {
+      const owed = await deps.chargebee.unpaidInvoicesFor(account.chargebeeCustomerId!, topUpItemPriceIds(deps.catalog));
+      if (owed.length === 0) return { invoices: [], applied: 0, credits: "0" };
+      if (!isChargeable(await deps.chargebee.paymentSource(account.chargebeeCustomerId!))) {
+        throw noPaymentMethod();
       }
-      invoices.push({ id: invoice.id, status: invoice.status });
-    }
 
-    // Paid now: record the packs, which moves the cap to include them.
-    const recorded = await applyTopUps(tenantId);
-    return { invoices, applied: recorded.applied, credits: recorded.credits };
+      const invoices: Array<{ id: string; status: string }> = [];
+      for (const unpaid of owed) {
+        let invoice: ChargedInvoice;
+        try {
+          invoice = await deps.chargebee.collectInvoice(unpaid.id);
+        } catch (err) {
+          if ((err as ChargebeeError).apiErrorCode === "payment_method_not_present") throw noPaymentMethod();
+          if (isPaymentFailure(err as ChargebeeError)) {
+            log.warn?.(
+              { metric: "billing.topup.collect_failed", tenantId, invoiceId: unpaid.id, reason: (err as Error).message },
+              "Unpaid top-up could not be collected; it stays owed",
+            );
+            throw conflict(`Payment failed: ${(err as Error).message}`, "topup-payment-failed");
+          }
+          throw err;
+        }
+        invoices.push({ id: invoice.id, status: invoice.status });
+      }
+
+      // Paid now: record the packs, which moves the cap to include them.
+      const recorded = await applyTopUps(tenantId);
+      return { invoices, applied: recorded.applied, credits: recorded.credits };
+    } finally {
+      await releaseCharge(tenantId, lease);
+    }
+  }
+
+  /**
+   * Take the account's top-up CHARGE lease (billing-account.repository
+   * takeTopUpCharge), or say why not: a currency switch is open, another
+   * charge holds it, or the account is not one a pack can be charged to —
+   * cancelled, switching, or still being set up.
+   */
+  async function takeCharge(tenantId: string, opts: { duringRequestedSwitch?: boolean } = {}): Promise<Date> {
+    const taken = await deps.accounts.takeTopUpCharge(tenantId, new Date(clock()), TOPUP_CHARGE_LEASE_MS, opts);
+    if (taken.taken) return taken.until;
+    if (taken.reason === "switch") throw currencySwitchInProgress();
+    if (taken.reason === "charging") throw conflict("A top-up is already being charged", "topup-in-progress");
+    const now = await deps.accounts.findByTenantId(tenantId);
+    if (!now?.chargebeeSubscriptionId) throw noSubscription();
+    if (now.status === ACCOUNT.CANCELLED) throw subscriptionCancelled();
+    if (now.status === ACCOUNT.SWITCHING) throw currencySwitchInProgress();
+    throw billingActivating();
+  }
+
+  /** Done charging — the lease goes, if it is still ours. A failure only delays the next top-up until the lease runs out. */
+  async function releaseCharge(tenantId: string, until: Date) {
+    try {
+      await deps.accounts.releaseTopUpCharge(tenantId, until);
+    } catch (err) {
+      log.error?.(
+        { metric: "billing.topup.charge_lease_release_failed", tenantId, err: errorMessage(err) },
+        "Could not clear the top-up charge lease; the next top-up waits until it runs out",
+      );
+    }
+  }
+
+  /** The live subscription's `currency_code`, for an account linked before the currency was stored. Null when it says none. */
+  async function liveCurrency(account: BillingAccount): Promise<string | null> {
+    const record = await deps.chargebee.subscription(account.chargebeeSubscriptionId!);
+    return typeof record?.currency_code === "string" ? record.currency_code : null;
   }
 
   /**
@@ -405,12 +617,23 @@ export function createCheckoutService(deps: {
   async function applyTopUps(tenantId: string) {
     const account = await deps.accounts.findByTenantId(tenantId);
     if (!account?.chargebeeSubscriptionId) throw noSubscription();
+    // EVERY currency's packs, each with its own credits per unit: a pack paid
+    // in INR is still to be recorded after the org has moved to USD. One after
+    // another, totalled; an outage on one stops the rest, as it would anyway.
     // applyPaidTopUps allocates nothing to a cancelled account; it raises the alert.
-    const result = await deps.accountService.applyPaidTopUps(tenantId, deps.topUpItemPriceId, deps.topUpCredits, {
-      chargebeeGrants,
-    });
+    let applied = 0;
+    let credits = "0";
+    const pending: string[] = [];
+    for (const topUp of topUpsOf(deps.catalog)) {
+      const result = await deps.accountService.applyPaidTopUps(tenantId, topUp.itemPriceId, topUp.credits, {
+        chargebeeGrants: topUp.chargebeeGrants ?? chargebeeGrants,
+      });
+      applied += result.applied;
+      credits = add(credits, result.credits);
+      pending.push(...(result.pending ?? []));
+    }
     if (account.status === ACCOUNT.CANCELLED) throw subscriptionCancelled();
-    return result;
+    return { applied, credits, ...(pending.length > 0 ? { pending } : {}) };
   }
 
   /**
@@ -430,7 +653,19 @@ export function createCheckoutService(deps: {
     return account;
   }
 
-  return { startSubscription, provisionFreePlan, setFreePlan, startTopUp, payUnpaidTopUps, applyTopUps };
+  return { startSubscription, provisionFreePlan, setFreePlan, startTopUp, payUnpaidTopUps, applyTopUps, customerFor };
+}
+
+export type CheckoutService = ReturnType<typeof createCheckoutService>;
+
+/**
+ * Does this open switch stop a top-up? One not started yet, one moving
+ * credits, and one linked whose cap has not moved to the new subscription do
+ * (currency-switch.repository BLOCKING_SWITCH); once it has, what is left —
+ * cancelling the old subscription — blocks nothing (A17).
+ */
+function blocksTopUps(open: { status: string; activatedAt: Date | null }): boolean {
+  return open.status === SWITCH.REQUESTED || open.status === SWITCH.MOVING || (open.status === SWITCH.LINKED && open.activatedAt == null);
 }
 
 /**
@@ -450,6 +685,13 @@ function topUpRangeMessage(offer: TopUpOffer | null, fewest: number, most: numbe
     : `Choose a whole number of units from ${fewest} to ${most}`;
 }
 
+/**
+ * How long a top-up's charge holds the account's charge lease: longer than a
+ * charge (never retried; 20 seconds at most) and the wait for its grant
+ * block. A process that dies holding it costs the next top-up this long.
+ */
+const TOPUP_CHARGE_LEASE_MS = 2 * 60_000;
+
 /** MEASURED: a new subscription's credit ledger appeared three seconds after it. */
 const LEDGER_WAIT_ATTEMPTS = 10;
 const LEDGER_WAIT_MS = 1_000;
@@ -460,6 +702,11 @@ const GRANT_WAIT_MS = 1_000;
 
 const noSubscription = () => conflict("Subscribe before topping up", "no-subscription");
 const noPaymentMethod = () => conflict("Add a card before buying credits", "no-payment-method");
+const topUpNotOffered = () => conflict("Buying credits is not available right now", "topup-not-offered");
+const billingAddressRequired = () => conflict("Add your billing address first", "billing-address-required");
+const currencySwitchInProgress = () =>
+  conflict("Your billing currency is being changed — try again once it has finished", "currency-switch-in-progress");
+const billingActivating = () => conflict("Your credits are still being set up — try again in a minute", "billing-activating");
 
 /** A card Chargebee will charge: `expiring` still is; `expired`, `invalid` and `pending_verification` are not. */
 function isChargeable(card: PaymentSource | null): boolean {

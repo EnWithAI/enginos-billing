@@ -14,6 +14,16 @@ export const ACCOUNT = {
   CANCELLED: "cancelled",
   /** Chargebee says the credits are used up. Only credits coming back (activate()) moves it on. */
   EXHAUSTED: "exhausted",
+  /**
+   * The org's credits are being moved to a subscription in another currency
+   * (the currency switch, `currency_switch`). The usage sync opens no window
+   * and sends no capture — usage waits in ClickHouse in front of a cursor that
+   * does not move — no top-up is sold, and the LiteLLM team keeps the cap it
+   * had, so the org keeps working. NOTHING but the currency switch changes the
+   * account's status or subscription while it reads this: every other status
+   * write and every relink refuses it (billing-account.repository.ts).
+   */
+  SWITCHING: "switching",
 } as const;
 
 export type AccountStatus = (typeof ACCOUNT)[keyof typeof ACCOUNT];

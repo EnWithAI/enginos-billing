@@ -1,10 +1,11 @@
 /**
- * Sentry for the billing worker: four alerts, and nothing else.
+ * Sentry for the billing worker: five alerts, and nothing else.
  *
  *   postgres-down            the database could not be reached
  *   postgres-write-failed    the database is up, and refused a write
  *   chargebee-down           Chargebee is not answering, or will not serve us
  *   chargebee-update-failed  Chargebee refused a usage window
+ *   currency-switch-stuck    a currency switch open for more than 30 minutes
  *
  * A customer out of credits is never an alert: that is their state, not a
  * fault, and it clears on a top-up.
@@ -39,6 +40,7 @@ export const ALERT = {
   postgresWriteFailed: { key: "postgres-write-failed", title: "Billing worker could not write to Postgres" },
   chargebeeDown: { key: "chargebee-down", title: "Chargebee is down or refusing the billing worker" },
   chargebeeUpdateFailed: { key: "chargebee-update-failed", title: "Usage could not be written to Chargebee" },
+  currencySwitchStuck: { key: "currency-switch-stuck", title: "A currency switch has been open for more than 30 minutes" },
 } as const satisfies Record<string, Alert>;
 
 /**
@@ -62,6 +64,9 @@ export const ALERT_FOR_METRIC: Readonly<Record<string, Alert>> = {
   "billing.sync.stuck": ALERT.chargebeeDown,
   "billing.sync.invalid": ALERT.chargebeeUpdateFailed,
   "billing.sync.no_ledger": ALERT.chargebeeUpdateFailed,
+  // A switch holds the org's top-ups (and, while moving, its billing) until
+  // it finishes; one open this long needs a person (currency-switch.service.ts).
+  "billing.currency_switch.stuck": ALERT.currencySwitchStuck,
 };
 
 export function initAlerts() {

@@ -30,7 +30,7 @@ import { createCheckoutService } from "@/services/checkout.service";
 import { createWebhookService } from "@/services/webhook.service";
 
 import { lifecycleRig, MINUTE, PACK, PLAN, T0, TENANT, UNIT, type LifecycleRig } from "./failure-matrix-lifecycle-webhooks-litellm.helpers";
-import { quietLogger } from "./harness";
+import { quietLogger, testCatalog } from "./harness";
 
 const apply = (r: LifecycleRig) => r.accounts.applyPaidTopUps(TENANT, PACK, "1000");
 const rows = (r: LifecycleRig) => [...r.prisma._topUps.values()];
@@ -374,6 +374,10 @@ describe("a pack charged to the card on file, Chargebee granting", () => {
   const paid = (id: string, quantity = 1) => ({ id, status: "paid", totalMinor: 100 * quantity, amountDueMinor: 0, currencyCode: "INR" });
 
   function charging(r: LifecycleRig, chargeItem: ChargebeeClient["chargeItem"], sleep = vi.fn(async () => {})) {
+    // The org has confirmed its billing address: no pack is sold before it
+    // has (billing-address-required). Its subscription is in INR, the
+    // currency of the pack sold here.
+    r.prisma._accounts.get(TENANT)!.billingCountry = "IN";
     const checkout = createCheckoutService({
       chargebee: {
         ...(r.cb.client as unknown as ChargebeeClient),
@@ -385,8 +389,7 @@ describe("a pack charged to the card on file, Chargebee granting", () => {
       accounts: createBillingAccountRepository(r.prisma as never),
       itemPriceIds: [PLAN],
       defaultItemPriceId: PLAN,
-      topUpItemPriceId: PACK,
-      topUpCredits: "50",
+      catalog: testCatalog({ topUp: PACK, credits: "50" }),
       topUpChargebeeGrants: true,
       logger: { log() {}, warn: (o: unknown) => void r.warns.push(o as Record<string, unknown>), error: (o: unknown) => void r.errors.push(o as Record<string, unknown>) },
       sleep,
@@ -463,7 +466,8 @@ describe("a pack charged to the card on file, Chargebee granting", () => {
     const webhooks = createWebhookService({
       accountService: r.accounts,
       accounts: createBillingAccountRepository(r.prisma as never),
-      topUp: { itemPriceId: PACK, creditsPerUnit: "50", chargebeeGrants: true },
+      topUps: [{ itemPriceId: PACK, creditsPerUnit: "50" }],
+      chargebeeGrants: true,
       logger: quietLogger,
     });
     const event = {

@@ -7,7 +7,7 @@
  * `?pgbouncer=true&connection_limit=1`; migrations use the direct URL.
  */
 
-import { PrismaClient } from "../../node_modules/.prisma/billing/index";
+import { PrismaClient, type Prisma } from "../../node_modules/.prisma/billing/index";
 
 /** A database call that threw: which model, which operation, and the error. */
 export interface QueryFailure {
@@ -67,6 +67,13 @@ export const prisma: PrismaClient =
 if (process.env.NODE_ENV !== "production") globalForPrisma.billingPrisma = prisma;
 
 export type { PrismaClient };
+
+/**
+ * The client a `$transaction` callback is handed. A repository method that
+ * must run inside another repository's transaction takes one of these — the
+ * root client satisfies it too, for a call that needs no transaction.
+ */
+export type TransactionClient = Prisma.TransactionClient;
 
 const WRITE_OPERATIONS = new Set([
   "create",

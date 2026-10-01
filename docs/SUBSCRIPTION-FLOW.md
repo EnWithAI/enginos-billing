@@ -127,9 +127,10 @@ Billing creates it in `checkout.provisionFreePlan()`, from three places:
 | 3 | Stop unless the free plan is for the org | `billing_account.free_plan`, else `FREE_PLAN_DEFAULT` |
 | 4 | The free plan must be configured and on the allowlist | `409` otherwise |
 | 5 | Link, don't create, if Chargebee already holds a live subscription (a call that died half-way) | `GET /subscriptions` |
-| 6 | The plan must cost **₹0** — a card-less customer is never put on a paid plan | `GET /item_prices/{id}` |
-| 7 | Create it. Idempotency key `free-plan:<tenant id>` makes concurrent calls create **one** | `POST /customers/{id}/subscription_for_items` |
+| 6 | The plan is the free plan of the org's currency — its saved billing country's, USD with none (`FREE_PLAN_ITEM_PRICE_ID_<CUR>`). It must cost **nothing**, and be priced in that currency — a card-less customer is never put on a paid plan | `GET /item_prices/{id}` |
+| 7 | Create it. Idempotency key `free-plan:<tenant id>:<currency>` makes concurrent calls create **one** | `POST /customers/{id}/subscription_for_items` |
 | 8 | Link it — `syncFromChargebee()`, which **grants the free credits** before activating (section 8.2 step 5). Repeated once a second, up to 10 times, until the account has a credit unit; normally the first pass has one | see [section 8](#8-linking-and-activation--the-common-path) |
+| 9 | Tell Chargebee the customer's preferred currency is the subscription's. Best effort | `POST /customers/{id}` (`preferred_currency_code`) |
 
 ### The free credits — granted once per org
 
@@ -166,8 +167,10 @@ for the allocate; each runs the same link again and changes nothing.
 | 1 | UI `POST /enginos-api/billing/checkout {itemPriceId}` → platform adds the tenant from the login → billing `POST /api/internal/checkout` | |
 | 2 | The plan must be on `ITEM_PRICE_IDS` — a request cannot name any other price in the catalogue | `400 plan-not-offered` |
 | 3 | The free plan is refused for an org it is not for (it costs nothing) | `400 plan-not-offered` |
+| 3a | The org must have saved a billing address — its country decides the currency (see [BILLING-USER-FLOWS.md §3](BILLING-USER-FLOWS.md#3-add-the-billing-address)) | `409 billing-address-required` |
+| 3b | The plan must be priced in that country's currency, read from the catalogue | Chargebee `GET /item_prices/{id}`; `400 plan-not-offered` |
 | 4 | Ensure the customer (normally made at sign-up) | Chargebee `POST /customers` if missing |
-| 5 | Create the hosted checkout for that customer and plan, quantity 1, returning to `APP_URL/organization/billing?from=checkout` | Chargebee `POST /hosted_pages/checkout_new_for_items` |
+| 5 | Create the hosted checkout for that customer and plan, quantity 1, returning to `APP_URL/organization/billing?from=checkout`, pre-filled with the saved billing address (the hosted page writes back the address it collects) | Chargebee `GET /customers/{id}`, `POST /hosted_pages/checkout_new_for_items` |
 | 6 | The page sends the browser to Chargebee | |
 
 Starting a checkout writes nothing but a missing customer, and nothing happens
@@ -385,7 +388,7 @@ balance moves about 1–2 minutes after a call ends. See
 | The free credits' allocate fails (Way 1) | `activating`, team blocked; *Activating your credits* | `activatePending` every minute — the `topup_grant` row makes it grant once |
 | Customer id is not the tenant id (Way 3) | Webhook answered `500`, never linked | A person: recreate it for the right customer |
 | Webhook credentials unset or wrong | Every delivery `401 webhook-unauthorized` | Set billing's `CHARGEBEE_WEBHOOK_USER` / `_PASSWORD` to match Chargebee; meanwhile the page's sync and the daily resync |
-| Free plan misconfigured (Way 1) | `409 free-plan-misconfigured`; no subscription | Fix `FREE_PLAN_ITEM_PRICE_ID` / `ITEM_PRICE_IDS` |
+| Free plan misconfigured (Way 1) | `409 free-plan-misconfigured`; no subscription | Fix `FREE_PLAN_ITEM_PRICE_ID_<CUR>` / `ITEM_PRICE_IDS` |
 
 ---
 

@@ -228,15 +228,16 @@ chooses a paid plan on its billing page"*. The LiteLLM team keeps
 | --- | --- | --- |
 | 6 | Check the free plan is configured and on the plan allowlist | `409` if not |
 | 7 | Does Chargebee already hold a live subscription for the customer? (a call that died half-way) | Chargebee `GET /subscriptions` |
-| 8 | Check the free plan really costs ₹0 | Chargebee `GET /item_prices/{FREE_PLAN_ITEM_PRICE_ID}` |
-| 9 | Subscribe — no checkout, no card. Idempotency key `free-plan:<tenant id>` | Chargebee `POST /customers/{id}/subscription_for_items` |
+| 8 | Check the free plan really costs nothing, and is priced in the org's currency — USD at sign-up, which has no billing address yet | Chargebee `GET /item_prices/{FREE_PLAN_ITEM_PRICE_ID_USD}` |
+| 9 | Subscribe — no checkout, no card. Idempotency key `free-plan:<tenant id>:USD` | Chargebee `POST /customers/{id}/subscription_for_items` |
 | 10 | Read the credit unit. The plan's own grant is cut to zero, and a zero-grant plan gets **no wallet** from Chargebee (MEASURED 2026-09-30), so there is none yet | Chargebee `GET /ledger_account_balances` |
-| 11 | Link it | `billing_account`: subscription id, item price, term dates, status `activating` |
+| 11 | Link it | `billing_account`: subscription id, item price, currency (`USD`), term dates, status `activating` |
 | 12 | Start usage billing **now** | `billing_account.last_processed_ingested_at = now()` |
 | 13 | **Grant the free credits — once per org, ever**: `FREE_PLAN_CREDITS` less what the plan's own grant gave (floor 0), into `FREE_PLAN_CREDIT_UNIT`, expiring 10 years out. The allocate creates the wallet, and the account adopts its unit | `topup_grant` row `free-plan-credits`; Chargebee `GET /grant_blocks`, `POST /ledger_operations/allocate` (key `free-plan-credits:<tenant id>`); `billing_account.ledger_unit_id` |
 | 14 | Read the usable balance (less any unpaid top-up) and the live grants | Chargebee balance, grant blocks, invoices |
 | 15 | Set the team's budget: spend baseline + credits in USD, no reset window, `billing_managed: true`, unblocked | LiteLLM `GET /team/info`, `POST /team/update` |
 | 16 | Mark it active | `billing_account.status = active` |
+| 17 | Tell Chargebee the customer pays in USD, so its payments go through the USD gateway. Best effort | Chargebee `POST /customers/{id}` (`preferred_currency_code`) |
 
 Steps 10–16 are one link (`syncFromChargebee()`), repeated once a second for up
 to 10 s until the account has a credit unit; normally the first pass has one.
@@ -352,7 +353,7 @@ team is blocked and billing holds the org until a top-up. See
 | Setting (enginos-billing `.env`) | Now | Meaning |
 | --- | --- | --- |
 | `FREE_PLAN_DEFAULT` | `false` | Whether an org with no setting of its own gets the free plan |
-| `FREE_PLAN_ITEM_PRICE_ID` | `pre-paid-test-v1-INR-Yearly` | The free plan. Must cost ₹0; its own Credit Grant is cut to zero (or a single token), so a renewal gives nothing |
+| `FREE_PLAN_ITEM_PRICE_ID_<CUR>` | `pre-paid-test-v1-USD-Yearly`, `pre-paid-test-v1-INR-Yearly` | The free plan in each billing currency (`_USD`, `_INR`); an org is put on its billing country's, USD until it gives one. Must cost nothing; its own Credit Grant is cut to zero (or a single token — MEASURED: the USD one grants 1), so a renewal gives next to nothing. The unsuffixed `FREE_PLAN_ITEM_PRICE_ID` is refused at start |
 | `FREE_PLAN_CREDITS` | e.g. `1000` | The **total** free credits each free-plan org starts with, granted once per org, ever. Empty: off |
 | `FREE_PLAN_CREDIT_UNIT` | `token-test` | The credit unit they go into. Required with `FREE_PLAN_CREDITS` — the zero-grant plan has no wallet to take one from |
 | `ITEM_PRICE_IDS` | `pre-paid-test-v1-INR-Monthly` | Paid plans on the Billing page, in this order |

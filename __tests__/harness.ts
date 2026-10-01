@@ -41,6 +41,8 @@ import {
   type CaptureResult,
 } from "@/integrations/chargebee";
 import type { ReadWindowArgs, UsageSource, UsageWindow } from "@/integrations/clickhouse/usage-source";
+import { currencyCatalog, type CurrencyCatalog, type CurrencyRules } from "@/models/currency";
+import { add, compare } from "@/models/decimal";
 import { Prisma } from "../node_modules/.prisma/billing/index";
 
 export const RATE = "0.001";
@@ -62,14 +64,61 @@ interface AccountRow {
   chargebeeCustomerId?: string | null;
   chargebeeItemPriceId?: string | null;
   billingEmail?: string | null;
+  freePlan?: boolean | null;
   currentTermStart?: Date | null;
   currentTermEnd?: Date | null;
+  /** The confirmed billing country (CHECKed: two upper-case letters). */
+  billingCountry?: string | null;
+  /** The linked subscription's currency (CHECKed: three upper-case letters). */
+  currency?: string | null;
   chargebeeSubscriptionId: string | null;
   ledgerUnitId: string | null;
   status: string;
   /** THE cursor. Null means billing has not started for this tenant. */
   lastProcessedIngestedAt: Date | null;
+  /** A top-up charge on the wire until then (migration 20261001130000). */
+  topupChargingUntil?: Date | null;
+  updatedAt?: Date;
 }
+
+/** `billing_account_status_check` (migration 20261001120000). */
+const ACCOUNT_STATUSES = ["unlinked", "activating", "active", "cancelled", "exhausted", "switching"];
+
+/** `currency_switch` as stored: its DECIMAL columns as text, like the other tables here. */
+interface SwitchRow {
+  id: string;
+  tenantId: string;
+  fromSubscriptionId: string;
+  fromCurrency: string;
+  toCurrency: string;
+  toItemPriceId: string;
+  toSubscriptionId: string | null;
+  toSubscriptionAt: Date | null;
+  ledgerUnitId: string | null;
+  status: string;
+  drained: string;
+  heldBack: string;
+  ownGrant: string;
+  drainOperationId: string | null;
+  drainAmount: string | null;
+  mirrorOperationId: string | null;
+  mirrorAmount: string | null;
+  mirroredAt: Date | null;
+  leaseUntil: Date | null;
+  leaseOwner: string | null;
+  attemptCount: number;
+  error: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  movingAt: Date | null;
+  linkedAt: Date | null;
+  activatedAt: Date | null;
+  completedAt: Date | null;
+}
+
+const SWITCH_STATUSES = ["REQUESTED", "MOVING", "LINKED", "DONE", "ABANDONED"];
+const OPEN_SWITCH_STATUSES = ["REQUESTED", "MOVING", "LINKED"];
+const SWITCH_DECIMALS = ["drained", "heldBack", "ownGrant", "drainAmount", "mirrorAmount"] as const;
 
 interface SyncRow {
   id: string;
@@ -137,6 +186,16 @@ interface TopUpRow {
 }
 
 /**
+ * An UPDATE's `data` as Prisma sends it: a key whose value is `undefined` is
+ * left out, and its column keeps what it held. Applied as given, a link that
+ * named no item price used to wipe the stored one in the fake, where Postgres
+ * kept it.
+ */
+function defined(data: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined));
+}
+
+/**
  * `cursorAt` seeds the tenant's activation point, which every test that expects
  * billing to run needs — without it the sync sets one at now() and reads
  * nothing, exactly as production would for a tenant linked before this existed.
@@ -145,6 +204,96 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
   const accounts = new Map<string, AccountRow>();
   const syncs = new Map<string, SyncRow>();
   const topUps = new Map<string, TopUpRow>();
+  const switches = new Map<string, SwitchRow>();
+
+  /**
+   * `billing_account`'s CHECKs (migration 20261001120000): the status list,
+   * and the country and currency as billing writes them. Checked on every
+   * write, before the row changes — a refused UPDATE changes nothing.
+   */
+  function assertAccountConstraints(row: AccountRow) {
+    if (!ACCOUNT_STATUSES.includes(row.status)) throw new Error(`billing_account_status_check: ${row.status}`);
+    if (row.billingCountry != null && !/^[A-Z]{2}$/.test(row.billingCountry)) {
+      throw new Error(`billing_account_billing_country_check: ${row.billingCountry}`);
+    }
+    if (row.currency != null && !/^[A-Z]{3}$/.test(row.currency)) throw new Error(`billing_account_currency_check: ${row.currency}`);
+  }
+
+  /**
+   * `currency_switch`'s CHECKs (both of its migrations), its foreign key, and the partial unique index
+   * `currency_switch_open_uq` — ONE open switch per tenant, which is what
+   * stops two switches each carrying the org's credits somewhere. As with
+   * the window index, a fake that skipped it would let every test pass while
+   * production refused the second insert.
+   */
+  function assertSwitchConstraints(row: SwitchRow) {
+    if (!accounts.has(row.tenantId)) throw new Error("currency_switch_tenant_fkey");
+    if (!SWITCH_STATUSES.includes(row.status)) throw new Error(`currency_switch_status_check: ${row.status}`);
+    const currency = /^[A-Z]{3}$/;
+    if (!currency.test(row.fromCurrency) || !currency.test(row.toCurrency) || row.fromCurrency === row.toCurrency) {
+      throw new Error("currency_switch_currencies");
+    }
+    const negative = (v: string | null) => v != null && compare(v, "0") < 0;
+    if (negative(row.drained) || negative(row.drainAmount) || negative(row.mirrorAmount) || row.attemptCount < 0) {
+      throw new Error("currency_switch_amounts_nonneg");
+    }
+    // 20261001130000_currency_switch_carry.
+    if (negative(row.heldBack) || negative(row.ownGrant)) throw new Error("currency_switch_carry_nonneg");
+    if ((row.toSubscriptionId == null) !== (row.toSubscriptionAt == null)) throw new Error("currency_switch_to_subscription_dated");
+    if ((row.leaseOwner == null) !== (row.leaseUntil == null)) throw new Error("currency_switch_lease_complete");
+    if (
+      (row.activatedAt != null && !["LINKED", "DONE"].includes(row.status)) ||
+      (row.status === "DONE" && row.activatedAt == null)
+    ) {
+      throw new Error("currency_switch_activated_when_linked");
+    }
+    if ((row.drainOperationId == null) !== (row.drainAmount == null)) throw new Error("currency_switch_drain_complete");
+    if ((row.mirrorOperationId == null) !== (row.mirrorAmount == null)) throw new Error("currency_switch_mirror_complete");
+    if (["MOVING", "LINKED", "DONE"].includes(row.status) && row.movingAt == null) {
+      throw new Error("currency_switch_moving_when_started");
+    }
+    const linked = ["LINKED", "DONE"].includes(row.status);
+    if (linked && (row.toSubscriptionId == null || row.linkedAt == null)) throw new Error("currency_switch_linked_to_b");
+    if (linked && (row.drainOperationId != null || (row.mirrorOperationId != null && row.mirroredAt == null))) {
+      throw new Error("currency_switch_settled_when_linked");
+    }
+    if ((row.status === "DONE") !== (row.completedAt != null)) throw new Error("currency_switch_done_when_completed");
+    if (OPEN_SWITCH_STATUSES.includes(row.status)) {
+      for (const other of switches.values()) {
+        if (other.id !== row.id && other.tenantId === row.tenantId && OPEN_SWITCH_STATUSES.includes(other.status)) {
+          throw new UniqueViolation("currency_switch_open_uq");
+        }
+      }
+    }
+  }
+
+  /** A `currency_switch` row as the Prisma client returns it: Decimals for the DECIMAL columns. */
+  const switchOut = (row: SwitchRow) => ({
+    ...row,
+    drained: asDecimal(row.drained),
+    heldBack: asDecimal(row.heldBack),
+    ownGrant: asDecimal(row.ownGrant),
+    drainAmount: row.drainAmount == null ? null : asDecimal(row.drainAmount),
+    mirrorAmount: row.mirrorAmount == null ? null : asDecimal(row.mirrorAmount),
+  });
+
+  /**
+   * One UPDATE's `data` applied to a switch row: `{ increment }` as Postgres
+   * adds (exactly, on the DECIMAL columns), a Decimal stored as its text, and
+   * `@updatedAt` from the test clock unless the write names it.
+   */
+  function applySwitchData(row: SwitchRow, data: Record<string, any>): SwitchRow {
+    const next: Record<string, any> = { ...row, updatedAt: new Date(api._now ?? T0) };
+    for (const [key, value] of Object.entries(defined(data))) {
+      const decimalColumn = (SWITCH_DECIMALS as readonly string[]).includes(key);
+      if (value && typeof value === "object" && "increment" in value) {
+        next[key] = decimalColumn ? add(next[key], stored(value.increment)) : next[key] + value.increment;
+      } else {
+        next[key] = decimalColumn && value != null ? stored(value) : value;
+      }
+    }
+    return next as SwitchRow;
+  }
 
   /** `topup_grant`'s CHECKs and its unique index (migration 20260924190000). */
   function assertTopUpConstraints(row: TopUpRow) {
@@ -180,8 +329,11 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
    *
    * Plain reads take no lock, as in Postgres. Not modelled: isolation of
    * uncommitted writes and rollback. Neither matters to the transactions this
-   * service runs — both open with a compare-and-set of the cursor ONTO ITSELF,
-   * so nothing they write before a failure changes a value.
+   * service runs — every one opens with a write to the account row that
+   * changes nothing that matters (the cursor onto itself in openWindow and
+   * advancePastEmptyWindow, `updated_at` in the sync claim and the currency
+   * switch's start and link), checks everything under that lock, and only
+   * then writes what changes state — so none of them depends on a rollback.
    */
   const txContext = new AsyncLocalStorage<number>();
   let nextTx = 0;
@@ -217,6 +369,24 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
   function candidateTenantIds(where: Record<string, any>): string[] {
     if (typeof where.tenantId === "string") return [where.tenantId];
     return [...accounts.keys()];
+  }
+
+  /**
+   * `matches`, plus the one relation filter billing writes on an account:
+   * `switches: { none | some: <where> }` — the tenant's `currency_switch`
+   * rows, as Prisma joins them.
+   */
+  function accountMatches(row: AccountRow, where: Record<string, any>): boolean {
+    const { switches: relation, ...rest } = where;
+    if (!matches(row as unknown as Record<string, any>, rest)) return false;
+    if (relation === undefined) return true;
+    const own = [...switches.values()].filter((sw) => sw.tenantId === row.tenantId);
+    const keys = Object.keys(relation);
+    if (keys.length !== 1 || !["none", "some"].includes(keys[0]!)) {
+      throw new Error(`fake Prisma: relation filter ${JSON.stringify(keys)} on switches is not modelled`);
+    }
+    const hit = own.some((sw) => matches(sw as unknown as Record<string, any>, relation[keys[0]!]));
+    return keys[0] === "none" ? !hit : hit;
   }
 
   accounts.set(TENANT, {
@@ -261,7 +431,7 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
 
   function applySyncData(row: SyncRow, data: Record<string, any>): SyncRow {
     const next = { ...row };
-    for (const [key, value] of Object.entries(data)) {
+    for (const [key, value] of Object.entries(defined(data))) {
       if (value && typeof value === "object" && "increment" in value) {
         (next as any)[key] = (next as any)[key] + (value as { increment: number }).increment;
       } else {
@@ -285,17 +455,19 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
         }
         return null;
       },
-      async findMany({ where }: { where?: Record<string, any> } = {}) {
-        return [...accounts.values()].filter((row) => matches(row, where ?? {})).map((r) => ({ ...r }));
+      async findMany({ where, orderBy, take }: { where?: Record<string, any>; orderBy?: unknown; take?: number; select?: unknown } = {}) {
+        const rows = ordered([...accounts.values()].filter((row) => accountMatches(row, where ?? {})), orderBy);
+        return (take == null ? rows : rows.slice(0, take)).map((r) => ({ ...r }));
       },
       async findFirst({ where }: { where?: Record<string, any> } = {}) {
-        const row = [...accounts.values()].find((r) => matches(r, where ?? {}));
+        const row = [...accounts.values()].find((r) => accountMatches(r, where ?? {}));
         return row ? { ...row } : null;
       },
       async upsert({ where, create, update }: { where: { tenantId: string }; create: Record<string, any>; update: Record<string, any> }) {
         const existing = accounts.get(where.tenantId);
         if (existing) {
-          Object.assign(existing, update);
+          assertAccountConstraints({ ...existing, ...defined(update) });
+          Object.assign(existing, defined(update));
           return { ...existing };
         }
         const row = {
@@ -306,13 +478,15 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
           status: "unlinked",
           ...create,
         } as AccountRow;
+        assertAccountConstraints(row);
         accounts.set(row.tenantId, row);
         return { ...row };
       },
       async update({ where, data }: { where: { tenantId: string }; data: Record<string, unknown> }) {
         const tx = await lockAccountRows([where.tenantId]);
         const row = accounts.get(where.tenantId)!;
-        Object.assign(row, data);
+        assertAccountConstraints({ ...row, ...defined(data) } as AccountRow);
+        Object.assign(row, defined(data));
         holdAccountRow(tx, where.tenantId);
         return { ...row };
       },
@@ -320,14 +494,81 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
         // Wait out any other transaction's lock, THEN evaluate the WHERE — the
         // re-check Postgres makes against the row the lock holder committed.
         const tx = await lockAccountRows(candidateTenantIds(where));
-        let count = 0;
-        for (const row of accounts.values()) {
-          if (!matches(row as Record<string, any>, where)) continue;
-          Object.assign(row, data);
+        const hit = [...accounts.values()].filter((row) => matches(row as Record<string, any>, where));
+        // One statement: every row it would change passes the CHECKs, or none changes.
+        for (const row of hit) assertAccountConstraints({ ...row, ...defined(data) });
+        for (const row of hit) {
+          Object.assign(row, defined(data));
           holdAccountRow(tx, row.tenantId);
-          count += 1;
         }
-        return { count };
+        return { count: hit.length };
+      },
+    },
+
+    /** Mirrors `currency_switch`: its CHECKs, its foreign key, and `currency_switch_open_uq`. */
+    currencySwitch: {
+      async create({ data }: { data: Record<string, any> }) {
+        const at = new Date(api._now ?? T0);
+        const row = {
+          id: data.id ?? randomUUID(),
+          toSubscriptionId: null,
+          toSubscriptionAt: null,
+          ledgerUnitId: null,
+          drainOperationId: null,
+          drainAmount: null,
+          mirrorOperationId: null,
+          mirrorAmount: null,
+          mirroredAt: null,
+          leaseUntil: null,
+          leaseOwner: null,
+          attemptCount: 0,
+          error: null,
+          createdAt: at,
+          updatedAt: at,
+          movingAt: null,
+          linkedAt: null,
+          activatedAt: null,
+          completedAt: null,
+          ...data,
+          drained: stored(data.drained ?? "0"),
+          heldBack: stored(data.heldBack ?? "0"),
+          ownGrant: stored(data.ownGrant ?? "0"),
+        } as SwitchRow;
+        if (data.drainAmount != null) row.drainAmount = stored(data.drainAmount);
+        if (data.mirrorAmount != null) row.mirrorAmount = stored(data.mirrorAmount);
+        assertSwitchConstraints(row);
+        switches.set(row.id, row);
+        return switchOut(row);
+      },
+      async findUnique({ where }: { where: { id: string } }) {
+        const row = switches.get(where.id);
+        return row ? switchOut(row) : null;
+      },
+      async findFirst({ where, orderBy }: { where?: Record<string, any>; orderBy?: any } = {}) {
+        const row = ordered([...switches.values()].filter((r) => matches(r as unknown as Record<string, any>, where ?? {})), orderBy)[0];
+        return row ? switchOut(row) : null;
+      },
+      async findMany({ where, orderBy }: { where?: Record<string, any>; orderBy?: any } = {}) {
+        return ordered([...switches.values()].filter((r) => matches(r as unknown as Record<string, any>, where ?? {})), orderBy).map(
+          switchOut,
+        );
+      },
+      /** Compare-and-set, atomic as one UPDATE is: every row it would change passes the CHECKs, or none changes. */
+      async updateMany({ where, data }: { where: Record<string, any>; data: Record<string, any> }) {
+        const before = [...switches.values()].filter((row) => matches(row as unknown as Record<string, any>, where));
+        const next = before.map((row) => applySwitchData(row, data));
+        for (const row of next) switches.set(row.id, row);
+        try {
+          // Against the table as the statement leaves it — the unique index included.
+          for (const row of next) assertSwitchConstraints(row);
+        } catch (err) {
+          for (const row of before) switches.set(row.id, row);
+          throw err;
+        }
+        return { count: next.length };
+      },
+      async count({ where }: { where?: Record<string, any> } = {}) {
+        return [...switches.values()].filter((r) => matches(r as unknown as Record<string, any>, where ?? {})).length;
       },
     },
 
@@ -432,12 +673,15 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
       async findMany({ where }: { where?: Record<string, any> } = {}) {
         return [...topUps.values()].filter((r) => matches(r as unknown as Record<string, any>, where ?? {})).map(topUpOut);
       },
+      async count({ where }: { where?: Record<string, any> } = {}) {
+        return [...topUps.values()].filter((r) => matches(r as unknown as Record<string, any>, where ?? {})).length;
+      },
       /** Compare-and-set, atomic as one UPDATE is. `updatedAt` follows the test clock unless the write names it. */
       async updateMany({ where, data }: { where: Record<string, any>; data: Record<string, any> }) {
         let count = 0;
         for (const row of [...topUps.values()]) {
           if (!matches(row as unknown as Record<string, any>, where)) continue;
-          const next: TopUpRow = { ...row, updatedAt: new Date(api._now ?? T0), ...data };
+          const next: TopUpRow = { ...row, updatedAt: new Date(api._now ?? T0), ...defined(data) };
           if ("credits" in data) next.credits = stored(data.credits);
           assertTopUpConstraints(next);
           topUps.set(row.id, next);
@@ -476,6 +720,8 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
     _accounts: accounts,
     _syncs: syncs,
     _topUps: topUps,
+    /** `currency_switch` rows by id, amounts as their stored text. */
+    _switches: switches,
     /** Every sync for the default tenant, oldest window first. */
     get _log() {
       return [...syncs.values()]
@@ -496,29 +742,99 @@ export function makeFakePrisma(account: Partial<AccountRow> = {}, cursorAt?: num
   return api;
 }
 
-function matches(row: Record<string, any>, where: Record<string, any>): boolean {
+/**
+ * Prisma's `where`, as far as this service writes one — evaluated as the SQL
+ * it becomes:
+ *
+ *   OR / AND / NOT          any / all / none of the conditions
+ *   undefined               no condition at all (Prisma drops it)
+ *   null                    IS NULL
+ *   a Date                  equal to the millisecond
+ *   a number or a Decimal   numerically equal (DECIMAL columns are stored as text here)
+ *   { in, notIn, not, equals, lt, lte, gt, gte, startsWith }
+ *                           EVERY operator given must hold, as in Prisma. A
+ *                           NULL column matches no comparison — `not: x`
+ *                           and `notIn` included, as in SQL — only `not: null`.
+ *
+ * An operator not listed THROWS. It used to match nothing, silently, so a
+ * guard written with one looked like a guard that never let anything through
+ * — exactly the kind of test that passes for the wrong reason.
+ */
+export function matches(row: Record<string, any>, where: Record<string, any>): boolean {
   return Object.entries(where).every(([key, condition]) => {
     if (key === "OR") return (condition as Array<Record<string, any>>).some((c) => matches(row, c));
-    if (condition === null) return row[key] == null;
-    if (condition instanceof Date) return row[key] instanceof Date && row[key].getTime() === condition.getTime();
-    if (condition && typeof condition === "object" && "in" in condition) {
-      return (condition.in as unknown[]).includes(row[key]);
-    }
-    if (condition && typeof condition === "object" && "not" in condition) {
-      return condition.not === null ? row[key] != null : row[key] !== condition.not;
-    }
-    if (condition && typeof condition === "object" && "lt" in condition) {
-      const left = row[key];
-      const right = condition.lt;
-      if (left == null) return false;
-      return left instanceof Date && right instanceof Date ? left.getTime() < right.getTime() : left < right;
-    }
-    if (condition && typeof condition === "object" && "startsWith" in condition) {
-      return typeof row[key] === "string" && row[key].startsWith(condition.startsWith);
-    }
-    if (typeof condition === "number") return Number(row[key]) === condition;
-    return row[key] === condition;
+    if (key === "AND") return asList(condition).every((c) => matches(row, c));
+    if (key === "NOT") return !asList(condition).some((c) => matches(row, c));
+    return matchesValue(row[key], condition);
   });
+}
+
+function asList(condition: unknown): Array<Record<string, any>> {
+  return (Array.isArray(condition) ? condition : [condition]) as Array<Record<string, any>>;
+}
+
+const FILTER_OPERATORS = new Set(["equals", "in", "notIn", "not", "lt", "lte", "gt", "gte", "startsWith"]);
+
+function isDecimalLike(value: unknown): value is { toFixed(): string } {
+  return value != null && typeof value === "object" && typeof (value as { toFixed?: unknown }).toFixed === "function";
+}
+
+function matchesValue(value: any, condition: any): boolean {
+  if (condition === undefined) return true;
+  if (condition === null) return value == null;
+  if (condition instanceof Date) return value instanceof Date && value.getTime() === condition.getTime();
+  if (typeof condition === "number") return value != null && Number(value) === condition;
+  if (isDecimalLike(condition)) return value != null && compare(stored(value), condition.toFixed()) === 0;
+  if (condition && typeof condition === "object" && !Array.isArray(condition)) {
+    return Object.entries(condition).every(([op, operand]) => {
+      if (!FILTER_OPERATORS.has(op)) throw new Error(`fake Prisma: filter operator "${op}" is not modelled — add it to matches()`);
+      return applyOperator(value, op, operand);
+    });
+  }
+  return value === condition;
+}
+
+function applyOperator(value: any, op: string, operand: any): boolean {
+  switch (op) {
+    case "equals":
+      return matchesValue(value, operand);
+    case "in":
+      return (operand as unknown[]).some((o) => o !== null && matchesValue(value, o));
+    case "notIn":
+      return value != null && !(operand as unknown[]).some((o) => o !== null && matchesValue(value, o));
+    case "not":
+      return operand === null ? value != null : value != null && !matchesValue(value, operand);
+    case "startsWith":
+      return typeof value === "string" && value.startsWith(operand);
+    default: {
+      if (value == null || operand == null) return false;
+      const order = ordering(value, operand);
+      return op === "lt" ? order < 0 : op === "lte" ? order <= 0 : op === "gt" ? order > 0 : order >= 0;
+    }
+  }
+}
+
+/** Negative, zero or positive, as `a` sorts before, with or after `b`: Dates by time, numbers and Decimals by value. */
+function ordering(a: any, b: any): number {
+  if (a instanceof Date && b instanceof Date) return a.getTime() - b.getTime();
+  if (typeof b === "number" || isDecimalLike(b) || isDecimalLike(a)) return compare(stored(a), stored(b));
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** `orderBy` — one field or several, each `asc` or `desc`; nulls first, as the fakes always have. */
+function ordered<T>(rows: T[], orderBy: unknown): T[] {
+  const orders = (Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : []) as Array<Record<string, string>>;
+  let out = [...rows];
+  for (const o of [...orders].reverse()) {
+    const [field, dir] = Object.entries(o)[0] as [string, string];
+    out = out.sort((x, y) => {
+      const a = (x as Record<string, any>)[field];
+      const b = (y as Record<string, any>)[field];
+      const cmp = a == null && b == null ? 0 : a == null ? -1 : b == null ? 1 : Math.sign(ordering(a, b));
+      return dir === "desc" ? -cmp : cmp;
+    });
+  }
+  return out;
 }
 
 /**
@@ -725,5 +1041,39 @@ export class FakeUsageSource implements UsageSource {
 }
 
 export const quietLogger = { log() {}, warn() {}, error() {} };
+
+/**
+ * A currency catalog (models/currency.ts) with what a test sells in its
+ * DEFAULT currency — the free plan, the top-up and its credits per unit — as
+ * the container builds one from FREE_PLAN_ITEM_PRICE_ID_<CUR> and
+ * TOPUP_ITEM_PRICE_ID_<CUR>.
+ *
+ * INR unless the rules say otherwise: every fixture here was written in INR
+ * (the plans and charges the stubs describe say `currencyCode: "INR"`), and
+ * the default currency is the one an org with no billing address is billed
+ * in. A test about more than one currency builds its catalog itself.
+ */
+export function testCatalog(
+  inDefault: {
+    free?: string | null;
+    topUp?: string | null;
+    credits?: string;
+    presetAmounts?: number[];
+    minAmount?: number | null;
+    maxAmount?: number | null;
+  } = {},
+  rules: CurrencyRules = { defaultCurrency: "INR", byCountry: {} },
+): CurrencyCatalog {
+  const topUp = inDefault.topUp
+    ? {
+        itemPriceId: inDefault.topUp,
+        presetAmounts: inDefault.presetAmounts ?? [50, 100],
+        minAmount: inDefault.minAmount ?? null,
+        maxAmount: inDefault.maxAmount ?? null,
+        credits: inDefault.credits ?? "",
+      }
+    : null;
+  return currencyCatalog(rules, { [rules.defaultCurrency]: { freeItemPriceId: inDefault.free || null, topUp } });
+}
 
 export { randomUUID };

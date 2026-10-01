@@ -17,6 +17,11 @@ row per tenant, ever, for the free plan's one-time credits (see
 **`topup_grant`** below). `processed_billing_event`, the webhook claim row, was
 removed — see **Webhook replays** at the end.
 
+A fourth, `currency_switch`, is not usage billing either: one row per currency
+switch — an org whose billing address moved it to another currency, carried
+from its subscription to a new one in that currency. It is the stored request
+for each capture the switch makes (see **`currency_switch`** below).
+
 Nothing here lives in ClickHouse, and billing adds or changes nothing there:
 usage is read from `tenant_<slug>.span_nodes FINAL` as it is. The `*_ingested_at`
 column names below are kept from when they held ClickHouse's ingest time; they
@@ -29,7 +34,7 @@ and Prisma Studio connect through PgBouncer (`DATABASE_URL`, `localhost:6432`,
 role `enginos_app`); migrations go straight to Postgres (`DATABASE_DIRECT_URL`,
 `localhost:5432`, role `enginos_owner`, via `make db-migrate`), because the app
 role cannot create tables. Prisma Studio (`make db-studio`, or `make dev`) shows
-only the three tables below: it shows what `prisma/schema.prisma` models. They are not in a tenant database: the usage sync sweeps
+only the four tables below: it shows what `prisma/schema.prisma` models. They are not in a tenant database: the usage sync sweeps
 every tenant each tick, and finding billable accounts by opening N tenant
 databases would be both slow and racy.
 
@@ -92,6 +97,9 @@ gateway enforces, and the billing cursor.
 | `free_plan` | `boolean` | NULL | Is this org put on the free plan (or offered the paid plans instead)? Null follows `FREE_PLAN_DEFAULT`. Set by an operator (`POST /api/internal/free-plan`); an org already on the plan keeps it when this is turned off. Added by `20260929120000_billing_account_free_plan`. |
 | `current_term_start` | `timestamptz` | NULL | Mirrored from the subscription, for display and for the expiry date a top-up allocation requires. |
 | `current_term_end` | `timestamptz` | NULL | As above. |
+| `billing_country` | `varchar(2)` | NULL | The country of the billing address the org saved (ISO 3166-1 alpha-2, upper case; CHECK `billing_account_billing_country_check`). The one part of the address kept here, because it decides the currency the org is billed in (`models/currency.ts`); the address itself is on the Chargebee customer. Written only by the billing address sync (`setBillingCountry`), which reads it from Chargebee — never from a request. Null until the org saves one: the page then sells nothing and asks for the address. Added by `20261001120000_billing_currency`. |
+| `currency` | `varchar(3)` | NULL | The linked subscription's currency (ISO 4217, upper case; CHECK `billing_account_currency_check`), mirrored from Chargebee's `currency_code` at every link — and set to the new one by a currency switch's link. Chargebee fixes it for the life of a subscription. Not backfilled: null on a row linked before it existed, and readers fall back to the live subscription's `currency_code` until the next sync stores it. Added by `20261001120000_billing_currency`. |
+| `topup_charging_until` | `timestamptz(3)` | NULL | A top-up charge (or Pay now) is on the wire until then: the charge lease, `now + 2 min`, taken under the row's lock in the same transaction that checks no currency switch is open, and cleared when the charge is recorded. A switch does not START while it is live, and no charge starts while a switch is open — so a pack is never charged onto a subscription a switch is about to empty. A lease, not a lock: a process that dies mid-charge leaves it to run out. Added by `20261001130000_currency_switch_carry`. |
 | `status` | `varchar(20)` | NOT NULL, dflt `unlinked` | See states below. |
 | `last_processed_ingested_at` | `timestamptz(3)` | NULL | **THE CURSOR** — a call end time, despite the name. See below. |
 | `created_at` | `timestamptz` | NOT NULL, dflt now() | |
@@ -170,6 +178,7 @@ Defined in [`src/models/account-status.ts`](../src/models/account-status.ts) as 
 | `active` | Subscribed, and the gateway holds the cap. |
 | `cancelled` | Subscription ended. The team is handed back to the platform, whose budget for it is $0. |
 | `exhausted` | Chargebee reports no usable balance. The team is blocked; the cursor stops moving until credits return. |
+| `switching` | A currency switch is moving the org's credits to a subscription in another currency. No usage range is opened or sent, no top-up is charged, no subscription sync relinks it, and nothing but the switch may change the row. The team keeps the cap it had, so the org keeps working. The billing page reads only the database. Set and ended by the switch (`currency_switch`); one left here with no switch moving it is put back by the worker. Added to the CHECK by `20261001120000_billing_currency`. |
 
 ---
 
@@ -183,7 +192,7 @@ already records that the minute passed.
 |---|---|---|---|
 | `id` | `uuid` | NOT NULL | **PK**, and ALSO the Chargebee ledger operation id. Written before the capture is sent. |
 | `tenant_id` | `uuid` | NOT NULL | FK to `billing_account` ON DELETE CASCADE. |
-| `chargebee_subscription_id` | `varchar(100)` | NULL | Pinned at creation, so a mid-term subscription change still settles against the subscription that incurred the usage. |
+| `chargebee_subscription_id` | `varchar(100)` | NULL | Pinned at creation, so a mid-term subscription change still settles against the subscription that incurred the usage. One exception: a currency switch's link re-pins the rows A never applied (`PENDING`, `OUT_OF_CREDITS`, `INVALID`) to B, in the same transaction (`repointHeld`), since A is emptied and cancelled. Rows on the wire or unsure are never re-pinned — a switch does not start while any exist. |
 | `ledger_unit_id` | `varchar(50)` | NULL | As above. |
 | `from_ingested_at` | `timestamptz(3)` | NOT NULL | Range start on call end time, EXCLUSIVE. Equals the cursor the range opened at, which is why the uniqueness index is on it. |
 | `to_ingested_at` | `timestamptz(3)` | NOT NULL | Range end on call end time, INCLUSIVE: `now − lag` when the range was opened, at most `from + BILLING_MAX_RANGE_MS` (default 1 h). Stored, so a retry re-sends exactly this range under this row's id and never recomputes it. |
@@ -270,10 +279,10 @@ model is `TopUpGrant`; the code is `repositories/topup-grant.repository.ts`,
 |---|---|---|---|
 | `id` | `uuid` | no | Row id. |
 | `tenant_id` | `uuid` | no | FK → `billing_account`, `ON DELETE RESTRICT` — deleting an account row must fail while it has guard rows, not take the guard with it. |
-| `invoice_id` | `varchar(100)` | no | The paid Chargebee invoice — or `free-plan-credits` (`FREE_PLAN_GRANT`) for the free plan's one-time grant. |
+| `invoice_id` | `varchar(100)` | no | The paid Chargebee invoice — or `free-plan-credits` (`FREE_PLAN_GRANT`) for the free plan's one-time grant, or `carry:<switch id>:<grant block id>` for a currency switch's copy of one grant block onto the new subscription. |
 | `chargebee_subscription_id`, `ledger_unit_id` | `varchar` | no | Where the credits went — pinned at the claim, so a retry completes against the same place. |
 | `credits` | `decimal(20,10)` | no | Credits granted (or, for a catalogue grant, granted by Chargebee). |
-| `expires_at`, `idempotency_key`, `key_issued_at` | | yes | The allocate request, stored before its first send so a retry is the same request; `key_issued_at` bounds Chargebee's 30-minute replay. Key `invoice:<id>`, or `free-plan-credits:<tenant>` with `expires_at` about 10 years out for the free plan's row. Null only for a catalogue grant. |
+| `expires_at`, `idempotency_key`, `key_issued_at` | | yes | The allocate request, stored before its first send so a retry is the same request; `key_issued_at` bounds Chargebee's 30-minute replay. Key `invoice:<id>`, or `free-plan-credits:<tenant>` with `expires_at` about 10 years out for the free plan's row, or the carry id itself for a switch's copy, with the copied block's own expiry. Null only for a catalogue grant. |
 | `status` | `varchar(16)` | no | `SENDING` (claimed, allocate on the wire) · `PENDING` (may have landed; retried) · `APPLIED`. |
 | `source` | `varchar(20)` | no | `allocation` — billing allocated it — or `catalogue_grant`: the pack's (or the free plan's) own Credit Grant already did it and nothing was allocated. |
 | `chargebee_ref` | `varchar(120)` | yes | The proof: `ledger_operation:<id>` or `grant_block:<id>`. |
@@ -297,9 +306,89 @@ allocate goes into `FREE_PLAN_CREDIT_UNIT` (required with `FREE_PLAN_CREDITS`),
 creates the wallet, and `billing_account.ledger_unit_id` then adopts that unit.
 Until the row is `APPLIED` the account is held `activating`.
 
+**A currency switch's copies.** Each live grant block on the old subscription
+is copied to the new one by one allocate, under its own row
+`carry:<switch id>:<block id>` (`allocateOnce`): claimed with the whole request
+before it is sent, and decided by reading the row again afterwards — `APPLIED`,
+or the switch waits. So a block is copied once, whatever crashes. The switch's
+abort is allowed only while no row of it is `APPLIED`.
+
 `20260924190100_topup_grant_seed_test_site` records the two test-site invoices
 allocated before the table existed (85 on org_aws_com, 83 on org_fs_com), and
 inserts nothing anywhere else.
+
+---
+
+## `currency_switch`
+
+One row per currency switch. Migrations `20261001120000_billing_currency`
+(the table, and `billing_account.billing_country`, `.currency` and the
+`switching` status) and `20261001130000_currency_switch_carry` (`held_back`,
+`own_grant`, `to_subscription_at`, `lease_owner`, `activated_at`, and
+`billing_account.topup_charging_until`). Both are additive. The model is
+`CurrencySwitch`; the code is `repositories/currency-switch.repository.ts`,
+and the state machine `services/currency-switch.service.ts`.
+
+**Why it exists.** Chargebee fixes a subscription's currency, and keys its
+credit ledger per subscription. An org on the free plan whose saved billing
+country wants another currency (India → INR, elsewhere → USD) is therefore
+moved to a new subscription, **B**, on that currency's free plan, from its old
+one, **A**: every live grant block of A is copied to B (allocates, guarded by
+`topup_grant` carry rows), A is drained to zero (a capture), A's consumption is
+captured on B (the mirror) so B shows the same granted, used and left, and
+only then is billing relinked to B and A cancelled. A paid plan never
+switches.
+
+**Why a row.** A capture takes a client-supplied operation id. The drain's and
+the mirror's id and amount are written here **before** they are sent, and
+re-sent only under that id, so a crash, a timeout or two advancers at once can
+delay a switch but never move money twice — the same rule as `chargebee_sync`.
+
+| Column | Type | Null | Meaning |
+|---|---|---|---|
+| `id` | `uuid` | NOT NULL | **PK.** B's subscription id is made from it: `cs_<id without dashes>`. |
+| `tenant_id` | `uuid` | NOT NULL | FK → `billing_account`, `ON DELETE RESTRICT`, as for `topup_grant`. |
+| `from_subscription_id` | `varchar(100)` | NOT NULL | A: the subscription the org was billed on when the switch was asked for. |
+| `from_currency`, `to_currency` | `varchar(3)` | NOT NULL | Both ISO 4217, upper case, and different (CHECK `currency_switch_currencies`). |
+| `to_item_price_id` | `varchar(100)` | NOT NULL | The plan B is made on: `FREE_PLAN_ITEM_PRICE_ID_<to_currency>`. |
+| `to_subscription_id`, `to_subscription_at` | `varchar(100)`, `timestamptz(3)` | NULL | B, and when it was created or adopted. Set once, together (CHECK `currency_switch_to_subscription_dated`). B's own plan grant is read only 10 s after `to_subscription_at`. |
+| `ledger_unit_id` | `varchar(50)` | NULL | The account's credit unit when MOVING started; every carry, drain and mirror is in it. Null: A had no wallet, and nothing is moved. |
+| `status` | `varchar(16)` | NOT NULL | See below. |
+| `drained` | `decimal(20,10)` | NOT NULL, dflt 0 | Credits captured off A by drains that settled. |
+| `held_back` | `decimal(20,10)` | NOT NULL, dflt 0 | Credits on A that belong to top-up invoices not settled (a voided pack's grant stays on A). Never carried — so a pack nobody paid for never becomes paid credits on B — and taken off what the mirror counts. Recorded once, before the first drain. |
+| `own_grant` | `decimal(20,10)` | NOT NULL, dflt 0 | What B's own plan granted on creation (MEASURED: 1 credit on a new free-plan subscription), netted out of the mirror and of the LiteLLM cap, so switching back and forth mints nothing. Recorded once, before the mirror; above zero it is logged `billing.currency_switch.target_plan_grants`. |
+| `drain_operation_id`, `drain_amount` | `uuid`, `decimal(20,10)` | NULL | A drain on the wire, or of unknown outcome — both or neither (CHECK `currency_switch_drain_complete`). Added to `drained` when it settles; dropped only when Chargebee answers its id 404. |
+| `mirror_operation_id`, `mirror_amount`, `mirrored_at` | `uuid`, `decimal(20,10)`, `timestamptz(3)` | NULL | The capture on B that carries A's consumption: Σ live granted on B − max(`drained` − `held_back`, 0). Stored before it is sent, and recorded once (CHECK `currency_switch_mirror_complete`). Never clamped: a negative figure stops the switch for a person. |
+| `lease_until`, `lease_owner` | `timestamptz(3)`, `uuid` | NULL | One advancer at a time, for 5 minutes (`SWITCH_LEASE_MS`); owner and time together (CHECK `currency_switch_lease_complete`). Every write of an advancing switch compares the status **and** `lease_owner`, so an advancer whose lease was taken over writes nothing more. |
+| `attempt_count` | `integer` | NOT NULL, dflt 0 | Advances that stopped on something. |
+| `error` | `text` | NULL | What it is waiting on, or why it was abandoned: `timed_out`, `country_changed`, `chargebee_refused`, `misconfigured`, `account_changed`, `no_customer`. |
+| `created_at`, `updated_at` | `timestamptz(3)` | NOT NULL | `updated_at` is also when an ABANDONED switch ended — only DONE sets `completed_at`. |
+| `moving_at`, `linked_at` | `timestamptz(3)` | NULL | When it started moving; when billing moved to B. |
+| `activated_at` | `timestamptz(3)` | NULL | When the org's LiteLLM cap moved to B. From here the switch blocks no top-up; cancelling A is a background chore. Only while LINKED or DONE, and DONE only with it (CHECK `currency_switch_activated_when_linked`). |
+| `completed_at` | `timestamptz(3)` | NULL | Set iff DONE (CHECK `currency_switch_done_when_completed`). |
+
+### `status` values
+
+| Value | Open? | Meaning |
+|---|---|---|
+| `REQUESTED` | yes | Asked for — by the billing address sync, a `customer_changed` webhook, or the worker's convergence. B may already be made (unlinked, harmless). Nothing else has changed. Waits while the org owes or is receiving anything: an unpaid or pending top-up, free credits being set up, a top-up charge (`topup_charging_until`) or a usage capture on the wire. Abandoned after 30 minutes (`timed_out`), or once the country no longer wants `to_currency` (`country_changed`). |
+| `MOVING` | yes | Started, in one transaction under the account row's lock: the account `switching`, `ledger_unit_id` recorded. Carry, drain, rescan, mirror. Aborted to ABANDONED only while no money has moved — the account then goes back to A, and B is cancelled. |
+| `LINKED` | yes | Billing points at B — the account's subscription, item price, unit, `currency` and term — and the `chargebee_sync` rows A never applied are re-pinned to B, in one transaction. Then the cap moves (`activated_at`), and A is cancelled. |
+| `DONE` | no | Finished. |
+| `ABANDONED` | no | Given up before anything moved. The page is told it failed for a day, unless the org changed its country back. |
+
+### Indexes and constraints
+
+| Object | What it prevents |
+|---|---|
+| `currency_switch_open_uq` UNIQUE `(tenant_id)` WHERE `status IN ('REQUESTED','MOVING','LINKED')` | Two open switches for one org, each carrying its credits somewhere. A partial index Prisma cannot express — apply with `prisma migrate deploy`, never `migrate dev`. |
+| `currency_switch_status_idx` `(status)` | The worker's minute: every open switch. |
+| CHECK `status_check`, `currencies`, `amounts_nonneg`, `carry_nonneg` | The obvious ones; amounts are credits, never negative. |
+| CHECK `moving_when_started`, `linked_to_b`, `settled_when_linked` | A row cannot claim a step it did not take: LINKED only with B, no drain outstanding, and the mirror (if any) settled. |
+| CHECK `drain_complete`, `mirror_complete`, `lease_complete`, `to_subscription_dated`, `activated_when_linked`, `done_when_completed` | Values written together stay together. |
+
+**Never delete a row.** An open one is money in flight; a finished one is the
+record of where an org's credits went.
 
 ## Webhook replays
 
@@ -313,7 +402,9 @@ and the daily reconcile run) and applies what Chargebee says now, so a late
 event finds the state that followed it. `grant_blocks_created` names no
 customer: the org is found by its CURRENT subscription
 (`findTenantIdBySubscriptionId`) and re-read the same way. `payment_succeeded`
-re-reads which top-up invoices are paid. Nothing in a body is written as it
+re-reads which top-up invoices are paid. `customer_changed` reads the
+customer's billing address back from Chargebee — never from the body — and
+only for an org that has saved one on its billing page. Nothing in a body is written as it
 stands; it only decides WHICH org is re-read, and it is exactly as trustworthy
 as the HTTP Basic credentials billing checks on it.
 

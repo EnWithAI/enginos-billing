@@ -25,7 +25,7 @@ import { AppError } from "@/shared/errors";
 import type { Logger } from "@/shared/logger";
 import { renderBillingOverview } from "@/views/billing.view";
 
-import { TENANT, makeFakePrisma, quietLogger } from "./harness";
+import { TENANT, makeFakePrisma, quietLogger, testCatalog } from "./harness";
 
 const RETRY = new Date("2026-09-29T10:00:00Z");
 const DUE = {
@@ -57,6 +57,7 @@ function blockFor(invoiceId: string, itemPriceId = "pack"): GrantBlock {
     status: "available",
     source: "top_up",
     createdAtMs: 1790600000000,
+    expiresAtMs: null,
     invoices: [{ invoiceId, lineItemId: "li_1" }],
     itemPriceId,
     doneBy: null,
@@ -67,11 +68,15 @@ function rig(
   over: Partial<ChargebeeClient> = {},
   { grants = true, logger = quietLogger }: { grants?: boolean; logger?: Logger } = {},
 ) {
+  // An org that has confirmed its billing address, billed in INR — the
+  // currency of the pack sold here (a top-up needs a confirmed country).
   const prisma = makeFakePrisma({
     chargebeeCustomerId: TENANT,
     chargebeeSubscriptionId: "sub_1",
     ledgerUnitId: "token-test",
     status: "active",
+    billingCountry: "IN",
+    currency: "INR",
   } as never);
   const chargebee = {
     chargeItem: async () => DUE,
@@ -91,7 +96,7 @@ function rig(
     chargebee,
     usdPerCredit: "0.02",
     pushBudget,
-    topUpItemPriceId: "pack",
+    topUpItemPriceIds: ["pack"],
     logger,
   });
   const checkout = createCheckoutService({
@@ -100,8 +105,7 @@ function rig(
     accounts: createBillingAccountRepository(prisma),
     itemPriceIds: ["plan"],
     defaultItemPriceId: "plan",
-    topUpItemPriceId: "pack",
-    topUpCredits: "50",
+    catalog: testCatalog({ topUp: "pack", credits: "50" }),
     topUpChargebeeGrants: grants,
     logger,
     sleep: async () => {},
@@ -145,7 +149,8 @@ describe("a top-up whose card declined", () => {
       "topup-unpaid",
       "Pay the unpaid top-up before buying more credits",
     ]);
-    expect(unpaidInvoicesFor).toHaveBeenCalledWith(TENANT, "pack");
+    // Every currency's top-up is looked at: one owed in any of them blocks a new one.
+    expect(unpaidInvoicesFor).toHaveBeenCalledWith(TENANT, ["pack"]);
     expect(chargeItem).not.toHaveBeenCalled();
   });
 });
@@ -470,12 +475,14 @@ describe("the billing page's unpaid top-ups", () => {
         subscription: async () => null,
         paymentSource: async () => null,
         unpaidTopUpCredits: async () => "0",
+        // The page reads the billing address too; none is held.
+        customer: async () => null,
       } as unknown as ChargebeeClient,
       accountService: { ensureLocalAccount: (t: string) => accounts.findByTenantId(t) } as never,
       accounts,
       syncs: createChargebeeSyncRepository(prisma as never),
       plansOffered: async () => [],
-      topUpItemPriceId: "pack",
+      catalog: testCatalog({ topUp: "pack" }),
       logger,
     });
   }
@@ -485,7 +492,8 @@ describe("the billing page's unpaid top-ups", () => {
 
     const result = await overview(unpaidInvoicesFor).overview(TENANT);
 
-    expect(unpaidInvoicesFor).toHaveBeenCalledWith(TENANT, "pack");
+    // Every currency's top-up: a pack owed is shown whatever it was bought in.
+    expect(unpaidInvoicesFor).toHaveBeenCalledWith(TENANT, ["pack"]);
     expect(result).toMatchObject({ kind: "linked", unpaidTopUps: [OWED] });
   });
 
@@ -524,7 +532,7 @@ describe("the billing page's unpaid top-ups", () => {
       accounts,
       syncs: createChargebeeSyncRepository(prisma as never),
       plansOffered: async () => [],
-      topUpItemPriceId: "pack",
+      catalog: testCatalog({ topUp: "pack" }),
       logger: quietLogger,
     }).overview(TENANT);
 
@@ -548,6 +556,15 @@ describe("the billing page's unpaid top-ups", () => {
         lastSync: null,
         topUp: null,
         unpaidTopUps: [OWED],
+        billingCountry: "IN",
+        billingAddress: null,
+        currency: "INR",
+        currencyRules: { defaultCurrency: "USD", byCountry: { IN: "INR" } },
+        currencySwitch: null,
+        currencyLocked: false,
+        currencyChange: "switch",
+        plansMissingForCurrency: false,
+        addressEditable: true,
       },
       { site: "s", defaultItemPriceId: "plan" },
     );
